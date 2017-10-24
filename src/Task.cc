@@ -1993,14 +1993,18 @@ KernelMapping Task::init_syscall_buffer(AutoRemoteSyscalls& remote,
 }
 
 void Task::set_syscallbuf_locked(bool locked) {
+  std::cout << "set_syscallbuf_locked called" << std::endl;
   if (!syscallbuf_child) {
+    std::cout << "early return" << std::endl;
     return;
   }
+  std::cout << "Doing some work around the syscallbuf_locked field" << std::endl;
   remote_ptr<uint8_t> remote_addr = REMOTE_PTR_FIELD(syscallbuf_child, locked);
   uint8_t locked_before = read_mem(remote_addr);
   uint8_t new_locked = locked ? (locked_before | SYSCALLBUF_LOCKED_TRACER)
                               : (locked_before & ~SYSCALLBUF_LOCKED_TRACER);
   if (new_locked != locked_before) {
+    std::cout << "wrote " << locked << "to syscallbuf_locked flag for tid: " << this->tid << std::endl;
     write_mem(remote_addr, new_locked);
   }
 }

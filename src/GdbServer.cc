@@ -896,53 +896,84 @@ GdbRequest GdbServer::divert(ReplaySession& replay) {
     timeline.apply_breakpoints_and_watchpoints();
   }
   DiversionSession::shr_ptr diversion_session = replay.clone_diversion();
-  uint32_t diversion_refcount = 1;
-  TaskUid saved_query_tuid = last_query_tuid;
 
-  while (diverter_process_debugger_requests(*diversion_session,
-                                            diversion_refcount, &req)) {
-    DEBUG_ASSERT(req.is_resume_request());
+  for (auto& v : diversion_session->tasks()) {
+    Task* t = v.second;
+    t->write_mem(REMOTE_PTR_FIELD(t->preload_globals, in_diversion), (unsigned char)1);
+    t->set_syscallbuf_locked(1);
+    std::cout << "Subverting " << t->tid << std::endl;
+    std::cout << "We are about to attempt a pause and detach" << std::endl;
+    kill(t->tid, SIGSTOP);
+    std::cout << "We have sent a sigstop" << std::endl;
+    std::cout << "Attempting ptrace detach" << std::endl;
+    ptrace(PTRACE_DETACH, t->tid, 0, 0);
+    std::cout << "Ptrace detach called" << std::endl;
+    std::cout << "Destabalizing task" << std::endl;
+    t->unstable = true;
+    t->destroy();
+    std::cout << "Task has been made unstable" << std::endl;
+    //  std::cout << "Reattaching ptrace" << std::endl;
+    //  ptrace(PTRACE_ATTACH, t->tid, 0, 0);
+    //  std::cout << "Ptrace maybe attached" << std::endl;
+    //  std::cout << "Continuing" << std::endl;
+    //  kill(t->tid, SIGCONT);
+    //  std::cout << "SIGCONT SENT" << std::endl;
 
-    if (req.cont().run_direction == RUN_BACKWARD) {
-      // We don't support reverse execution in a diversion. Just issue
-      // an immediate stop.
-      dbg->notify_stop(get_threadid(*diversion_session, last_continue_tuid), 0);
-      memset(&stop_siginfo, 0, sizeof(stop_siginfo));
-      last_query_tuid = last_continue_tuid;
-      continue;
-    }
-
-    Task* t = diversion_session->find_task(last_continue_tuid);
-    if (!t) {
-      diversion_refcount = 0;
-      req = GdbRequest(DREQ_NONE);
-      break;
-    }
-
-    int signal_to_deliver;
-    RunCommand command =
-        compute_run_command_from_actions(t, req, &signal_to_deliver);
-    auto result =
-        diversion_session->diversion_step(t, command, signal_to_deliver);
-
-    if (result.status == DiversionSession::DIVERSION_EXITED) {
-      diversion_refcount = 0;
-      req = GdbRequest(DREQ_NONE);
-      break;
-    }
-
-    DEBUG_ASSERT(result.status == DiversionSession::DIVERSION_CONTINUE);
-
-    maybe_notify_stop(req, result.break_status);
   }
-
-  LOG(debug) << "... ending debugging diversion";
-  DEBUG_ASSERT(diversion_refcount == 0);
-
-  diversion_session->kill_all_tasks();
-
-  last_query_tuid = saved_query_tuid;
+  std::cout << "After loop" << std::endl;
+  req = GdbRequest(DREQ_DETACH);
   return req;
+
+
+//  uint32_t diversion_refcount = 1;
+//  TaskUid saved_query_tuid = last_query_tuid;
+//
+//  while (diverter_process_debugger_requests(*diversion_session,
+//                                            diversion_refcount, &req)) {
+//    DEBUG_ASSERT(req.is_resume_request());
+//
+//    if (req.cont().run_direction == RUN_BACKWARD) {
+//      // We don't support reverse execution in a diversion. Just issue
+//      // an immediate stop.
+//      dbg->notify_stop(get_threadid(*diversion_session, last_continue_tuid), 0);
+//      memset(&stop_siginfo, 0, sizeof(stop_siginfo));
+//      last_query_tuid = last_continue_tuid;
+//      continue;
+//    }
+//
+//    Task* t = diversion_session->find_task(last_continue_tuid);
+//    if (!t) {
+//      diversion_refcount = 0;
+//      req = GdbRequest(DREQ_NONE);
+//      break;
+//    }
+//
+//    int signal_to_deliver;
+//    RunCommand command =
+//        compute_run_command_from_actions(t, req, &signal_to_deliver);
+//    auto result =
+//        diversion_session->diversion_step(t, command, signal_to_deliver);
+//
+//    if (result.status == DiversionSession::DIVERSION_EXITED) {
+//      diversion_refcount = 0;
+//      req = GdbRequest(DREQ_NONE);
+//      break;
+//    }
+//
+//    DEBUG_ASSERT(result.status == DiversionSession::DIVERSION_CONTINUE);
+//
+//    maybe_notify_stop(req, result.break_status);
+//  }
+//
+//  LOG(debug) << "... ending debugging diversion";
+//  DEBUG_ASSERT(diversion_refcount == 0);
+//
+//  std::cout << "The kill request from GDBSERVER" << std::endl;
+//  //diversion_session->kill_all_tasks();
+//  std::cout << "End of The kill request from GDBSERVER" << std::endl;
+//
+//  last_query_tuid = saved_query_tuid;
+//  return req;
 }
 
 /**
@@ -969,8 +1000,12 @@ GdbRequest GdbServer::process_debugger_requests(ReportState state) {
       // siginfo and then incorrectly start a diversion and go haywire :-(.
       // Ideally we'd come up with a better way to detect diversions so that
       // "print $_siginfo" works.
-      req = divert(timeline.current_session());
+      std::cout << "Pre-divert" << std::endl;
+      divert(timeline.current_session());
+      req = GdbRequest(DREQ_DETACH);
+      std::cout << "Post-divert" << std::endl;
       if (req.type == DREQ_NONE) {
+        std::cout << "DREQ_NONE" << std::endl;
         continue;
       }
       // Carry on to process the request that was rejected by

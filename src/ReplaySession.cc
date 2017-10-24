@@ -176,6 +176,7 @@ bool ReplaySession::can_clone() {
 }
 
 DiversionSession::shr_ptr ReplaySession::clone_diversion() {
+  std::cout << "Cloning DiversionSession from ReplaySession" << std::endl;
   finish_initializing();
   clear_syscall_bp();
 
@@ -184,9 +185,16 @@ DiversionSession::shr_ptr ReplaySession::clone_diversion() {
 
   DiversionSession::shr_ptr session(new DiversionSession());
   LOG(debug) << "  deepfork session is " << session.get();
+  std::cout << "Session from clone: " << session.get() << std::endl;
+
 
   copy_state_to(*session, emufs(), session->emufs());
   session->finish_initializing();
+
+  for (auto& v : session->tasks()) {
+    Task* t = v.second;
+    std::cout << "Task: " << t->tid << std::endl;
+  }
 
   return session;
 }
