@@ -48,15 +48,11 @@ Session::Session()
 }
 
 Session::~Session() {
-  std::cout << "in __SESSION__ destructor" << std::endl;
   kill_all_tasks();
   LOG(debug) << "Session " << this << " destroyed";
-
   for (auto tg : task_group_map) {
-    std::cout << "task_group_map loop" << std::endl;
     tg.second->forget_session();
   }
-  std::cout << "end of __SESSION__ destructor" << std::endl;
 }
 
 Session::Session(const Session& other) {
@@ -186,9 +182,7 @@ AddressSpace* Session::find_address_space(const AddressSpaceUid& vmuid) const {
 }
 
 void Session::kill_all_tasks() {
-  std::cout << "In session kill_all_tasks" << std::endl;
   for (auto& v : task_map) {
-    std::cout << "First loop" << std::endl;
     Task* t = v.second;
 
     if (!t->is_stopped) {
@@ -233,7 +227,6 @@ void Session::kill_all_tasks() {
     t->flush_regs();
     long result;
     do {
-      std::cout << "First ptrace loop" << std::endl;
       // We have observed this failing with an ESRCH when the thread clearly
       // still exists and is ptraced. Retrying the PTRACE_DETACH seems to
       // work around it.
