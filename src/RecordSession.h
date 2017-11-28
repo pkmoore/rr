@@ -20,6 +20,7 @@ class RecordTask;
 /** Encapsulates additional session state related to recording. */
 class RecordSession : public Session {
 public:
+  bool strace_output = false;
   typedef std::shared_ptr<RecordSession> shr_ptr;
 
   /**
@@ -30,7 +31,8 @@ public:
       const std::vector<std::string>& argv,
       const std::vector<std::string>& extra_env = std::vector<std::string>(),
       SyscallBuffering syscallbuf = ENABLE_SYSCALL_BUF,
-      BindCPU bind_cpu = BIND_CPU);
+      BindCPU bind_cpu = BIND_CPU,
+      bool strace_output = false);
 
   bool use_syscall_buffer() const { return use_syscall_buffer_; }
   size_t syscall_buffer_size() const { return syscall_buffer_size_; }

@@ -1672,7 +1672,7 @@ static string lookup_by_path(const string& name) {
 
 /*static*/ RecordSession::shr_ptr RecordSession::create(
     const vector<string>& argv, const vector<string>& extra_env,
-    SyscallBuffering syscallbuf, BindCPU bind_cpu) {
+    SyscallBuffering syscallbuf, BindCPU bind_cpu, bool strace_output) {
   // The syscallbuf library interposes some critical
   // external symbols like XShmQueryExtension(), so we
   // preload it whether or not syscallbuf is enabled. Indicate here whether
@@ -1754,6 +1754,7 @@ static string lookup_by_path(const string& name) {
 
   shr_ptr session(
       new RecordSession(full_path, argv, env, syscallbuf, bind_cpu));
+  session->strace_output = strace_output;
   return session;
 }
 
@@ -1873,6 +1874,7 @@ RecordSession::RecordResult RecordSession::record_step() {
         desched_state_changed(t);
         break;
       case EV_SYSCALL:
+        t->strace_output = strace_output;
         syscall_state_changed(t, &step_state);
         break;
       case EV_SIGNAL:

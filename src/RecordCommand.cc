@@ -121,6 +121,8 @@ struct RecordFlags {
 
   bool setuid_sudo;
 
+  bool strace_output;
+
   RecordFlags()
       : max_ticks(Scheduler::DEFAULT_MAX_TICKS),
         ignore_sig(0),
@@ -136,7 +138,8 @@ struct RecordFlags {
         wait_for_all(false),
         ignore_nested(false),
         scarce_fds(false),
-        setuid_sudo(false) {}
+        setuid_sudo(false),
+        strace_output(false) {}
 };
 
 static void parse_signal_name(ParsedOption& opt) {
@@ -181,7 +184,8 @@ static bool parse_record_arg(vector<string>& args, RecordFlags& flags) {
     { 't', "continue-through-signal", HAS_PARAMETER },
     { 'u', "cpu-unbound", NO_PARAMETER },
     { 'v', "env", HAS_PARAMETER },
-    { 'w', "wait", NO_PARAMETER }
+    { 'w', "wait", NO_PARAMETER },
+    { 'q', "strace-output", NO_PARAMETER}
   };
   ParsedOption opt;
   auto args_copy = args;
@@ -266,6 +270,9 @@ static bool parse_record_arg(vector<string>& args, RecordFlags& flags) {
     case 'w':
       flags.wait_for_all = true;
       break;
+    case 'q':
+        flags.strace_output = true;
+        break;
     default:
       DEBUG_ASSERT(0 && "Unknown option");
   }
@@ -341,8 +348,8 @@ static WaitStatus record(const vector<string>& args, const RecordFlags& flags) {
   LOG(info) << "Start recording...";
 
   auto session = RecordSession::create(
-      args, flags.extra_env, flags.use_syscall_buffer, flags.bind_cpu);
-  setup_session_from_flags(*session, flags);
+    args, flags.extra_env, flags.use_syscall_buffer, flags.bind_cpu, flags.strace_output);
+  setup_session_from_flags(*session, flags)
 
   static_session = session.get();
 
