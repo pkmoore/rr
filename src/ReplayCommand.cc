@@ -320,6 +320,16 @@ static void serve_replay_no_debugger(const string& trace_dir,
     }
 
     FrameTime before_time = replay_session->trace_reader().time();
+    if(before_time == flags.divert_on_event) {
+      std::cout << "EVENT: " << before_time << " ";
+      DiversionSession::shr_ptr diversion_session = replay_session->clone_diversion();
+      RunCommand rc = RUN_CONTINUE;
+      for (auto& v : diversion_session->tasks()) {
+          Task* t = v.second;
+          t->spin_off_on_next_resume_execution = true;
+          diversion_session->diversion_step(t, rc, 0);
+      }
+    }
     auto result = replay_session->replay_step(cmd);
     FrameTime after_time = replay_session->trace_reader().time();
     DEBUG_ASSERT(after_time >= before_time && after_time <= before_time + 1);
@@ -348,34 +358,7 @@ static void serve_replay_no_debugger(const string& trace_dir,
     DEBUG_ASSERT(!result.break_status.breakpoint_hit);
     DEBUG_ASSERT(cmd == RUN_SINGLESTEP ||
                  !result.break_status.singlestep_complete);
-    if(replay_session->trace_reader().time() == flags.divert_on_event) {
-        DiversionSession::shr_ptr diversion_session = replay_session->clone_diversion();
-        for (auto& v : diversion_session->tasks()) {
-            Task* t = v.second;
-            t->write_mem(REMOTE_PTR_FIELD(t->preload_globals, in_diversion), (unsigned char)1);
-            t->set_syscallbuf_locked(1);
-            std::cout << "Subverting " << t->tid << std::endl;
-            std::cout << "We are about to attempt a pause and detach" << std::endl;
-            kill(t->tid, SIGSTOP);
-            std::cout << "We have sent a sigstop" << std::endl;
-            std::cout << "Attempting ptrace detach" << std::endl;
-            ptrace(PTRACE_DETACH, t->tid, 0, 0);
-            std::cout << "Ptrace detach called" << std::endl;
-            std::cout << "Destabilizing task" << std::endl;
-            t->unstable = true;
-            t->destroy();
-            std::cout << "Task has been made unstable" << std::endl;
-            //  std::cout << "Reattaching ptrace" << std::endl;
-            //  ptrace(PTRACE_ATTACH, t->tid, 0, 0);
-            //  std::cout << "Ptrace maybe attached" << std::endl;
-            //  std::cout << "Continuing" << std::endl;
-            //  kill(t->tid, SIGCONT);
-            //  std::cout << "SIGCONT SENT" << std::endl;
-        }
-        break;
-    }
   }
-
   LOG(info) << "Replayer successfully finished";
 }
 

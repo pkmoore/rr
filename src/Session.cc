@@ -185,6 +185,11 @@ void Session::kill_all_tasks() {
   for (auto& v : task_map) {
     Task* t = v.second;
 
+    if (t->spun_off) {
+      t->destroy();
+      return;
+    }
+
     if (!t->is_stopped) {
       // During recording we might be aborting the recording, in which case
       // one or more tasks might not be stopped. We haven't got any really

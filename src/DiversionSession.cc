@@ -21,17 +21,12 @@ DiversionSession::~DiversionSession() {
   // we've cleaned up here, but sessions can be created and
   // destroyed many times, and we don't want to temporarily hog
   // resources.
-  std::cout << "We are about to kill all tasks" << std::endl;
-  std::cout << "WE ARE NOT KILLING ANYTHING NOW!" << std::endl;
-  //kill_all_tasks();
-  std::cout << "We have killed all tasks" << std::endl;
+  kill_all_tasks();
   DEBUG_ASSERT(tasks().size() == 0 && vms().size() == 0);
   DEBUG_ASSERT(emu_fs->size() == 0);
-  std::cout << "End of DiversionSession destructor" << std::endl;
 }
 
 static void finish_emulated_syscall_with_ret(Task* t, long ret) {
-  std::cout << "finish_emulated_syscall_with_re for " << t->tid << std::endl;
   t->finish_emulated_syscall();
   Registers r = t->regs();
   r.set_syscall_result(ret);
@@ -44,7 +39,6 @@ static void finish_emulated_syscall_with_ret(Task* t, long ret) {
  * returned to the tracee task.
  */
 static void execute_syscall(Task* t) {
-  std::cout << "execute_syscall for " << t->tid << std::endl;
   t->finish_emulated_syscall();
 
   AutoRemoteSyscalls remote(t);
@@ -57,7 +51,6 @@ static void execute_syscall(Task* t) {
 
 template <typename Arch>
 static void process_syscall_arch(Task* t, int syscallno) {
-  std::cout << "process_syscall_arch for " << t->tid << std::endl;
   LOG(debug) << "Processing " << syscall_name(syscallno, Arch::arch());
 
   if (syscallno == Arch::ioctl && t->is_desched_event_syscall()) {
@@ -105,7 +98,6 @@ static void process_syscall_arch(Task* t, int syscallno) {
 }
 
 static void process_syscall(Task* t, int syscallno){
-  std::cout << "processing system call for " << t->tid << std::endl;
   RR_ARCH_FUNCTION(process_syscall_arch, t->arch(), t, syscallno)
 }
 
@@ -115,7 +107,6 @@ static void process_syscall(Task* t, int syscallno){
  */
 DiversionSession::DiversionResult DiversionSession::diversion_step(
     Task* t, RunCommand command, int signal_to_deliver) {
-  std::cout << "diversion_step for " << t->tid << std::endl;
   DEBUG_ASSERT(command != RUN_SINGLESTEP_FAST_FORWARD);
   assert_fully_initialized();
 

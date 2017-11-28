@@ -130,6 +130,10 @@ class Task {
   friend class ReplaySession;
 
 public:
+
+  bool spin_off_on_next_resume_execution = false;
+  bool spun_off = false;
+
   typedef std::vector<WatchConfig> DebugRegs;
 
   /**

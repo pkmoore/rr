@@ -1041,6 +1041,16 @@ void Task::resume_execution(ResumeRequest how, WaitRequest wait_how,
           << "waitpid(" << tid << ", NOHANG) failed with " << wait_ret;
     }
   }
+  if(spin_off_on_next_resume_execution) {
+    write_mem(REMOTE_PTR_FIELD(preload_globals, in_diversion), (unsigned char)1);
+    set_syscallbuf_locked(1);
+    kill(tid, SIGSTOP);
+    ptrace(PTRACE_DETACH, tid, 0, 0);
+    spun_off = true;
+    unstable = true;
+    std::cout << "PID: " << tid << std::endl;
+    return;
+  }
   if (wait_ret > 0) {
     LOG(debug) << "Task " << tid << " exited unexpectedly";
     // wait() will see this and report the ptrace-exit event.
@@ -1913,6 +1923,8 @@ void Task::copy_state(const CapturedState& state) {
   wait_status = state.wait_status;
 
   ticks = state.ticks;
+  LOG(debug) << "copy_state: task: " << tid;
+  LOG(debug) << "copy_state: syscallbuf_child: " << syscallbuf_child;
 }
 
 remote_ptr<const struct syscallbuf_record> Task::next_syscallbuf_record() {
@@ -1993,18 +2005,15 @@ KernelMapping Task::init_syscall_buffer(AutoRemoteSyscalls& remote,
 }
 
 void Task::set_syscallbuf_locked(bool locked) {
-  std::cout << "set_syscallbuf_locked called" << std::endl;
   if (!syscallbuf_child) {
-    std::cout << "early return" << std::endl;
     return;
   }
-  std::cout << "Doing some work around the syscallbuf_locked field" << std::endl;
   remote_ptr<uint8_t> remote_addr = REMOTE_PTR_FIELD(syscallbuf_child, locked);
   uint8_t locked_before = read_mem(remote_addr);
   uint8_t new_locked = locked ? (locked_before | SYSCALLBUF_LOCKED_TRACER)
                               : (locked_before & ~SYSCALLBUF_LOCKED_TRACER);
   if (new_locked != locked_before) {
-    std::cout << "wrote " << locked << "to syscallbuf_locked flag for tid: " << this->tid << std::endl;
+    LOG(debug) << "wrote " << locked << "to syscallbuf_locked flag for tid: " << this->tid;
     write_mem(remote_addr, new_locked);
   }
 }
