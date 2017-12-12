@@ -8,6 +8,8 @@
 #include <unistd.h>
 #include <string>
 
+#include <algorithm>
+
 #include <limits>
 
 #include "Command.h"
@@ -104,7 +106,7 @@ struct ReplayFlags {
   /* When true, echo tracee stdout/stderr writes to console. */
   bool redirect;
 
-  int divert_on_event;
+  std::vector<int> divert_on_event;
 
   // When true make all private mappings shared with the tracee by default
   // to test the corresponding code.
@@ -121,7 +123,7 @@ struct ReplayFlags {
         keep_listening(false),
         gdb_binary_file_path("gdb"),
         redirect(true),
-        divert_on_event(0),
+        divert_on_event({}),
         share_private_mappings(false) {}
 };
 
@@ -151,6 +153,10 @@ static bool parse_replay_arg(vector<string>& args, ReplayFlags& flags) {
   if (!Command::parse_option(args, options, &opt)) {
     return false;
   }
+  std::string events_str;
+  std::string delimiter = ",";
+  int event_i;
+  size_t pos;
 
   switch (opt.short_name) {
     case 'a':
@@ -211,7 +217,14 @@ static bool parse_replay_arg(vector<string>& args, ReplayFlags& flags) {
       flags.gdb_options.push_back(opt.value);
       break;
     case 'n':
-      flags.divert_on_event = std::stoi(opt.value, nullptr, 10);
+      events_str = opt.value;
+      while(events_str.length() > 0) {
+        pos = events_str.find(delimiter);
+        event_i = std::stoi(events_str.substr(0, pos), nullptr, 10);
+        flags.divert_on_event.push_back(event_i);
+        events_str.erase(0, pos + delimiter.length());
+      }
+      break;
     case 0:
       flags.share_private_mappings = true;
       break;
@@ -320,7 +333,7 @@ static void serve_replay_no_debugger(const string& trace_dir,
     }
 
     FrameTime before_time = replay_session->trace_reader().time();
-    if(before_time == flags.divert_on_event) {
+    if(std::find(flags.divert_on_event.begin(), flags.divert_on_event.end(), before_time) != flags.divert_on_event.end()) {
       std::cout << "EVENT: " << before_time << " ";
       DiversionSession::shr_ptr diversion_session = replay_session->clone_diversion();
       RunCommand rc = RUN_CONTINUE;
