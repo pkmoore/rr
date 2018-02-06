@@ -349,7 +349,7 @@ static WaitStatus record(const vector<string>& args, const RecordFlags& flags) {
 
   auto session = RecordSession::create(
     args, flags.extra_env, flags.use_syscall_buffer, flags.bind_cpu, flags.strace_output);
-  setup_session_from_flags(*session, flags)
+  setup_session_from_flags(*session, flags);
 
   static_session = session.get();
 
