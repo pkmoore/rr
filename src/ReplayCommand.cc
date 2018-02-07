@@ -8,6 +8,8 @@
 #include <unistd.h>
 #include <string>
 
+#include <Python.h>
+
 #include <algorithm>
 
 #include <limits>
@@ -23,6 +25,9 @@
 #include "main.h"
 
 using namespace std;
+
+extern PyObject* dump_state_func;
+extern PyObject* print_state_func;
 
 namespace rr {
 
@@ -317,6 +322,8 @@ static void serve_replay_no_debugger(const string& trace_dir,
   uint32_t step_count = 0;
   struct timeval last_dump_time;
   Session::Statistics last_stats;
+  // HACK HACK HACK:  Work around for each event being "handled" twice
+  FrameTime last_event_handled = -1;
   gettimeofday(&last_dump_time, NULL);
 
   while (true) {
@@ -334,13 +341,18 @@ static void serve_replay_no_debugger(const string& trace_dir,
 
     FrameTime before_time = replay_session->trace_reader().time();
     if(std::find(flags.divert_on_event.begin(), flags.divert_on_event.end(), before_time) != flags.divert_on_event.end()) {
-      std::cout << "EVENT: " << before_time << " ";
-      DiversionSession::shr_ptr diversion_session = replay_session->clone_diversion();
-      RunCommand rc = RUN_CONTINUE;
-      for (auto& v : diversion_session->tasks()) {
-          Task* t = v.second;
-          t->spin_off_on_next_resume_execution = true;
-          diversion_session->diversion_step(t, rc, 0);
+      // HACK HACK HACK:  Work around for each event being "handled" twice
+      if(before_time != last_event_handled) { 
+        std::cout << "EVENT: " << before_time << " ";
+        DiversionSession::shr_ptr diversion_session = replay_session->clone_diversion();
+        rrdump_dump_state(int(before_time));
+        RunCommand rc = RUN_CONTINUE;
+        for (auto& v : diversion_session->tasks()) {
+            Task* t = v.second;
+            t->spin_off_on_next_resume_execution = true;
+            diversion_session->diversion_step(t, rc, 0);
+        }
+        last_event_handled = before_time;
       }
     }
     auto result = replay_session->replay_step(cmd);
@@ -585,3 +597,10 @@ int ReplayCommand::run(vector<string>& args) {
 }
 
 } // namespace rr
+
+void rrdump_dump_state(int event) {
+    char argstr[] = "i";
+    if(PyObject_CallFunction(dump_state_func, argstr, event) == NULL) {
+        std::cout << "dump_state call failed" << std::endl;
+    }
+}

@@ -9,6 +9,8 @@
 #include <string.h>
 #include <sys/utsname.h>
 
+#include "Python.h"
+
 #include <sstream>
 
 #include "Command.h"
@@ -197,7 +199,27 @@ bool parse_global_option(std::vector<std::string>& args) {
 
 using namespace rr;
 
+PyObject* process_syscall_func;
+PyObject* dump_state_func;
+PyObject* print_state_func;
+
 int main(int argc, char* argv[]) {
+  Py_Initialize();
+  std::string cpp_rrdump_modname = "rrdump.rrdump";
+  PyObject* py_rrdump_modname = PyString_FromString(cpp_rrdump_modname.c_str());
+  PyObject* py_rrdump_module = PyImport_Import(py_rrdump_modname);
+  PyObject* py_rrdump_dict = PyModule_GetDict(py_rrdump_module);
+  std::string cpp_process_syscall_func_name = "process_syscall";
+  std::string cpp_dump_state_func_name = "dump_state";
+  std::string cpp_print_state_func_name = "print_state";
+  process_syscall_func = PyDict_GetItemString(py_rrdump_dict,
+                                              cpp_process_syscall_func_name.c_str());
+  dump_state_func = PyDict_GetItemString(py_rrdump_dict,
+                                         cpp_dump_state_func_name.c_str());
+  print_state_func = PyDict_GetItemString(py_rrdump_dict,
+                                          cpp_print_state_func_name.c_str());
+
+
   init_random();
 
   vector<string> args;
@@ -233,5 +255,10 @@ int main(int argc, char* argv[]) {
     }
   }
 
-  return command->run(args);
+  auto result = command->run(args);
+  Py_DECREF(py_rrdump_modname);
+  Py_DECREF(py_rrdump_module);
+  Py_Finalize();
+
+  return result;
 }

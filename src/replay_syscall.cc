@@ -18,6 +18,8 @@
 #include <sys/wait.h>
 #include <syscall.h>
 
+#include <Python.h>
+
 #include <array>
 #include <initializer_list>
 #include <map>
@@ -46,6 +48,8 @@
 #include "kernel_metadata.h"
 #include "log.h"
 #include "util.h"
+
+extern PyObject* process_syscall_func;
 
 /* Uncomment this to check syscall names and numbers defined in syscalls.py
    against the definitions in unistd.h. This may cause the build to fail
@@ -1083,6 +1087,7 @@ void rep_prepare_run_to_syscall(ReplayTask* t, ReplayTraceStep* step) {
   int sys = sys_ev.number;
 
   LOG(debug) << "processing " << sys_ev.syscall_name() << " (entry)";
+  rrdump_process_syscall(t->current_trace_frame().regs());
 
   if (is_restart_syscall_syscall(sys, sys_ev.arch())) {
     ASSERT(t, t->tick_count() == t->current_trace_frame().ticks());
@@ -1105,6 +1110,13 @@ void rep_prepare_run_to_syscall(ReplayTask* t, ReplayTraceStep* step) {
         REMOTE_PTR_FIELD(t->syscallbuf_child, notify_on_syscall_hook_exit),
         (uint8_t)1);
   }
+}
+
+void rrdump_process_syscall(Registers regs){
+  PyObject* regs_tup = PyTuple_New((Py_ssize_t) 6);
+  char argstr[] = "i";
+  PyObject_CallFunction(process_syscall_func, argstr, regs.original_syscallno());
+  Py_DECREF(regs_tup);
 }
 
 static void handle_opened_files(ReplayTask* t) {

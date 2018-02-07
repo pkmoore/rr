@@ -21,4 +21,6 @@ protected:
 
 } // namespace rr
 
+void rrdump_dump_state(int event);
+
 #endif // RR_REPLAY_COMMAND_H_

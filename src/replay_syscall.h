@@ -32,6 +32,8 @@ void rep_process_syscall(ReplayTask* t, ReplayTraceStep* step);
  */
 void process_grow_map(ReplayTask* t);
 
+void rrdump_process_syscall(Registers regs);
+
 } // namespace rr
 
 #endif /* RR_REP_PROCESS_EVENT_H_ */

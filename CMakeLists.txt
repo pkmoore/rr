@@ -252,6 +252,20 @@ foreach(py_module ${REQUIRED_PYTHON_MODULES})
   endif()
 endforeach(py_module)
 
+# Install rrdump module
+set(SETUP_PY    "${CMAKE_SOURCE_DIR}/rrdump/setup.py")
+set(DEPS        "${CMAKE_SOURCE_DIR}/rrdump/rrdump/rrdump.py")
+set(OUTPUT      "${CMAKE_SOURCE_DIR}/build/rrdump_timestamp")
+
+add_custom_command(OUTPUT ${OUTPUT}
+  COMMAND ${PYTHON_EXECUTABLE} ${SETUP_PY} install
+  COMMAND ${CMAKE_COMMAND} -E touch ${OUTPUT}
+  DEPENDS ${DEPS})
+
+add_custom_target(target ALL DEPENDS ${OUTPUT})
+
+install(CODE "execute_process(COMMAND ${PYTHON_EXECUTABLE} ${SETUP_PY} install)")
+
 if(WILL_RUN_TESTS)
   # Check for gdb
   execute_process(COMMAND "gdb" "--version" RESULT_VARIABLE module_status OUTPUT_QUIET)
@@ -275,6 +289,7 @@ set_source_files_properties(src/preload/syscallbuf.c
 include_directories("${PROJECT_SOURCE_DIR}/include")
 include_directories("${PROJECT_SOURCE_DIR}/third-party/proc-service")
 include_directories("${PROJECT_SOURCE_DIR}/third-party/brotli/include")
+include_directories("/usr/include/python2.7")
 # We need to know where our generated files are.
 include_directories("${CMAKE_CURRENT_BINARY_DIR}")
 
@@ -466,6 +481,7 @@ endif()
 target_link_libraries(rr
   ${CMAKE_DL_LIBS}
   -lrt
+  -lpython2.7
   brotli
 )
 
