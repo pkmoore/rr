@@ -343,7 +343,7 @@ static void serve_replay_no_debugger(const string& trace_dir,
     if(std::find(flags.divert_on_event.begin(), flags.divert_on_event.end(), before_time) != flags.divert_on_event.end()) {
       // HACK HACK HACK:  Work around for each event being "handled" twice
       if(before_time != last_event_handled) { 
-        std::cout << "EVENT: " << before_time << " ";
+        std::cerr << "EVENT: " << before_time << " ";
         DiversionSession::shr_ptr diversion_session = replay_session->clone_diversion();
         rrdump_dump_state(int(before_time));
         RunCommand rc = RUN_CONTINUE;
@@ -599,8 +599,12 @@ int ReplayCommand::run(vector<string>& args) {
 } // namespace rr
 
 void rrdump_dump_state(int event) {
-    char argstr[] = "i";
-    if(PyObject_CallFunction(dump_state_func, argstr, event) == NULL) {
-        std::cout << "dump_state call failed" << std::endl;
-    }
+  PyObject* event_obj;
+  if((event_obj = PyInt_FromLong((long)event)) == NULL) {
+    std::cerr << "Failed to create event from int" << std::endl;
+  }
+  if(PyObject_CallFunctionObjArgs(dump_state_func, event_obj, NULL) == NULL) {
+    std::cerr << "dump_state call failed" << std::endl;
+    PyErr_Print();
+  }
 }

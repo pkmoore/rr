@@ -1048,7 +1048,7 @@ void Task::resume_execution(ResumeRequest how, WaitRequest wait_how,
     ptrace(PTRACE_DETACH, tid, 0, 0);
     spun_off = true;
     unstable = true;
-    std::cout << "PID: " << tid << std::endl;
+    std::cerr << "PID: " << tid << std::endl;
     return;
   }
   if (wait_ret > 0) {

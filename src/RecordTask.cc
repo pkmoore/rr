@@ -1640,7 +1640,7 @@ void RecordTask::record_event(const Event& ev, FlushSyscallbuf flush,
     }
   }
   if (strace_output) {
-    std::cout << "Regs: " << registers << " " << extra_registers << std::endl;
+    std::cerr << "Regs: " << registers << " " << extra_registers << std::endl;
   }
   trace_writer().write_frame(this, ev, registers, extra_registers);
   LOG(debug) << "Wrote event " << ev << " for time " << current_time;
