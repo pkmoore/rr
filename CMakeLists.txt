@@ -252,20 +252,6 @@ foreach(py_module ${REQUIRED_PYTHON_MODULES})
   endif()
 endforeach(py_module)
 
-# Install rrdump module
-set(SETUP_PY    "${CMAKE_SOURCE_DIR}/rrdump/setup.py")
-set(DEPS        "${CMAKE_SOURCE_DIR}/rrdump/rrdump/rrdump.py")
-set(OUTPUT      "${CMAKE_SOURCE_DIR}/build/rrdump_timestamp")
-
-add_custom_command(OUTPUT ${OUTPUT}
-  COMMAND ${PYTHON_EXECUTABLE} ${SETUP_PY} install
-  COMMAND ${CMAKE_COMMAND} -E touch ${OUTPUT}
-  DEPENDS ${DEPS})
-
-add_custom_target(target ALL DEPENDS ${OUTPUT})
-
-install(CODE "execute_process(COMMAND ${PYTHON_EXECUTABLE} ${SETUP_PY} install)")
-
 if(WILL_RUN_TESTS)
   # Check for gdb
   execute_process(COMMAND "gdb" "--version" RESULT_VARIABLE module_status OUTPUT_QUIET)
