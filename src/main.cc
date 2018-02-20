@@ -219,6 +219,13 @@ int main(int argc, char* argv[]) {
   print_state_func = PyDict_GetItemString(py_rrdump_dict,
                                           cpp_print_state_func_name.c_str());
 
+  if((!PyCallable_Check(process_syscall_func)) ||
+     (!PyCallable_Check(dump_state_func)) ||
+     (!PyCallable_Check(print_state_func)))
+  {
+    std::cerr << "Failed to initialize required rrdump python functions" << std::endl;
+    return 1;
+  }
 
   init_random();
 
