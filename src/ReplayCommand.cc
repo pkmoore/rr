@@ -27,7 +27,6 @@
 using namespace std;
 
 extern PyObject* dump_state_func;
-extern PyObject* print_state_func;
 
 namespace rr {
 

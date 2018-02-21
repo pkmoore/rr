@@ -16,8 +16,3 @@ def dump_state(event):
     name = str(event) + '_state.json'
     with open(name, 'w') as f:
         json.dump(state_dict, f)
-
-def print_state():
-    print(state_dict)
-    
-

@@ -201,7 +201,6 @@ using namespace rr;
 
 PyObject* process_syscall_func;
 PyObject* dump_state_func;
-PyObject* print_state_func;
 
 int main(int argc, char* argv[]) {
   Py_Initialize();
@@ -211,17 +210,13 @@ int main(int argc, char* argv[]) {
   PyObject* py_rrdump_dict = PyModule_GetDict(py_rrdump_module);
   std::string cpp_process_syscall_func_name = "process_syscall";
   std::string cpp_dump_state_func_name = "dump_state";
-  std::string cpp_print_state_func_name = "print_state";
   process_syscall_func = PyDict_GetItemString(py_rrdump_dict,
                                               cpp_process_syscall_func_name.c_str());
   dump_state_func = PyDict_GetItemString(py_rrdump_dict,
                                          cpp_dump_state_func_name.c_str());
-  print_state_func = PyDict_GetItemString(py_rrdump_dict,
-                                          cpp_print_state_func_name.c_str());
 
   if((!PyCallable_Check(process_syscall_func)) ||
-     (!PyCallable_Check(dump_state_func)) ||
-     (!PyCallable_Check(print_state_func)))
+     (!PyCallable_Check(dump_state_func)))
   {
     std::cerr << "Failed to initialize required rrdump python functions" << std::endl;
     return 1;
