@@ -9,8 +9,8 @@ state_dict['open_fds'] = []
 state_dict['syscalls_made'] = []
 
 # Make this track open file descriptors
-def process_syscall(regs):
-    state_dict['syscalls_made'].append(regs)
+def process_syscall(regs, entering):
+    state_dict['syscalls_made'].append((regs, entering))
 
 def dump_state(event):
     name = str(event) + '_state.json'

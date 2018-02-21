@@ -333,6 +333,8 @@ private:
 
   void clear_syscall_bp();
 
+  void rrdump_process_syscall(Registers regs, bool entering);
+
   std::shared_ptr<EmuFs> emu_fs;
   TraceReader trace_in;
   TraceFrame trace_frame;
