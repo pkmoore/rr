@@ -497,7 +497,7 @@ Completion ReplaySession::enter_syscall(ReplayTask* t,
   if (current_trace_frame().event().Syscall().state == ENTERING_SYSCALL) {
     rep_after_enter_syscall(t);
   }
-  rrdump_process_syscall(t->current_trace_frame().regs(), true);
+  rrdump_process_syscall(t->current_trace_frame().regs(), t->arch(), true);
   return COMPLETE;
 }
 
@@ -519,12 +519,13 @@ Completion ReplaySession::exit_syscall(ReplayTask* t) {
     flags |= ReplayTask::IGNORE_ESI;
   }
   t->validate_regs(flags);
-  rrdump_process_syscall(t->current_trace_frame().regs(), false);
+  rrdump_process_syscall(t->current_trace_frame().regs(), t->arch(), false);
   return COMPLETE;
 }
 
-void ReplaySession::rrdump_process_syscall(Registers regs, bool entering){
+  void ReplaySession::rrdump_process_syscall(Registers regs, SupportedArch arch, bool entering){
   PyObject* regs_tup;
+  PyObject* name;
   PyObject* orig_syscallno;
   PyObject* arg1;
   PyObject* arg2;
@@ -533,7 +534,9 @@ void ReplaySession::rrdump_process_syscall(Registers regs, bool entering){
   PyObject* arg5;
   PyObject* arg6;
   PyObject* entering_obj;
-
+  if((name = PyString_FromString(syscall_name(regs.original_syscallno(), arch).c_str())) == NULL) {
+    std::cerr << "Failed to parse name into PyString" << std::endl;
+  }
   if((orig_syscallno = PyInt_FromLong((long)regs.original_syscallno())) == NULL) {
     std::cerr << "Failed to parse orig_syscallno into PyInt" << std::endl;
   }
@@ -556,47 +559,53 @@ void ReplaySession::rrdump_process_syscall(Registers regs, bool entering){
     std::cerr << "Failed to parse arg6 into PyInt" << std::endl;
   }
 
-  if((regs_tup = PyTuple_New((Py_ssize_t) 7)) == NULL) {
+  if((regs_tup = PyTuple_New((Py_ssize_t) 8)) == NULL) {
     std::cerr << "Failed to create registers tuple" << std::endl;
   }
   if(PyTuple_SetItem(regs_tup,
                      (Py_ssize_t)0,
+                     name) != 0)
+  {
+    std::cerr << "Failed to set tuple syscall name" << std::endl;
+  }
+  if(PyTuple_SetItem(regs_tup,
+                     (Py_ssize_t)1,
                      orig_syscallno) != 0)
   {
     std::cerr << "Failed to set tuple orig_syscallno" << std::endl;
   }
   if(PyTuple_SetItem(regs_tup,
-                     (Py_ssize_t)1,
+                     (Py_ssize_t)2,
                      arg1) != 0)
   {
     std::cerr << "Failed to set tuple arg1" << std::endl;
   }
   if(PyTuple_SetItem(regs_tup,
-                     (Py_ssize_t)2,
+                     (Py_ssize_t)3,
                      arg2) != 0)
   {
     std::cerr << "Failed to set tuple arg2" << std::endl;
   }
   if(PyTuple_SetItem(regs_tup,
-                     (Py_ssize_t)3,
+                     (Py_ssize_t)4,
                      arg3) != 0)
   {
     std::cerr << "Failed to set tuple arg3" << std::endl;
   }
   if(PyTuple_SetItem(regs_tup,
-                     (Py_ssize_t)4,
+                     (Py_ssize_t)5,
                      arg4) != 0)
   {
     std::cerr << "Failed to set tuple arg4" << std::endl;
   }
   if(PyTuple_SetItem(regs_tup,
-                     (Py_ssize_t)5,
+                     (Py_ssize_t)6,
                      arg5) != 0)
   {
     std::cerr << "Failed to set tuple arg5" << std::endl;
   }
   if(PyTuple_SetItem(regs_tup,
-                     (Py_ssize_t)6,
+                     (Py_ssize_t)7,
                      arg6) != 0)
   {
     std::cerr << "Failed to set tuple arg6" << std::endl;

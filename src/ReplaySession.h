@@ -333,7 +333,7 @@ private:
 
   void clear_syscall_bp();
 
-  void rrdump_process_syscall(Registers regs, bool entering);
+  void rrdump_process_syscall(Registers regs, SupportedArch arch, bool entering);
 
   std::shared_ptr<EmuFs> emu_fs;
   TraceReader trace_in;
