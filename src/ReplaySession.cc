@@ -10,8 +10,6 @@
 
 #include <algorithm>
 
-#include <Python.h>
-
 #include "AutoRemoteSyscalls.h"
 #include "Flags.h"
 #include "ReplayTask.h"
@@ -523,101 +521,71 @@ Completion ReplaySession::exit_syscall(ReplayTask* t) {
   return COMPLETE;
 }
 
-  void ReplaySession::rrdump_process_syscall(Registers regs, SupportedArch arch, bool entering){
-  PyObject* regs_tup;
+  void ReplaySession::rrdump_process_syscall(Registers regs, SupportedArch arch, bool is_entry){
+  PyObject* state_dict;
   PyObject* name;
-  PyObject* orig_syscallno;
-  PyObject* arg1;
-  PyObject* arg2;
-  PyObject* arg3;
-  PyObject* arg4;
-  PyObject* arg5;
-  PyObject* arg6;
-  PyObject* entering_obj;
+  PyObject* entering;
   if((name = PyString_FromString(syscall_name(regs.original_syscallno(), arch).c_str())) == NULL) {
     std::cerr << "Failed to parse name into PyString" << std::endl;
   }
-  if((orig_syscallno = PyInt_FromLong((long)regs.original_syscallno())) == NULL) {
-    std::cerr << "Failed to parse orig_syscallno into PyInt" << std::endl;
-  }
-  if((arg1 = PyInt_FromLong((long)regs.arg1())) == NULL) {
-    std::cerr << "Failed to parse arg1 into PyInt" << std::endl;
-  }
-  if((arg2 = PyInt_FromLong((long)regs.arg2())) == NULL) {
-    std::cerr << "Failed to parse arg2 into PyInt" << std::endl;
-  }
-  if((arg3 = PyInt_FromLong((long)regs.arg3())) == NULL) {
-    std::cerr << "Failed to parse arg3 into PyInt" << std::endl;
-  }
-  if((arg4 = PyInt_FromLong((long)regs.arg4())) == NULL) {
-    std::cerr << "Failed to parse arg4 into PyInt" << std::endl;
-  }
-  if((arg5 = PyInt_FromLong((long)regs.arg5())) == NULL) {
-    std::cerr << "Failed to parse arg5 into PyInt" << std::endl;
-  }
-  if((arg6 = PyInt_FromLong((long)regs.arg6())) == NULL) {
-    std::cerr << "Failed to parse arg6 into PyInt" << std::endl;
+  entering = PyBool_FromLong(is_entry);
+  if((state_dict = PyDict_New()) == NULL) {
+    std::cerr << "Failed to create state dict" << std::endl;
   }
 
-  if((regs_tup = PyTuple_New((Py_ssize_t) 8)) == NULL) {
-    std::cerr << "Failed to create registers tuple" << std::endl;
-  }
-  if(PyTuple_SetItem(regs_tup,
-                     (Py_ssize_t)0,
-                     name) != 0)
+  std::string name_key = "name";
+  if(PyDict_SetItemString(state_dict,
+                          name_key.c_str(),
+                          name) != 0)
   {
-    std::cerr << "Failed to set tuple syscall name" << std::endl;
+    std::cerr << "Failed to set key: name" << std::endl;
   }
-  if(PyTuple_SetItem(regs_tup,
-                     (Py_ssize_t)1,
-                     orig_syscallno) != 0)
+  std::string entering_key = "entering";
+  if(PyDict_SetItemString(state_dict,
+                          entering_key.c_str(),
+                          entering) != 0)
   {
-    std::cerr << "Failed to set tuple orig_syscallno" << std::endl;
+    std::cerr << "Failed to set key: entering" << std::endl;
   }
-  if(PyTuple_SetItem(regs_tup,
-                     (Py_ssize_t)2,
-                     arg1) != 0)
-  {
-    std::cerr << "Failed to set tuple arg1" << std::endl;
-  }
-  if(PyTuple_SetItem(regs_tup,
-                     (Py_ssize_t)3,
-                     arg2) != 0)
-  {
-    std::cerr << "Failed to set tuple arg2" << std::endl;
-  }
-  if(PyTuple_SetItem(regs_tup,
-                     (Py_ssize_t)4,
-                     arg3) != 0)
-  {
-    std::cerr << "Failed to set tuple arg3" << std::endl;
-  }
-  if(PyTuple_SetItem(regs_tup,
-                     (Py_ssize_t)5,
-                     arg4) != 0)
-  {
-    std::cerr << "Failed to set tuple arg4" << std::endl;
-  }
-  if(PyTuple_SetItem(regs_tup,
-                     (Py_ssize_t)6,
-                     arg5) != 0)
-  {
-    std::cerr << "Failed to set tuple arg5" << std::endl;
-  }
-  if(PyTuple_SetItem(regs_tup,
-                     (Py_ssize_t)7,
-                     arg6) != 0)
-  {
-    std::cerr << "Failed to set tuple arg6" << std::endl;
-  }
-  // Implicit cast from bool to int then promotion to long
-  entering_obj = PyBool_FromLong(entering);
-  if(PyObject_CallFunctionObjArgs(process_syscall_func, regs_tup, entering_obj, NULL) == NULL) {
+  rrdump_insert_register_value_into_dict(state_dict, "orig_syscallno", regs.original_syscallno());
+  rrdump_insert_register_value_into_dict(state_dict, "arg1", regs.arg1());
+  rrdump_insert_register_value_into_dict(state_dict, "arg2", regs.arg2());
+  rrdump_insert_register_value_into_dict(state_dict, "arg3", regs.arg3());
+  rrdump_insert_register_value_into_dict(state_dict, "arg4", regs.arg4());
+  rrdump_insert_register_value_into_dict(state_dict, "arg5", regs.arg5());
+  rrdump_insert_register_value_into_dict(state_dict, "arg6", regs.arg6());
+
+  if(PyObject_CallFunctionObjArgs(process_syscall_func, state_dict, NULL) == NULL) {
     std::cerr << "Calling process_syscall failed" << std::endl;
     PyErr_Print();
   }
-  Py_DECREF(regs_tup);
+  Py_DECREF(state_dict);
+  Py_DECREF(name);
+  Py_DECREF(entering);
 }
+
+
+void ReplaySession::rrdump_insert_register_value_into_dict(PyObject* dict, std::string key, int value) {
+  if(dict == NULL) {
+    std::cerr << "Couldn't insert key:value. Dict is null" << std::endl;
+    return;
+  }
+  Py_INCREF(dict);
+  PyObject* value_obj;
+    if((value_obj = PyInt_FromLong((long)value)) == NULL) {
+    std::cerr << "Failed to parse value into PyInt" << std::endl;
+  }
+  if(PyDict_SetItemString(dict,
+                          key.c_str(),
+                          value_obj) != 0)
+  {
+    std::cerr << "Failed to set key: " << key << " value: " << value << std::endl;
+  }
+  Py_DECREF(dict);
+  Py_DECREF(value_obj);
+}
+
+
 
 void ReplaySession::check_pending_sig(ReplayTask* t) {
   if (!t->stop_sig()) {

@@ -6,6 +6,8 @@
 #include <memory>
 #include <set>
 
+#include <Python.h>
+
 #include "AddressSpace.h"
 #include "CPUIDBugDetector.h"
 #include "DiversionSession.h"
@@ -333,7 +335,8 @@ private:
 
   void clear_syscall_bp();
 
-  void rrdump_process_syscall(Registers regs, SupportedArch arch, bool entering);
+  void rrdump_process_syscall(Registers regs, SupportedArch arch, bool is_entry);
+  void rrdump_insert_register_value_into_dict(PyObject* dict, std::string key, int value);
 
   std::shared_ptr<EmuFs> emu_fs;
   TraceReader trace_in;
