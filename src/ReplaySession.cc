@@ -554,6 +554,7 @@ Completion ReplaySession::exit_syscall(ReplayTask* t) {
   rrdump_insert_register_value_into_dict(state_dict, "arg4", regs.arg4());
   rrdump_insert_register_value_into_dict(state_dict, "arg5", regs.arg5());
   rrdump_insert_register_value_into_dict(state_dict, "arg6", regs.arg6());
+  rrdump_insert_register_value_into_dict(state_dict, "result", regs.syscall_result());
 
   if(PyObject_CallFunctionObjArgs(process_syscall_func, state_dict, NULL) == NULL) {
     std::cerr << "Calling process_syscall failed" << std::endl;
