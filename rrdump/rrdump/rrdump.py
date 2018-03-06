@@ -1,6 +1,9 @@
+"""
+Supplies functions to be called from within rr to handle collecting and
+exporting state needed within the CrashSim Injector
+"""
+
 from __future__ import print_function
-import sys
-import os
 import json
 
 
