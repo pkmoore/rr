@@ -5,7 +5,7 @@ import json
 
 
 state_dict = {}
-state_dict['open_fds'] = [1, 2]
+state_dict['open_fds'] = [0, 1, 2]
 state_dict['syscalls_made'] = []
 
 # Make this track open file descriptors
