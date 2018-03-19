@@ -10,6 +10,8 @@
 
 #include <Python.h>
 
+#include <fstream>
+
 #include <algorithm>
 
 #include <limits>
@@ -346,7 +348,10 @@ static void serve_replay_no_debugger(const string& trace_dir,
     if(std::find(flags.divert_on_event.begin(), flags.divert_on_event.end(), before_time) != flags.divert_on_event.end()) {
       // HACK HACK HACK:  Work around for each event being "handled" twice
       if(before_time != last_event_handled) { 
-        std::cerr << "EVENT: " << before_time << " ";
+        ofstream outfile; 
+        outfile.open("events.log", std::ofstream::app);
+        outfile << "EVENT: " << before_time << " ";
+        outfile.close();
         DiversionSession::shr_ptr diversion_session = replay_session->clone_diversion();
         rrdump_dump_state(int(before_time));
         RunCommand rc = RUN_CONTINUE;
