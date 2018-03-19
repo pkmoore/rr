@@ -222,6 +222,10 @@ static bool parse_replay_arg(vector<string>& args, ReplayFlags& flags) {
       break;
     case 'n':
       events_str = opt.value;
+      // Ensure we have a , delimiter at the end of the string events list
+      if(!events_str.empty() && events_str.back() != ',') {
+          events_str.push_back(',');
+      }
       while(events_str.length() > 0) {
         pos = events_str.find(delimiter);
         event_i = std::stoi(events_str.substr(0, pos), nullptr, 10);
