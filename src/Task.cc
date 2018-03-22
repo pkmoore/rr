@@ -1050,10 +1050,6 @@ void Task::resume_execution(ResumeRequest how, WaitRequest wait_how,
     ptrace(PTRACE_DETACH, tid, 0, 0);
     spun_off = true;
     unstable = true;
-    ofstream outfile; 
-    outfile.open("events.log", std::ofstream::app);
-    outfile << "PID: " << tid << std::endl;
-    outfile.close();
     return;
   }
   if (wait_ret > 0) {
