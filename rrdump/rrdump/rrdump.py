@@ -5,11 +5,25 @@ exporting state needed within the CrashSim Injector
 
 from __future__ import print_function
 import json
+import os
+import os.path
 
 
 state_dict = {}
 state_dict['open_fds'] = [0, 1, 2]
 state_dict['syscalls_made'] = []
+proc_pipe = None
+proc_pipe_name = 'rrdump_proc.pipe'
+
+def write_to_pipe(data):
+    global proc_pipe
+    print('Inside write to pipe')
+    if not proc_pipe:
+        if os.path.exists(proc_pipe_name):
+            os.unlink(proc_pipe_name)
+        os.mkfifo(proc_pipe_name)
+        proc_pipe = open(proc_pipe_name, 'w', 0)
+    proc_pipe.write(data)
 
 def process_syscall(state):
     if state['name'] == 'open' and not state['entering']:

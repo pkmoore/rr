@@ -9,6 +9,7 @@
 #include <string>
 
 #include <Python.h>
+#include <sstream>
 
 #include <fstream>
 
@@ -29,6 +30,7 @@
 using namespace std;
 
 extern PyObject* dump_state_func;
+extern PyObject* write_to_pipe_func;
 
 namespace rr {
 
@@ -359,6 +361,7 @@ static void serve_replay_no_debugger(const string& trace_dir,
             Task* t = v.second;
             t->spin_off_on_next_resume_execution = true;
             diversion_session->diversion_step(t, rc, 0);
+            rrdump_write_to_pipe(before_time, t->tid);
         }
         last_event_handled = before_time;
       }
@@ -615,4 +618,19 @@ void rrdump_dump_state(int event) {
     std::cerr << "dump_state call failed" << std::endl;
     PyErr_Print();
   }
+}
+
+void rrdump_write_to_pipe(int ft, int tid) {
+    PyObject* proc_string_obj;
+    ostringstream os;
+    os << "EVENT: " << ft << " PID: " << tid << "\n";
+    if((proc_string_obj = PyString_FromString(os.str().c_str())) == NULL) {
+        std::cerr << "Failed to create python string" << std::endl;
+    }
+    if(PyObject_CallFunctionObjArgs(write_to_pipe_func,
+                                    proc_string_obj,
+                                    NULL) == NULL) {
+        std::cerr << "write_to_pipe call failed" << std::endl;
+        PyErr_Print();
+    }
 }

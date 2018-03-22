@@ -23,4 +23,6 @@ protected:
 
 void rrdump_dump_state(int event);
 
+void rrdump_write_to_pipe(int ft, int tid);
+
 #endif // RR_REPLAY_COMMAND_H_
