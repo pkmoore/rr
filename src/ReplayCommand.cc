@@ -31,6 +31,7 @@ using namespace std;
 
 extern PyObject* dump_state_func;
 extern PyObject* write_to_pipe_func;
+extern PyObject* close_pipe_func;
 
 namespace rr {
 
@@ -395,6 +396,9 @@ static void serve_replay_no_debugger(const string& trace_dir,
     DEBUG_ASSERT(cmd == RUN_SINGLESTEP ||
                  !result.break_status.singlestep_complete);
   }
+  if(flags.divert_on_event.size() > 0) {
+      rrdump_close_pipe();
+  }
   LOG(info) << "Replayer successfully finished";
 }
 
@@ -631,6 +635,13 @@ void rrdump_write_to_pipe(int ft, int tid) {
                                     proc_string_obj,
                                     NULL) == NULL) {
         std::cerr << "write_to_pipe call failed" << std::endl;
+        PyErr_Print();
+    }
+}
+
+void rrdump_close_pipe() {
+    if(PyObject_CallFunction(close_pipe_func, NULL) == NULL) {
+        std::cerr << "close_pipe call failed" << std::endl;
         PyErr_Print();
     }
 }

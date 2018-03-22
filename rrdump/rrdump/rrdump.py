@@ -25,6 +25,10 @@ def write_to_pipe(data):
         proc_pipe = open(proc_pipe_name, 'w', 0)
     proc_pipe.write(data)
 
+def close_pipe():
+    global proc_pipe
+    proc_pipe.close()
+
 def process_syscall(state):
     if state['name'] == 'open' and not state['entering']:
         open_exit_handler(state)
