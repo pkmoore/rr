@@ -31,9 +31,12 @@ def close_pipe():
 
 def process_syscall(state):
     if state['name'] == 'open' and not state['entering']:
-        open_exit_handler(state)
+        add_result_fd(state)
     if state['name'] == 'close' and not state['entering']:
         close_exit_handler(state)
+    if state['name'] == 'socketcall' and not state['entering']:
+        if state['arg1'] == 1:
+            add_result_fd(state)
     state_dict['syscalls_made'].append(state)
 
 def dump_state(event):
@@ -41,9 +44,12 @@ def dump_state(event):
     with open(name, 'w') as f:
         json.dump(state_dict, f)
 
-def open_exit_handler(state):
+def add_result_fd(state):
+    if state['result'] < 0:
+        return
     if state['result'] in state_dict['open_fds']:
-        raise Exception('Open call returned already open file descriptor')
+        raise Exception('Tried to add already open file descriptor: {}'
+                         .format(state['result']))
     state_dict['open_fds'].append(state['result'])
 
 def close_exit_handler(state):
