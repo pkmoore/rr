@@ -12,6 +12,7 @@ import os.path
 state_dict = {}
 state_dict['open_fds'] = [0, 1, 2]
 state_dict['syscalls_made'] = []
+state_dict['time_call_results'] = []
 proc_pipe = None
 proc_pipe_name = 'rrdump_proc.pipe'
 
@@ -39,6 +40,8 @@ def process_syscall(state):
     if state['name'] == 'socketcall' and not state['entering']:
         if state['arg1'] == 1:
             add_result_fd(state)
+    if state['name'] == 'time' and not state['entering']:
+        time_exit_handler(state)
     state_dict['syscalls_made'].append(state)
 
 def dump_state(event):
@@ -59,3 +62,6 @@ def close_exit_handler(state):
         raise Exception('Successful close call on non-open file descriptor: {}'
                         .format(state['arg1']))
     state_dict['open_fds'].remove(state['arg1'])
+
+def time_exit_handler(state):
+    state_dict['time_call_results'].append(state['result'])
