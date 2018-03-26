@@ -32,6 +32,8 @@ def close_pipe():
 def process_syscall(state):
     if state['name'] == 'open' and not state['entering']:
         add_result_fd(state)
+    if state['name'] == 'epoll_create' and not state['entering']:
+        add_result_fd(state)
     if state['name'] == 'close' and not state['entering']:
         close_exit_handler(state)
     if state['name'] == 'socketcall' and not state['entering']:
