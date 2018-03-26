@@ -53,6 +53,7 @@ def add_result_fd(state):
     state_dict['open_fds'].append(state['result'])
 
 def close_exit_handler(state):
-    if state['arg1'] not in state_dict['open_fds'] and state['result'] != -1:
-        raise Exception('Successful close call on non-open file descriptor')
+    if state['arg1'] not in state_dict['open_fds'] and state['result'] == 0 :
+        raise Exception('Successful close call on non-open file descriptor: {}'
+                        .format(state['arg1']))
     state_dict['open_fds'].remove(state['arg1'])
