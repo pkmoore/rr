@@ -13,6 +13,7 @@ state_dict = {}
 state_dict['open_fds'] = [0, 1, 2]
 state_dict['syscalls_made'] = []
 state_dict['time_call_results'] = []
+state_dict['brks'] = []
 proc_pipe = None
 proc_pipe_name = 'rrdump_proc.pipe'
 
@@ -44,6 +45,13 @@ def process_syscall(state):
     if state['name'] == 'time' and not state['entering']:
         time_exit_handler(state)
     state_dict['syscalls_made'].append(state)
+
+def process_brk(flags, start, size, prot):
+    print('In process brk')
+    state_dict['brks'].append({'flags': flags,
+                               'start': start,
+                               'size': size,
+                               'prot': prot})
 
 def dump_state(event):
     name = str(event) + '_state.json'

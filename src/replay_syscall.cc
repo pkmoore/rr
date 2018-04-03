@@ -17,6 +17,9 @@
 #include <sys/prctl.h>
 #include <sys/wait.h>
 #include <syscall.h>
+#include <cstdint>
+
+#include <Python.h>
 
 #include <array>
 #include <initializer_list>
@@ -46,6 +49,8 @@
 #include "kernel_metadata.h"
 #include "log.h"
 #include "util.h"
+
+extern PyObject* process_brk_func;
 
 /* Uncomment this to check syscall names and numbers defined in syscalls.py
    against the definitions in unistd.h. This may cause the build to fail
@@ -648,6 +653,7 @@ static void process_brk(ReplayTask* t) {
   TraceReader::MappedData data;
   KernelMapping km = t->trace_reader().read_mapped_region(&data);
   // Zero flags means it's an an unmap, or no change.
+  rrdump_process_brk(km);
   if (km.flags()) {
     AutoRemoteSyscalls remote(t);
     ASSERT(t, data.source == TraceReader::SOURCE_ZERO);
@@ -664,6 +670,41 @@ static void process_brk(ReplayTask* t) {
                               km.size());
     t->vm()->unmap(t, km.start(), km.size());
   }
+}
+
+void rrdump_process_brk(KernelMapping km) {
+    PyObject* flags_obj;
+    PyObject* start_obj;
+    PyObject* size_obj;
+    PyObject* prot_obj;
+
+    if((flags_obj = PyInt_FromLong((long)km.flags())) == NULL) {
+        std::cerr << "failed to parse flags into PyInt" << std::endl;
+    }
+    if((start_obj = PyInt_FromLong((long)km.start().as_int())) == NULL) {
+        std::cerr << "failed to parse start into PyInt" << std::endl;
+    }
+    if((size_obj = PyInt_FromLong((long)km.size())) == NULL) {
+        std::cerr << "failed to parse size into PyInt" << std::endl;
+    }
+    if((prot_obj = PyInt_FromLong((long)km.prot())) == NULL) {
+        std::cerr << "failed to parse prot into PyInt" << std::endl;
+    }
+    std::cout << "Before call" << std::endl;
+    if(PyObject_CallFunctionObjArgs(process_brk_func,
+                                    flags_obj,
+                                    start_obj,
+                                    size_obj,
+                                    prot_obj,
+                                    NULL) == NULL) {
+        std::cerr << "Calling process brk failed" << std::endl;
+        PyErr_Print();
+    }
+    std::cout << "After call" << std::endl;
+    Py_DECREF(flags_obj);
+    Py_DECREF(start_obj);
+    Py_DECREF(size_obj);
+    Py_DECREF(prot_obj);
 }
 
 /**
