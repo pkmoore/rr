@@ -38,7 +38,8 @@ def process_syscall(state):
     if state['name'] == 'close' and not state['entering']:
         close_exit_handler(state)
     if state['name'] == 'socketcall' and not state['entering']:
-        if state['arg1'] == 1:
+        # socket, accept, accept4
+        if state['arg1'] == 1 or state['arg1'] == 5 or state['arg1'] == 19:
             add_result_fd(state)
     if state['name'] == 'time' and not state['entering']:
         time_exit_handler(state)
