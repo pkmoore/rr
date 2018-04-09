@@ -12,9 +12,12 @@
 #include "ReplaySession.h"
 #include "ReplayTimeline.h"
 #include "ScopedFd.h"
+#include "ThreadDb.h"
 #include "TraceFrame.h"
 
 namespace rr {
+
+static std::string localhost_addr = "127.0.0.1";
 
 class GdbServer {
   // Not ideal but we can't inherit friend from GdbCommand
@@ -41,6 +44,7 @@ public:
     // specific port to listen on. If keep_listening is on, wait for another
     // debugger connection after the first one is terminated.
     int dbg_port;
+    std::string dbg_host;
     bool keep_listening;
     // If non-null, then when the gdbserver is set up, we write its connection
     // parameters through this pipe. GdbServer::launch_gdb is passed the
@@ -52,6 +56,7 @@ public:
 
     ConnectionFlags()
         : dbg_port(-1),
+          dbg_host(localhost_addr),
           keep_listening(false),
           debugger_params_write_pipe(nullptr) {}
   };
@@ -209,10 +214,12 @@ private:
   // dbg is initially null. Once the debugger connection is established, it
   // never changes.
   std::unique_ptr<GdbConnection> dbg;
-  // When dbg is non-null, the TaskGroupUid of the task being debugged. Never
+  // When dbg is non-null, the ThreadGroupUid of the task being debugged. Never
   // changes once the connection is established --- we don't currently
   // support switching gdb between debuggee processes.
-  TaskGroupUid debuggee_tguid;
+  ThreadGroupUid debuggee_tguid;
+  // ThreadDb for debuggee ThreadGroup
+  std::unique_ptr<ThreadDb> thread_db;
   // The TaskUid of the last continued task.
   TaskUid last_continue_tuid;
   // The TaskUid of the last queried task.

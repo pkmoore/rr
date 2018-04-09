@@ -32,9 +32,7 @@ namespace rr {
 static bool attributes_initialized;
 static struct perf_event_attr ticks_attr;
 static struct perf_event_attr cycles_attr;
-static struct perf_event_attr page_faults_attr;
 static struct perf_event_attr hw_interrupts_attr;
-static struct perf_event_attr instructions_retired_attr;
 static uint32_t skid_size;
 static bool has_ioc_period_bug;
 static bool has_kvm_in_txcp_bug;
@@ -69,7 +67,6 @@ struct PmuConfig {
   CpuMicroarch uarch;
   const char* name;
   unsigned rcb_cntr_event;
-  unsigned rinsn_cntr_event;
   unsigned hw_intr_cntr_event;
   uint32_t skid_size;
   bool supported;
@@ -87,27 +84,19 @@ struct PmuConfig {
 
 // XXX please only edit this if you really know what you're doing.
 static const PmuConfig pmu_configs[] = {
-  { IntelKabylake, "Intel Kabylake", 0x5101c4, 0x5100c0, 0x5301cb, 100, true,
+  { IntelKabylake, "Intel Kabylake", 0x5101c4, 0x5301cb, 100, true, false },
+  { IntelSilvermont, "Intel Silvermont", 0x517ec4, 0x5301cb, 100, true, true },
+  { IntelSkylake, "Intel Skylake", 0x5101c4, 0x5301cb, 100, true, false },
+  { IntelBroadwell, "Intel Broadwell", 0x5101c4, 0x5301cb, 100, true, false },
+  { IntelHaswell, "Intel Haswell", 0x5101c4, 0x5301cb, 100, true, false },
+  { IntelIvyBridge, "Intel Ivy Bridge", 0x5101c4, 0x5301cb, 100, true, false },
+  { IntelSandyBridge, "Intel Sandy Bridge", 0x5101c4, 0x5301cb, 100, true,
     false },
-  { IntelSilvermont, "Intel Silvermont", 0x517ec4, 0x5100c0, 0x5301cb, 100,
-    true, true },
-  { IntelSkylake, "Intel Skylake", 0x5101c4, 0x5100c0, 0x5301cb, 100, true,
-    false },
-  { IntelBroadwell, "Intel Broadwell", 0x5101c4, 0x5100c0, 0x5301cb, 100, true,
-    false },
-  { IntelHaswell, "Intel Haswell", 0x5101c4, 0x5100c0, 0x5301cb, 100, true,
-    false },
-  { IntelIvyBridge, "Intel Ivy Bridge", 0x5101c4, 0x5100c0, 0x5301cb, 100, true,
-    false },
-  { IntelSandyBridge, "Intel Sandy Bridge", 0x5101c4, 0x5100c0, 0x5301cb, 100,
-    true, false },
-  { IntelNehalem, "Intel Nehalem", 0x5101c4, 0x5100c0, 0x50011d, 100, true,
-    false },
-  { IntelWestmere, "Intel Westmere", 0x5101c4, 0x5100c0, 0x50011d, 100, true,
-    false },
-  { IntelPenryn, "Intel Penryn", 0, 0, 0, 100, false, false },
-  { IntelMerom, "Intel Merom", 0, 0, 0, 100, false, false },
-  { AMDRyzen, "AMD Ryzen", 0x5100d1, 0x5100c0, 0, 1000, true, false },
+  { IntelNehalem, "Intel Nehalem", 0x5101c4, 0x50011d, 100, true, false },
+  { IntelWestmere, "Intel Westmere", 0x5101c4, 0x50011d, 100, true, false },
+  { IntelPenryn, "Intel Penryn", 0, 0, 100, false, false },
+  { IntelMerom, "Intel Merom", 0, 0, 100, false, false },
+  { AMDRyzen, "AMD Ryzen", 0x5100d1, 0, 1000, true, false },
 };
 
 static string lowercase(const string& s) {
@@ -131,11 +120,22 @@ static CpuMicroarch get_cpu_microarch() {
         return pmu.uarch;
       }
     }
-    FATAL() << "Forced uarch " << Flags::get().forced_uarch << " isn't known.";
+    CLEAN_FATAL() << "Forced uarch " << Flags::get().forced_uarch
+                  << " isn't known.";
+  }
+
+  auto cpuid_vendor = cpuid(CPUID_GETVENDORSTRING, 0);
+  char vendor[13];
+  memcpy(&vendor[0], &cpuid_vendor.ebx, 4);
+  memcpy(&vendor[4], &cpuid_vendor.edx, 4);
+  memcpy(&vendor[8], &cpuid_vendor.ecx, 4);
+  vendor[12] = 0;
+  if (strcmp(vendor, "GenuineIntel") && strcmp(vendor, "AuthenticAMD")) {
+    CLEAN_FATAL() << "Unknown CPU vendor '" << vendor << "'";
   }
 
   auto cpuid_data = cpuid(CPUID_GETFEATURES, 0);
-  unsigned int cpu_type = (cpuid_data.eax & 0xF0FF0);
+  unsigned int cpu_type = cpuid_data.eax & 0xF0FF0;
   unsigned int ext_family = (cpuid_data.eax >> 20) & 0xff;
   switch (cpu_type) {
     case 0x006F0:
@@ -168,6 +168,7 @@ static CpuMicroarch get_cpu_microarch() {
     case 0x50660:
       return IntelBroadwell;
     case 0x406e0:
+    case 0x50650:
     case 0x506e0:
       return IntelSkylake;
     case 0x50670:
@@ -190,7 +191,15 @@ static CpuMicroarch get_cpu_microarch() {
     default:
       break;
   }
-  FATAL() << "CPU " << HEX(cpu_type) << " unknown.";
+
+  if (!strcmp(vendor, "AuthenticAMD")) {
+    CLEAN_FATAL()
+        << "AMD CPUs not supported.\n"
+        << "For Ryzen, see https://github.com/mozilla/rr/issues/2034.\n"
+        << "For post-Ryzen CPUs, please file a Github issue.";
+  } else {
+    CLEAN_FATAL() << "Intel CPU type " << HEX(cpu_type) << " unknown";
+  }
   return UnknownCpu; // not reached
 }
 
@@ -534,15 +543,11 @@ static void init_attributes() {
   init_perf_event_attr(&ticks_attr, PERF_TYPE_RAW, pmu->rcb_cntr_event);
   init_perf_event_attr(&cycles_attr, PERF_TYPE_HARDWARE,
                        PERF_COUNT_HW_CPU_CYCLES);
-  init_perf_event_attr(&instructions_retired_attr, PERF_TYPE_RAW,
-                       pmu->rinsn_cntr_event);
   init_perf_event_attr(&hw_interrupts_attr, PERF_TYPE_RAW,
                        pmu->hw_intr_cntr_event);
   // libpfm encodes the event with this bit set, so we'll do the
   // same thing.  Unclear if necessary.
   hw_interrupts_attr.exclude_hv = 1;
-  init_perf_event_attr(&page_faults_attr, PERF_TYPE_SOFTWARE,
-                       PERF_COUNT_SW_PAGE_FAULTS);
 
   check_for_bugs();
   /*

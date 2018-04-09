@@ -20,9 +20,8 @@
 namespace rr {
 
 /**
- * Descriptor for task within a task group.  Note: on linux, we can
- * uniquely identify any thread by its |tid| (ignoring pid
- * namespaces).
+ * Descriptor for task.  Note: on linux, we can uniquely identify any thread
+ * by its |tid| (in rr's pid namespace).
  */
 struct GdbThreadId {
   GdbThreadId(pid_t pid = -1, pid_t tid = -1) : pid(pid), tid(tid) {}
@@ -75,6 +74,7 @@ enum GdbRequestType {
 
   /* These use params.target. */
   DREQ_GET_AUXV,
+  DREQ_GET_EXEC_FILE,
   DREQ_GET_IS_THREAD_ALIVE,
   DREQ_GET_THREAD_EXTRA_INFO,
   DREQ_SET_CONTINUE_THREAD,
@@ -414,6 +414,11 @@ public:
   void reply_get_auxv(const std::vector<uint8_t>& auxv);
 
   /**
+   * Reply with the target thread's executable file name
+   */
+  void reply_get_exec_file(const std::string& exec_file);
+
+  /**
    * |alive| is true if the requested thread is alive, false if dead.
    */
   void reply_get_is_thread_alive(bool alive);
@@ -671,7 +676,7 @@ private:
   GdbThreadId query_thread;
   // gdb and rr don't work well together in multi-process and
   // multi-exe-image debugging scenarios, so we pretend only
-  // this task group exists when interfacing with gdb
+  // this thread group exists when interfacing with gdb
   pid_t tgid;
   uint32_t cpu_features_;
   // true when "no-ack mode" enabled, in which we don't have

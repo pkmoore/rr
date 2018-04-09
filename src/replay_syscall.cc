@@ -41,7 +41,7 @@
 #include "ReplayTask.h"
 #include "SeccompFilterRewriter.h"
 #include "StdioMonitor.h"
-#include "TaskGroup.h"
+#include "ThreadGroup.h"
 #include "TraceStream.h"
 #include "VirtualPerfCounterMonitor.h"
 #include "core.h"
@@ -489,7 +489,7 @@ static void process_execve(ReplayTask* t, const TraceFrame& trace_frame,
   /* Complete the syscall. The tid of the task will be the thread-group-leader
    * tid, no matter what tid it was before.
    */
-  pid_t tgid = t->task_group()->real_tgid;
+  pid_t tgid = t->thread_group()->real_tgid;
   __ptrace_cont(t, RESUME_SYSCALL, t->arch(), expect_syscallno,
                 syscall_number_for_execve(trace_frame.regs().arch()),
                 tgid == t->tid ? -1 : tgid);
@@ -515,15 +515,11 @@ static void process_execve(ReplayTask* t, const TraceFrame& trace_frame,
   vector<KernelMapping> kms;
   vector<TraceReader::MappedData> datas;
 
+  TraceTaskEvent tte = read_task_trace_event(t, TraceTaskEvent::EXEC);
+
   // Find the text mapping of the main executable. This is complicated by the
   // fact that the kernel also loads the dynamic linker (if the main
-  // executable specifies an interpreter). To disambiguate, we use the
-  // following criterion: The dynamic linker (if it exists) is a different file
-  // (identified via fsname) that has an executable segment that contains the
-  // ip. To compute this, we find (up to) two kms that have different fsnames
-  // but do each have an executable segment, as well as the km that contains
-  // the ip. This is slightly complicated, but should handle the case where
-  // either file has more than one exectuable segment.
+  // executable specifies an interpreter).
   ssize_t exe_km_option1 = -1, exe_km_option2 = -1, rip_km = -1;
   while (true) {
     TraceReader::MappedData data;
@@ -537,29 +533,43 @@ static void process_execve(ReplayTask* t, const TraceFrame& trace_frame,
       // Skip rr-page mapping record, that gets mapped automatically
       continue;
     }
-    const string& file_name = km.fsname();
-    if ((km.prot() & PROT_EXEC) && file_name.size() > 0 &&
-        // Make sure to exclude [vdso] (and similar) and executable stacks.
-        file_name[0] != '[') {
-      if (exe_km_option1 == -1) {
+
+    if (tte.exe_base()) {
+      // We recorded the executable's start address so we can just use that
+      if (tte.exe_base() == km.start()) {
         exe_km_option1 = kms.size();
-      } else if (exe_km_option2 == -1 &&
-                 kms[exe_km_option1].fsname() != file_name) {
-        exe_km_option2 = kms.size();
-      } else {
-        ASSERT(t,
-               kms[exe_km_option1].fsname() == file_name ||
-                   kms[exe_km_option2].fsname() == file_name);
       }
-    }
-    if (km.contains(trace_frame.regs().ip().to_data_ptr<void>())) {
-      rip_km = kms.size();
+    } else {
+      // To disambiguate, we use the following criterion: The dynamic linker
+      // (if it exists) is a different file (identified via fsname) that has
+      // an executable segment that contains the ip. To compute this, we find
+      // (up to) two kms that have different fsnames but do each have an
+      // executable segment, as well as the km that contains the ip. This is
+      // slightly complicated, but should handle the case where either file has
+      // more than one exectuable segment.
+      const string& file_name = km.fsname();
+      if ((km.prot() & PROT_EXEC) && file_name.size() > 0 &&
+          // Make sure to exclude [vdso] (and similar) and executable stacks.
+          file_name[0] != '[') {
+        if (exe_km_option1 == -1) {
+          exe_km_option1 = kms.size();
+        } else if (exe_km_option2 == -1 &&
+                   kms[exe_km_option1].fsname() != file_name) {
+          exe_km_option2 = kms.size();
+        } else {
+          ASSERT(t,
+                 kms[exe_km_option1].fsname() == file_name ||
+                     kms[exe_km_option2].fsname() == file_name);
+        }
+      }
+      if (km.contains(trace_frame.regs().ip().to_data_ptr<void>())) {
+        rip_km = kms.size();
+      }
     }
     kms.push_back(km);
     datas.push_back(data);
   }
 
-  ASSERT(t, rip_km >= 0) << "No mapping contains the ip?";
   ASSERT(t, exe_km_option1 >= 0) << "No executable mapping?";
 
   ssize_t exe_km = exe_km_option1;
@@ -1015,6 +1025,7 @@ static void process_shmat(ReplayTask* t, const TraceFrame& trace_frame,
     int prot = shm_flags_to_mmap_prot(shm_flags);
     int flags = MAP_SHARED;
     finish_shared_mmap(t, remote, prot, flags, -1, 0, data.file_size_bytes, km);
+    t->vm()->set_shm_size(km.start(), km.size());
 
     // Finally, we finish by emulating the return value.
     remote.regs().set_syscall_result(trace_frame.regs().syscall_result());
@@ -1031,10 +1042,8 @@ static void process_shmdt(ReplayTask* t, const TraceFrame& trace_frame,
 
   {
     AutoRemoteSyscalls remote(t);
-    auto mapping = t->vm()->mapping_of(addr);
-    ASSERT(t, mapping.map.start() == addr);
-    remote.infallible_syscall(syscall_number_for_munmap(t->arch()), addr,
-                              mapping.map.end() - addr);
+    size_t size = t->vm()->get_shm_size(addr);
+    remote.infallible_syscall(syscall_number_for_munmap(t->arch()), addr, size);
     remote.regs().set_syscall_result(trace_frame.regs().syscall_result());
   }
   t->validate_regs();
@@ -1200,7 +1209,9 @@ static void rep_process_syscall_arch(ReplayTask* t, ReplayTraceStep* step,
 
   if (trace_regs.original_syscallno() ==
       SECCOMP_MAGIC_SKIP_ORIGINAL_SYSCALLNO) {
-    // rr vetoed this syscall. Don't do any post-processing.
+    // rr vetoed this syscall. Don't do any post-processing. Do set registers
+    // to match any registers rr modified to fool the signal handler.
+    t->set_regs(trace_regs);
     return;
   }
 

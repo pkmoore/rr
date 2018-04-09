@@ -1438,6 +1438,7 @@ static Switchable prepare_ioctl(RecordTask* t,
     case SIOCGIFNAME:
     case SIOCGIFNETMASK:
     case SIOCGIFMETRIC:
+    case SIOCGIFMAP:
       syscall_state.reg_parameter<typename Arch::ifreq>(3);
       syscall_state.after_syscall_action(record_page_below_stack_ptr);
       return PREVENT_SWITCH;
@@ -1461,10 +1462,6 @@ static Switchable prepare_ioctl(RecordTask* t,
       syscall_state.after_syscall_action(record_page_below_stack_ptr);
       return PREVENT_SWITCH;
     }
-
-    case SIOCGIFMAP:
-      syscall_state.reg_parameter<typename Arch::ifmap>(3);
-      return PREVENT_SWITCH;
 
     case SIOCGSTAMP:
       syscall_state.reg_parameter<typename Arch::timeval>(3);
@@ -1757,7 +1754,7 @@ static bool maybe_emulate_wait(RecordTask* t, TaskSyscallState& syscall_state,
     }
   }
   if (options & WUNTRACED) {
-    for (TaskGroup* child_process : t->task_group()->children()) {
+    for (ThreadGroup* child_process : t->thread_group()->children()) {
       for (Task* child : child_process->task_set()) {
         auto rchild = static_cast<RecordTask*>(child);
         if (rchild->emulated_stop_type == GROUP_STOP &&
@@ -2879,6 +2876,35 @@ static void record_ranges(RecordTask* t,
 }
 
 template <typename Arch>
+static Switchable rec_prepare_open(const std::string& pathname, RecordTask* t,
+                                   const Registers& regs) {
+  if (is_blacklisted_filename(pathname.c_str())) {
+    LOG(warn) << "Cowardly refusing to open " << pathname;
+    Registers r = regs;
+    // Set path to terminating null byte. This forces ENOENT.
+    switch (t->ev().Syscall().number) {
+      case Arch::open:
+        r.set_arg1(remote_ptr<char>(r.arg1()) + pathname.size());
+        break;
+      case Arch::openat:
+        r.set_arg2(remote_ptr<char>(r.arg2()) + pathname.size());
+        break;
+      default:
+        FATAL() << "Unsupported open syscall";
+        break;
+    }
+    t->set_regs(r);
+  } else if (is_gcrypt_deny_file(pathname.c_str())) {
+    // Hijack the syscall.
+    Registers r = regs;
+    r.set_original_syscallno(Arch::gettid);
+    t->set_regs(r);
+    return PREVENT_SWITCH;
+  }
+  return ALLOW_SWITCH;
+}
+
+template <typename Arch>
 static Switchable rec_prepare_syscall_arch(RecordTask* t,
                                            TaskSyscallState& syscall_state,
                                            const Registers& regs) {
@@ -2976,7 +3002,7 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
       return ALLOW_SWITCH;
 
     case Arch::exit_group:
-      if (t->task_group()->task_set().size() == 1) {
+      if (t->thread_group()->task_set().size() == 1) {
         prepare_exit(t, (int)regs.arg1());
         return ALLOW_SWITCH;
       }
@@ -3588,25 +3614,21 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
 
     case Arch::open: {
       string pathname = t->read_c_str(remote_ptr<char>(regs.arg1()));
-      if (is_blacklisted_filename(pathname.c_str())) {
-        LOG(warn) << "Cowardly refusing to open " << pathname;
-        Registers r = regs;
-        // Set path to terminating null byte. This forces ENOENT.
-        r.set_arg1(remote_ptr<char>(r.arg1()) + pathname.size());
-        t->set_regs(r);
-      } else if (is_gcrypt_deny_file(pathname.c_str())) {
-        // Hijack the syscall.
-        Registers r = regs;
-        r.set_original_syscallno(Arch::gettid);
-        t->set_regs(r);
-        return PREVENT_SWITCH;
-      }
-      return ALLOW_SWITCH;
+      return rec_prepare_open<Arch>(pathname, t, regs);
     }
 
     case Arch::openat: {
-      // XXX we really should support blacklisting here
-      return ALLOW_SWITCH;
+      int dirfd = regs.arg1_signed();
+      // With AT_FDCWD, or an absolute path, openat is just open.
+      string pathname = t->read_c_str(remote_ptr<char>(regs.arg2()));
+      if (dirfd != AT_FDCWD && pathname.c_str()[0] != '/') {
+        // Not sure what we should do here. If we need to do something, we
+        // will need to somehow figure out what dirfd refers to, or else let
+        // the tracee do an openat and then look at what it opened and undo
+        // the open if we don't like it.
+        return ALLOW_SWITCH;
+      }
+      return rec_prepare_open<Arch>(pathname, t, regs);
     }
 
     case Arch::close:
@@ -3666,14 +3688,14 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
             r.set_arg1(intptr_t(-1));
             t->set_regs(r);
             syscall_state.emulate_result(0);
-            t->task_group()->dumpable = false;
+            t->thread_group()->dumpable = false;
           } else if (regs.arg2() == 1) {
-            t->task_group()->dumpable = true;
+            t->thread_group()->dumpable = true;
           }
           break;
 
         case PR_GET_DUMPABLE:
-          syscall_state.emulate_result(t->task_group()->dumpable);
+          syscall_state.emulate_result(t->thread_group()->dumpable);
           break;
 
         case PR_GET_SECCOMP:
@@ -3889,6 +3911,13 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
       syscall_state.reg_parameter(
           2, sizeof(typename Arch::epoll_event) * regs.arg3_signed());
       return ALLOW_SWITCH;
+
+    case Arch::epoll_pwait: {
+      syscall_state.reg_parameter(
+          2, sizeof(typename Arch::epoll_event) * regs.arg3_signed());
+      t->invalidate_sigmask();
+      return ALLOW_SWITCH;
+    }
 
     /* The following two syscalls enable context switching not for
      * liveness/correctness reasons, but rather because if we
@@ -4349,8 +4378,6 @@ static void process_execve(RecordTask* t, TaskSyscallState& syscall_state) {
       TraceWriter::RR_BUFFER_MAPPING);
   ASSERT(t, mode == TraceWriter::DONT_RECORD_IN_TRACE);
 
-  t->session().trace_writer().write_task_event(*syscall_state.exec_saved_event);
-
   KernelMapping vvar;
 
   // Write out stack mappings first since during replay we need to set up the
@@ -4363,7 +4390,13 @@ static void process_execve(RecordTask* t, TaskSyscallState& syscall_state) {
     } else if (km.is_vvar()) {
       vvar = km;
     }
+    if (km.fsname() == t->vm()->exe_image() && (km.prot() & PROT_EXEC)) {
+      syscall_state.exec_saved_event->set_exe_base(km.start());
+    }
   }
+  ASSERT(t, !syscall_state.exec_saved_event->exe_base().is_null());
+
+  t->session().trace_writer().write_task_event(*syscall_state.exec_saved_event);
 
   {
     AutoRemoteSyscalls remote(t, AutoRemoteSyscalls::DISABLE_MEMORY_PARAMS);
@@ -4503,7 +4536,7 @@ static void process_mmap(RecordTask* t, size_t length, int prot, int flags,
                    st.st_ino, unique_ptr<struct stat>(new struct stat(st)));
 
   bool adjusted_size = false;
-  if (!st.st_size) {
+  if (!st.st_size && !S_ISREG(st.st_mode)) {
     // Some device files are mmappable but have zero size. Increasing the
     // size here is safe even if the mapped size is greater than the real size.
     st.st_size = offset + size;
@@ -4625,10 +4658,11 @@ static void process_shmat(RecordTask* t, int shmid, int shm_flags,
   KernelMapping km =
       t->vm()->map(t, addr, size, prot, flags, 0, kernel_info.fsname(),
                    kernel_info.device(), kernel_info.inode());
-  if (t->trace_writer().write_mapped_region(t, km, km.fake_stat()) ==
-      TraceWriter::RECORD_IN_TRACE) {
-    t->record_remote(addr, size);
-  }
+  t->vm()->set_shm_size(km.start(), km.size());
+  auto disposition =
+      t->trace_writer().write_mapped_region(t, km, km.fake_stat());
+  ASSERT(t, disposition == TraceWriter::RECORD_IN_TRACE);
+  t->record_remote(addr, size);
 
   LOG(debug) << "Optimistically hoping that SysV segment is not used outside "
                 "of tracees";
@@ -4989,10 +5023,12 @@ static void rec_process_syscall_arch(RecordTask* t,
       break;
     }
 
-    case Arch::open: {
+    case Arch::open:
+    case Arch::openat: {
       // Restore the registers that we may have altered.
       Registers r = t->regs();
       r.set_arg1(syscall_state.syscall_entry_registers.arg1());
+      r.set_arg2(syscall_state.syscall_entry_registers.arg2());
       if (r.original_syscallno() == Arch::gettid) {
         // We hijacked this call to deal with /etc/gcrypt/hwf.deny.
         TempFile file = create_temporary_file("rr-gcrypt-hwf-deny-XXXXXX");
@@ -5001,7 +5037,9 @@ static void rec_process_syscall_arch(RecordTask* t,
         if (!stat("/etc/gcrypt/hwf.deny", &dummy)) {
           // Copy the contents into our temporary file
           ScopedFd existing("/etc/gcrypt/hwf.deny", O_RDONLY);
-          copy_file(t, file.fd, existing);
+          if (!copy_file(file.fd, existing)) {
+            FATAL() << "Can't copy file";
+          }
         }
 
         static const char disable_rdrand[] = "\nintel-rdrand\n";
@@ -5021,7 +5059,7 @@ static void rec_process_syscall_arch(RecordTask* t,
         unlink(file.name.c_str());
 
         // And hand out our fake file.
-        r.set_original_syscallno(Arch::open);
+        r.set_original_syscallno(syscallno);
         r.set_syscall_result(child_fd);
       }
       t->set_regs(r);
@@ -5030,12 +5068,6 @@ static void rec_process_syscall_arch(RecordTask* t,
       }
       break;
     }
-
-    case Arch::openat:
-      if (!t->regs().syscall_failed()) {
-        handle_opened_file(t, (int)t->regs().syscall_result_signed());
-      }
-      break;
 
     case SYS_rrcall_notify_control_msg: {
       auto msg =
@@ -5206,7 +5238,7 @@ static void rec_process_syscall_arch(RecordTask* t,
           if (tracee->emulated_ptracer == t) {
             tracee->emulated_stop_pending = false;
           } else {
-            for (Task* thread : tracee->task_group()->task_set()) {
+            for (Task* thread : tracee->thread_group()->task_set()) {
               auto rt = static_cast<RecordTask*>(thread);
               rt->emulated_stop_pending = false;
             }

@@ -42,11 +42,11 @@ static const char* trim_leading_blanks(const char* str) {
 /**
  * Returns true if a task in t's task-group other than t is doing an exec.
  */
-static bool task_group_in_exec(Task* t) {
+static bool thread_group_in_exec(Task* t) {
   if (!t->session().is_recording()) {
     return false;
   }
-  for (Task* tt : t->task_group()->task_set()) {
+  for (Task* tt : t->thread_group()->task_set()) {
     if (tt == t) {
       continue;
     }
@@ -62,9 +62,9 @@ static bool task_group_in_exec(Task* t) {
 
 KernelMapIterator::KernelMapIterator(Task* t) : tid(t->tid) {
   // See https://lkml.org/lkml/2016/9/21/423
-  ASSERT(t, !task_group_in_exec(t)) << "Task-group in execve, so reading "
-                                       "/proc/.../maps may trigger kernel "
-                                       "deadlock!";
+  ASSERT(t, !thread_group_in_exec(t)) << "Task-group in execve, so reading "
+                                         "/proc/.../maps may trigger kernel "
+                                         "deadlock!";
   init();
 }
 
@@ -1312,7 +1312,7 @@ KernelMapping AddressSpace::vdso() const {
 void AddressSpace::verify(Task* t) const {
   ASSERT(t, task_set().end() != task_set().find(t));
 
-  if (task_group_in_exec(t)) {
+  if (thread_group_in_exec(t)) {
     return;
   }
 
@@ -1393,6 +1393,7 @@ AddressSpace::AddressSpace(Session* session, const AddressSpace& o,
       brk_start(o.brk_start),
       brk_end(o.brk_end),
       mem(o.mem),
+      shm_sizes(o.shm_sizes),
       monitored_mem(o.monitored_mem),
       session_(session),
       vdso_start_addr(o.vdso_start_addr),
@@ -1425,7 +1426,16 @@ AddressSpace::AddressSpace(Session* session, const AddressSpace& o,
 }
 
 void AddressSpace::post_vm_clone(Task* t) {
-  // Recreate preload_thread_locals mapping.
+  if (has_mapping(preload_thread_locals_start()) &&
+      (mapping_flags_of(preload_thread_locals_start()) &
+       AddressSpace::Mapping::IS_THREAD_LOCALS) == 0) {
+    // The tracee already has a mapping at this address that doesn't belong to
+    // us. Don't touch it.
+    return;
+  }
+
+  // Otherwise, the preload_thread_locals mapping is non-existent or ours.
+  // Recreate it.
   AutoRemoteSyscalls remote(t);
   t->session().create_shared_mmap(remote, PRELOAD_THREAD_LOCALS_SIZE,
                                   preload_thread_locals_start(),

@@ -477,6 +477,18 @@ bool GdbConnection::xfer(const char* name, char* args) {
     return true;
   }
 
+  if (!strcmp(name, "exec-file")) {
+    if (strcmp(mode, "read")) {
+      write_packet("");
+      return false;
+    }
+
+    req = GdbRequest(DREQ_GET_EXEC_FILE);
+    req.target.pid = req.target.tid = strtoul(annex, nullptr, 16);
+    // XXX handle offset/len here!
+    return true;
+  }
+
   if (!strcmp(name, "siginfo")) {
     if (strcmp(annex, "")) {
       write_packet("E00");
@@ -637,6 +649,7 @@ bool GdbConnection::query(char* payload) {
                  ";QStartNoAckMode+"
                  ";qXfer:features:read+"
                  ";qXfer:auxv:read+"
+                 ";qXfer:exec-file:read+"
                  ";qXfer:siginfo:read+"
                  ";qXfer:siginfo:write+"
                  ";multiprocess+"
@@ -1447,10 +1460,16 @@ void GdbConnection::notify_stop(GdbThreadId thread, int sig,
   // don't do this, gdb will sometimes continue to send requests
   // for the previously-stopped thread when it obviously intends
   // to be making requests about the stopped thread.
-  // Setting to ANY here will make the client choose the correct default thread.
-  LOG(debug) << "forcing query/resume thread to ANY";
-  query_thread = GdbThreadId::ANY;
-  resume_thread = GdbThreadId::ANY;
+  // To make things even better, gdb expects different behavior
+  // for forward continue/interupt and reverse continue.
+  if (req.is_resume_request() && req.cont().run_direction == RUN_BACKWARD) {
+    LOG(debug) << "Setting query/resume_thread to ANY after reverse continue";
+    query_thread = resume_thread = GdbThreadId::ANY;
+  } else {
+    LOG(debug) << "Setting query/resume_thread to " << thread
+               << " after forward continue or interrupt";
+    query_thread = resume_thread = thread;
+  }
 
   consume_request();
 }
@@ -1480,6 +1499,20 @@ void GdbConnection::reply_get_auxv(const vector<uint8_t>& auxv) {
 
   if (!auxv.empty()) {
     write_binary_packet("l", auxv.data(), auxv.size());
+  } else {
+    write_packet("E01");
+  }
+
+  consume_request();
+}
+
+void GdbConnection::reply_get_exec_file(const string& exec_file) {
+  DEBUG_ASSERT(DREQ_GET_EXEC_FILE == req.type);
+
+  if (!exec_file.empty()) {
+    write_binary_packet("l",
+                        reinterpret_cast<const uint8_t*>(exec_file.c_str()),
+                        exec_file.size());
   } else {
     write_packet("E01");
   }

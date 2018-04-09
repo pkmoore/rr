@@ -17,8 +17,10 @@
 #include <netinet/in.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
+#include <sys/time.h>
 #include <sys/vfs.h>
 #include <unistd.h>
 
@@ -74,7 +76,7 @@ int clone_flags_to_task_flags(int flags_arg) {
   flags |= (CLONE_CHILD_CLEARTID & flags_arg) ? CLONE_CLEARTID : 0;
   flags |= (CLONE_SETTLS & flags_arg) ? CLONE_SET_TLS : 0;
   flags |= (CLONE_SIGHAND & flags_arg) ? CLONE_SHARE_SIGHANDLERS : 0;
-  flags |= (CLONE_THREAD & flags_arg) ? CLONE_SHARE_TASK_GROUP : 0;
+  flags |= (CLONE_THREAD & flags_arg) ? CLONE_SHARE_THREAD_GROUP : 0;
   flags |= (CLONE_VM & flags_arg) ? CLONE_SHARE_VM : 0;
   flags |= (CLONE_FILES & flags_arg) ? CLONE_SHARE_FILES : 0;
   return flags;
@@ -592,9 +594,15 @@ bool should_copy_mmap_region(const KernelMapping& mapping,
   bool private_mapping = (flags & MAP_PRIVATE);
 
   // TODO: handle mmap'd files that are unlinked during
-  // recording.
+  // recording or otherwise not available.
   if (!has_fs_name(file_name)) {
-    LOG(debug) << "  copying unlinked file";
+    // This includes files inaccessible because the tracee is using a different
+    // mount namespace with its own mounts
+    LOG(debug) << "  copying unlinked/inaccessible file";
+    return true;
+  }
+  if (!S_ISREG(stat.st_mode)) {
+    LOG(debug) << "  copying non-regular-file";
     return true;
   }
   if (is_tmp_file(file_name)) {
@@ -678,9 +686,9 @@ bool should_copy_mmap_region(const KernelMapping& mapping,
   if (!can_write_file) {
     /* mmap'ing another user's (non-system) files?  Highly
      * irregular ... */
-    FATAL() << "Unhandled mmap " << file_name << "(prot:" << HEX(prot)
-            << ((flags & MAP_SHARED) ? ";SHARED" : "")
-            << "); uid:" << stat.st_uid << " mode:" << stat.st_mode;
+    LOG(warn) << "Scary mmap " << file_name << "(prot:" << HEX(prot)
+              << ((flags & MAP_SHARED) ? ";SHARED" : "")
+              << "); uid:" << stat.st_uid << " mode:" << stat.st_mode;
   }
   return true;
 }
@@ -908,6 +916,31 @@ bool cpuid_faulting_works() {
   return cpuid_faulting_ok;
 }
 
+const CPUIDRecord* find_cpuid_record(const vector<CPUIDRecord>& records,
+                                     uint32_t eax, uint32_t ecx) {
+  for (const auto& rec : records) {
+    if (rec.eax_in == eax && (rec.ecx_in == ecx || rec.ecx_in == UINT32_MAX)) {
+      return &rec;
+    }
+  }
+  return nullptr;
+}
+
+bool cpuid_compatible(const vector<CPUIDRecord>& trace_records) {
+  // We could compare all CPUID records but that might be fragile (it's hard to
+  // be sure the values don't change in ways applications don't care about).
+  // Let's just check the microarch for now.
+  auto cpuid_data = cpuid(CPUID_GETFEATURES, 0);
+  unsigned int cpu_type = cpuid_data.eax & 0xF0FF0;
+  auto trace_cpuid_data =
+      find_cpuid_record(trace_records, CPUID_GETFEATURES, 0);
+  if (!trace_cpuid_data) {
+    FATAL() << "GETFEATURES missing???";
+  }
+  unsigned int trace_cpu_type = trace_cpuid_data->out.eax & 0xF0FF0;
+  return cpu_type == trace_cpu_type;
+}
+
 template <typename Arch>
 static CloneParameters extract_clone_parameters_arch(const Registers& regs) {
   CloneParameters result;
@@ -1061,6 +1094,11 @@ vector<string> read_proc_status_fields(pid_t tid, const char* name,
   return result;
 }
 
+bool is_zombie_process(pid_t pid) {
+  auto state = read_proc_status_fields(pid, "State");
+  return state.empty() || state[0].empty() || state[0][0] == 'Z';
+}
+
 static bool check_for_pax_kernel() {
   auto results = read_proc_status_fields(getpid(), "PaX");
   return !results.empty();
@@ -1071,16 +1109,19 @@ bool uses_invisible_guard_page() {
   return !is_pax_kernel;
 }
 
-void copy_file(Task* t, int dest_fd, int src_fd) {
-  char buf[1024];
+bool copy_file(int dest_fd, int src_fd) {
+  char buf[32 * 1024];
   while (1) {
     ssize_t bytes_read = read(src_fd, buf, sizeof(buf));
-    ASSERT(t, bytes_read >= 0);
+    if (bytes_read < 0) {
+      return false;
+    }
     if (!bytes_read) {
       break;
     }
     write_all(dest_fd, buf, bytes_read);
   }
+  return true;
 }
 
 void* xmalloc(size_t size) {
@@ -1242,14 +1283,55 @@ void check_for_leaks() {
   }
 }
 
+void ensure_dir(const string& dir, const char* dir_type, mode_t mode) {
+  string d = dir;
+  while (!d.empty() && d[d.length() - 1] == '/') {
+    d = d.substr(0, d.length() - 1);
+  }
+
+  struct stat st;
+  if (0 > stat(d.c_str(), &st)) {
+    if (errno != ENOENT) {
+      FATAL() << "Error accessing " << dir_type << " " << dir << "'";
+    }
+
+    size_t last_slash = d.find_last_of('/');
+    if (last_slash == string::npos || last_slash == 0) {
+      FATAL() << "Can't find directory `" << dir << "'";
+    }
+    ensure_dir(d.substr(0, last_slash), dir_type, mode);
+
+    // Allow for a race condition where someone else creates the directory
+    if (0 > mkdir(d.c_str(), mode) && errno != EEXIST) {
+      FATAL() << "Can't create " << dir_type << " `" << dir << "'";
+    }
+    if (0 > stat(d.c_str(), &st)) {
+      FATAL() << "Can't stat " << dir_type << " `" << dir << "'";
+    }
+  }
+
+  if (!(S_IFDIR & st.st_mode)) {
+    FATAL() << "`" << dir << "' exists but isn't a directory.";
+  }
+  if (access(d.c_str(), W_OK)) {
+    FATAL() << "Can't write to " << dir_type << " `" << dir << "'.";
+  }
+}
+
 const char* tmp_dir() {
   const char* dir = getenv("RR_TMPDIR");
   if (dir) {
+    ensure_dir(string(dir), "temporary file directory (RR_TMPDIR)", S_IRWXU);
     return dir;
   }
   dir = getenv("TMPDIR");
   if (dir) {
+    ensure_dir(string(dir), "temporary file directory (TMPDIR)", S_IRWXU);
     return dir;
+  }
+  // Don't try to create "/tmp", that probably won't work well.
+  if (access("/tmp", W_OK)) {
+    FATAL() << "Can't write to temporary file directory /tmp.";
   }
   return "/tmp";
 }
@@ -1505,6 +1587,32 @@ ssize_t read_to_end(const ScopedFd& fd, size_t offset, void* buf, size_t size) {
     buf = static_cast<uint8_t*>(buf) + r;
   }
   return ret;
+}
+
+static struct rlimit initial_fd_limit;
+
+void raise_resource_limits() {
+  if (getrlimit(RLIMIT_NOFILE, &initial_fd_limit) < 0) {
+    FATAL() << "Can't get RLIMIT_NOFILE";
+  }
+
+  struct rlimit new_limit = initial_fd_limit;
+  // Try raising fd limit to 65536
+  new_limit.rlim_cur = max<rlim_t>(new_limit.rlim_cur, 65536);
+  if (new_limit.rlim_max != RLIM_INFINITY) {
+    new_limit.rlim_cur = min<rlim_t>(new_limit.rlim_cur, new_limit.rlim_max);
+  }
+  if (new_limit.rlim_cur != initial_fd_limit.rlim_cur) {
+    if (setrlimit(RLIMIT_NOFILE, &new_limit) < 0) {
+      LOG(warn) << "Failed to raise file descriptor limit";
+    }
+  }
+}
+
+void restore_initial_resource_limits() {
+  if (setrlimit(RLIMIT_NOFILE, &initial_fd_limit) < 0) {
+    LOG(warn) << "Failed to reset file descriptor limit";
+  }
 }
 
 } // namespace rr

@@ -496,6 +496,8 @@ public:
 
   ~RecordTask();
 
+  void maybe_restore_original_syscall_registers();
+
 private:
   /**
    * Wait for |futex| in this address space to have the value
@@ -539,6 +541,8 @@ private:
   void set_tid_addr(remote_ptr<int> tid_addr);
 
 public:
+  Ticks ticks_at_last_recorded_syscall_exit;
+
   // Scheduler state
 
   Registers registers_at_start_of_last_timeslice;
@@ -662,6 +666,12 @@ public:
   bool break_at_syscallbuf_traced_syscalls;
   bool break_at_syscallbuf_untraced_syscalls;
   bool break_at_syscallbuf_final_instruction;
+
+  // The pmc is programmed to interrupt at a value requested by the tracee, not
+  // by rr.
+  bool next_pmc_interrupt_is_for_user;
+
+  bool did_record_robust_futex_changes;
 };
 
 } // namespace rr

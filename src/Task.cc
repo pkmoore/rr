@@ -271,6 +271,12 @@ static vector<uint8_t> ptrace_get_regs_set(Task* t, const Registers& regs,
   return t->read_mem(iov.iov_base.rptr().template cast<uint8_t>(), iov.iov_len);
 }
 
+static void process_shmdt(Task* t, remote_ptr<void> addr) {
+  size_t size = t->vm()->get_shm_size(addr);
+  t->vm()->remove_shm_size(addr);
+  t->vm()->unmap(t, addr, size);
+}
+
 template <typename Arch>
 void Task::on_syscall_exit_arch(int syscallno, const Registers& regs) {
   session().accumulate_syscall_performed();
@@ -325,12 +331,8 @@ void Task::on_syscall_exit_arch(int syscallno, const Registers& regs) {
       size_t num_bytes = regs.arg2();
       return vm()->unmap(this, addr, num_bytes);
     }
-    case Arch::shmdt: {
-      remote_ptr<void> addr = regs.arg1();
-      auto mapping = vm()->mapping_of(addr);
-      ASSERT(this, mapping.map.start() == addr);
-      return vm()->unmap(this, addr, mapping.map.end() - addr);
-    }
+    case Arch::shmdt:
+      return process_shmdt(this, regs.arg1());
     case Arch::madvise: {
       remote_ptr<void> addr = regs.arg1();
       size_t num_bytes = regs.arg2();
@@ -339,12 +341,8 @@ void Task::on_syscall_exit_arch(int syscallno, const Registers& regs) {
     }
     case Arch::ipc: {
       switch ((int)regs.arg1_signed()) {
-        case SHMDT: {
-          remote_ptr<void> addr = regs.arg5();
-          auto mapping = vm()->mapping_of(addr);
-          ASSERT(this, mapping.map.start() == addr);
-          return vm()->unmap(this, addr, mapping.map.end() - addr);
-        }
+        case SHMDT:
+          return process_shmdt(this, regs.arg5());
         default:
           break;
       }
@@ -644,6 +642,12 @@ bool Task::exit_syscall_and_prepare_restart() {
   // This exits the hijacked SYS_gettid.  Now the tracee is
   // ready to do our bidding.
   if (!exit_syscall()) {
+    // The tracee suddenly exited. To get this to replay correctly, we need to
+    // make it look like we really entered the syscall. Then
+    // handle_ptrace_exit_event will record something appropriate.
+    r.set_original_syscallno(syscallno);
+    r.set_syscall_result(-ENOSYS);
+    set_regs(r);
     return false;
   }
   LOG(debug) << "exit_syscall_and_prepare_restart done";
@@ -714,7 +718,7 @@ void Task::post_exec(const string& exe_file) {
   stopping_breakpoint_table = nullptr;
   stopping_breakpoint_table_entry_size = 0;
   preload_globals = nullptr;
-  task_group()->execed = true;
+  thread_group()->execed = true;
 
   thread_areas_.clear();
   memset(&thread_locals, 0, sizeof(thread_locals));
@@ -1279,11 +1283,6 @@ void Task::update_prname(remote_ptr<void> child_addr) {
   prname = buf;
 }
 
-static bool is_zombie_process(pid_t pid) {
-  auto state = read_proc_status_fields(pid, "State");
-  return state.empty() || state[0] == "Z";
-}
-
 static bool is_signal_triggered_by_ptrace_interrupt(int group_stop_sig) {
   switch (group_stop_sig) {
     case SIGTRAP:
@@ -1508,24 +1507,30 @@ void Task::did_waitpid(WaitStatus status) {
   if (status.ptrace_event() != PTRACE_EVENT_EXIT) {
     ASSERT(this, !registers_dirty) << "Registers shouldn't already be dirty";
   }
-  struct user_regs_struct ptrace_regs;
-  if (ptrace_if_alive(PTRACE_GETREGS, nullptr, &ptrace_regs)) {
-    registers.set_from_ptrace(ptrace_regs);
-#if defined(__i386__) || defined(__x86_64__)
-    // Check the architecture of the task by looking at the
-    // cs segment register and checking if that segment is a long mode segment
-    // (Linux always uses GDT entries for this, which are globally the same).
-    SupportedArch a = is_long_mode_segment(registers.cs()) ? x86_64 : x86;
-    if (a != registers.arch()) {
-      registers.set_arch(a);
+  // If the task was not stopped, we don't need to read the registers.
+  // In fact if we didn't start the thread, we may not have flushed dirty
+  // registers but still received a PTRACE_EVENT_EXIT, in which case the
+  // task's register values are not what they should be.
+  if (!is_stopped) {
+    struct user_regs_struct ptrace_regs;
+    if (ptrace_if_alive(PTRACE_GETREGS, nullptr, &ptrace_regs)) {
       registers.set_from_ptrace(ptrace_regs);
-    }
+#if defined(__i386__) || defined(__x86_64__)
+      // Check the architecture of the task by looking at the
+      // cs segment register and checking if that segment is a long mode segment
+      // (Linux always uses GDT entries for this, which are globally the same).
+      SupportedArch a = is_long_mode_segment(registers.cs()) ? x86_64 : x86;
+      if (a != registers.arch()) {
+        registers.set_arch(a);
+        registers.set_from_ptrace(ptrace_regs);
+      }
 #else
 #error detect architecture here
 #endif
-  } else {
-    LOG(debug) << "Unexpected process death for " << tid;
-    status = WaitStatus::for_ptrace_event(PTRACE_EVENT_EXIT);
+    } else {
+      LOG(debug) << "Unexpected process death for " << tid;
+      status = WaitStatus::for_ptrace_event(PTRACE_EVENT_EXIT);
+    }
   }
 
   is_stopped = true;
@@ -1654,10 +1659,7 @@ Task* Task::clone(CloneReason reason, int flags, remote_ptr<void> stack,
   Task* t =
       new_task_session->new_task(new_tid, new_rec_tid, new_serial, arch());
 
-  bool unmap_buffers = false;
-  bool close_buffers = false;
-
-  if (CLONE_SHARE_TASK_GROUP & flags) {
+  if (CLONE_SHARE_THREAD_GROUP & flags) {
     t->tg = tg;
   } else {
     t->tg = new_task_session->clone(t, tg);
@@ -1679,7 +1681,6 @@ Task* Task::clone(CloneReason reason, int flags, remote_ptr<void> stack,
     }
   } else {
     t->as = new_task_session->clone(t, as);
-    unmap_buffers = as->task_set().size() > 1;
   }
 
   t->syscallbuf_size = syscallbuf_size;
@@ -1696,7 +1697,6 @@ Task* Task::clone(CloneReason reason, int flags, remote_ptr<void> stack,
     t->fds->insert_task(t);
   } else {
     t->fds = fds->clone(t);
-    close_buffers = fds->task_set().size() > 1;
   }
 
   t->top_of_stack = stack;
@@ -1719,28 +1719,18 @@ Task* Task::clone(CloneReason reason, int flags, remote_ptr<void> stack,
   t->as->insert_task(t);
 
   if (reason == TRACEE_CLONE) {
-    if (unmap_buffers) {
-      // Unmap syscallbuf and scratch for tasks that were not cloned into
-      // the new address space
+    if (!(CLONE_SHARE_VM & flags)) {
+      // Unmap syscallbuf and scratch for tasks running the original address
+      // space.
       AutoRemoteSyscalls remote(t);
       for (Task* tt : as->task_set()) {
+        // Leak the scratch buffer for the task we cloned from. We need to do
+        // this because we may be using part of it for the syscallbuf stack
+        // and unmapping it now would cause a crash in the new task.
         if (tt != this) {
           t->unmap_buffers_for(remote, tt, tt->syscallbuf_child);
         }
       }
-    }
-    if (close_buffers) {
-      // Close syscallbuf fds for tasks that were not cloned into
-      // the new fd table
-      AutoRemoteSyscalls remote(t);
-      for (Task* tt : fds->task_set()) {
-        if (tt != this) {
-          t->close_buffers_for(remote, tt);
-        }
-      }
-    }
-
-    if (!(CLONE_SHARE_VM & flags)) {
       as->did_fork_into(t);
     }
 
@@ -1749,6 +1739,12 @@ Task* Task::clone(CloneReason reason, int flags, remote_ptr<void> stack,
       // It should only be closed in |this|.
       t->desched_fd_child = -1;
       t->cloned_file_data_fd_child = -1;
+    } else {
+      // Close syscallbuf fds for tasks using the original fd table.
+      AutoRemoteSyscalls remote(t);
+      for (Task* tt : fds->task_set()) {
+        t->close_buffers_for(remote, tt);
+      }
     }
   }
 
@@ -2280,6 +2276,7 @@ bool Task::ptrace_if_alive(int request, remote_ptr<void> addr, void* data) {
   errno = 0;
   fallible_ptrace(request, addr, data);
   if (errno == ESRCH) {
+    LOG(debug) << "ptrace_if_alive tid " << tid << " was not alive";
     return false;
   }
   ASSERT(this, !errno) << "ptrace(" << ptrace_req_name(request) << ", " << tid
@@ -2431,6 +2428,8 @@ static void spawned_child_fatal_error(const ScopedFd& err_fd,
 static void set_up_process(Session& session, const ScopedFd& err_fd) {
   /* TODO tracees can probably undo some of the setup below
    * ... */
+
+  restore_initial_resource_limits();
 
   /* CLOEXEC so that the original fd here will be closed by the exec that's
    * about to happen.
@@ -2697,16 +2696,7 @@ static void run_initial_child(Session& session, const ScopedFd& error_fd,
   return t;
 }
 
-bool Task::get_tls_address(size_t offset, remote_ptr<void> load_module,
-                           remote_ptr<void>* result) {
-  return tg->thread_db()->get_tls_address(rec_tid, offset, load_module, result);
-}
-
-void Task::register_symbol(const std::string& name, remote_ptr<void> address) {
-  tg->thread_db()->register_symbol(name, address);
-}
-
-const std::set<std::string> Task::get_symbols_and_clear_map() {
-  return tg->thread_db()->get_symbols_and_clear_map();
+void* Task::preload_thread_locals() {
+  return preload_thread_locals_local_addr(*as);
 }
 }

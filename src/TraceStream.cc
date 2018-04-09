@@ -6,6 +6,8 @@
 #include <capnp/serialize-packed.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <sched.h>
+#include <sys/wait.h>
 #include <sysexits.h>
 
 #include <algorithm>
@@ -14,6 +16,7 @@
 #include <string>
 
 #include "AddressSpace.h"
+#include "AutoRemoteSyscalls.h"
 #include "Event.h"
 #include "RecordSession.h"
 #include "RecordTask.h"
@@ -23,6 +26,8 @@
 #include "log.h"
 #include "rr_trace.capnp.h"
 #include "util.h"
+
+#include "rr/rr.h"
 
 using namespace std;
 using namespace capnp;
@@ -114,46 +119,11 @@ static string latest_trace_symlink() {
   return trace_save_dir() + "/latest-trace";
 }
 
-static void ensure_dir(const string& dir, mode_t mode) {
-  string d = dir;
-  while (!d.empty() && d[d.length() - 1] == '/') {
-    d = d.substr(0, d.length() - 1);
-  }
-
-  struct stat st;
-  if (0 > stat(d.c_str(), &st)) {
-    if (errno != ENOENT) {
-      FATAL() << "Error accessing trace directory `" << dir << "'";
-    }
-
-    size_t last_slash = d.find_last_of('/');
-    if (last_slash == string::npos || last_slash == 0) {
-      FATAL() << "Can't find trace directory `" << dir << "'";
-    }
-    ensure_dir(d.substr(0, last_slash), mode);
-
-    // Allow for a race condition where someone else creates the directory
-    if (0 > mkdir(d.c_str(), mode) && errno != EEXIST) {
-      FATAL() << "Can't create trace directory `" << dir << "'";
-    }
-    if (0 > stat(d.c_str(), &st)) {
-      FATAL() << "Can't stat trace directory `" << dir << "'";
-    }
-  }
-
-  if (!(S_IFDIR & st.st_mode)) {
-    FATAL() << "`" << dir << "' exists but isn't a directory.";
-  }
-  if (access(d.c_str(), W_OK)) {
-    FATAL() << "Can't write to `" << dir << "'.";
-  }
-}
-
 /**
  * Create the default ~/.rr directory if it doesn't already exist.
  */
 static void ensure_default_rr_trace_dir() {
-  ensure_dir(default_rr_trace_dir(), S_IRWXU);
+  ensure_dir(default_rr_trace_dir(), "trace directory", S_IRWXU);
 }
 
 class CompressedWriterOutputStream : public kj::OutputStream {
@@ -644,6 +614,7 @@ void TraceWriter::write_task_event(const TraceTaskEvent& event) {
       for (size_t i = 0; i < event_cmd_line.size(); ++i) {
         cmd_line.set(i, str_to_data(event_cmd_line[i]));
       }
+      exec.setExeBase(event.exe_base().as_int());
       break;
     }
     case TraceTaskEvent::EXIT:
@@ -697,6 +668,7 @@ TraceTaskEvent TraceReader::read_task_event(FrameTime* time) {
       for (size_t i = 0; i < cmd_line.size(); ++i) {
         r.cmd_line_[i] = data_to_str(cmd_line[i]);
       }
+      r.exe_base_ = exec.getExeBase();
       break;
     }
     case trace::TaskEvent::Which::EXIT:
@@ -716,7 +688,8 @@ static string base_file_name(const string& file_name) {
                                         : file_name;
 }
 
-string TraceWriter::try_hardlink_file(const string& file_name) {
+bool TraceWriter::try_hardlink_file(const string& file_name,
+                                    std::string* new_name) {
   char count_str[20];
   sprintf(count_str, "%d", mmap_count);
 
@@ -724,10 +697,10 @@ string TraceWriter::try_hardlink_file(const string& file_name) {
       string("mmap_hardlink_") + count_str + "_" + base_file_name(file_name);
   int ret = link(file_name.c_str(), (dir() + "/" + path).c_str());
   if (ret < 0) {
-    // maybe tried to link across filesystems?
-    return file_name;
+    return false;
   }
-  return path;
+  *new_name = path;
+  return true;
 }
 
 bool TraceWriter::try_clone_file(RecordTask* t, const string& file_name,
@@ -763,6 +736,58 @@ bool TraceWriter::try_clone_file(RecordTask* t, const string& file_name,
   return true;
 }
 
+bool TraceWriter::copy_file(const std::string& file_name,
+                            std::string* new_name) {
+  char count_str[20];
+  sprintf(count_str, "%d", mmap_count);
+
+  string path =
+      string("mmap_copy_") + count_str + "_" + base_file_name(file_name);
+
+  ScopedFd src(file_name.c_str(), O_RDONLY);
+  if (!src.is_open()) {
+    LOG(debug) << "Can't open " << file_name;
+    return false;
+  }
+  string dest_path = dir() + "/" + path;
+  ScopedFd dest(dest_path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0700);
+  if (!dest.is_open()) {
+    return false;
+  }
+
+  *new_name = path;
+
+  return rr::copy_file(dest, src);
+}
+
+/**
+ * Given `file_name`, where `file_name` is relative to our root directory
+ * but is in the mount namespace of `t`, try to make it a file we can read.
+ */
+static string try_make_process_file_name(RecordTask* t,
+                                         const std::string& file_name) {
+  char proc_root[32];
+  // /proc/<pid>/root has magical properties; not only is it a link, but
+  // it links to a view of the filesystem as the process sees it, taking into
+  // account the process mount namespace etc.
+  snprintf(proc_root, sizeof(proc_root), "/proc/%d/root", t->tid);
+  char root[PATH_MAX];
+  ssize_t ret = readlink(proc_root, root, sizeof(root) - 1);
+  ASSERT(t, ret >= 0);
+  root[ret] = 0;
+
+  if (strncmp(root, file_name.c_str(), ret)) {
+    LOG(debug) << "File " << file_name << " is outside known root "
+               << proc_root;
+    return file_name;
+  }
+  return string(proc_root) + (ret == 1 ? file_name : file_name.substr(ret));
+}
+
+static bool starts_with(const string& s, const string& with) {
+  return s.find(with) == 0;
+}
+
 TraceWriter::RecordInTrace TraceWriter::write_mapped_region(
     RecordTask* t, const KernelMapping& km, const struct stat& stat,
     MappingOrigin origin) {
@@ -785,36 +810,57 @@ TraceWriter::RecordInTrace TraceWriter::write_mapped_region(
   auto src = map.getSource();
   string backing_file_name;
 
-  if (origin == REMAP_MAPPING || origin == PATCH_MAPPING) {
+  if (origin == REMAP_MAPPING || origin == PATCH_MAPPING ||
+      origin == RR_BUFFER_MAPPING) {
     src.setZero();
-  } else if (km.fsname().find("/SYSV") == 0) {
+  } else if (starts_with(km.fsname(), "/SYSV")) {
     src.setTrace();
   } else if (origin == SYSCALL_MAPPING &&
              (km.inode() == 0 || km.fsname() == "/dev/zero (deleted)")) {
     src.setZero();
-  } else if (origin == RR_BUFFER_MAPPING) {
-    src.setZero();
-  } else if ((km.flags() & MAP_PRIVATE) &&
-             try_clone_file(t, km.fsname(), &backing_file_name)) {
-    src.initFile().setBackingFileName(str_to_data(backing_file_name));
-  } else if (should_copy_mmap_region(km, stat) &&
-             files_assumed_immutable.find(make_pair(
-                 stat.st_dev, stat.st_ino)) == files_assumed_immutable.end()) {
+  } else if (!starts_with(km.fsname(), "/")) {
     src.setTrace();
   } else {
-    // should_copy_mmap_region's heuristics determined it was OK to just map
-    // the file here even if it's MAP_SHARED. So try cloning again to avoid
-    // the possibility of the file changing between recording and replay.
-    if (!try_clone_file(t, km.fsname(), &backing_file_name)) {
-      // Try hardlinking file into the trace directory. This will avoid
-      // replay failures if the original file is deleted or replaced (but not
-      // if it is overwritten in-place). If try_hardlink_file fails it
-      // just returns the original file name.
-      // A relative backing_file_name is relative to the trace directory.
-      backing_file_name = try_hardlink_file(km.fsname());
-      files_assumed_immutable.insert(make_pair(stat.st_dev, stat.st_ino));
+    string file_name = try_make_process_file_name(t, km.fsname());
+    auto assumed_immutable =
+        files_assumed_immutable.find(make_pair(stat.st_dev, stat.st_ino));
+
+    if (assumed_immutable != files_assumed_immutable.end()) {
+      src.initFile().setBackingFileName(str_to_data(assumed_immutable->second));
+    } else if ((km.flags() & MAP_PRIVATE) &&
+               try_clone_file(t, file_name, &backing_file_name)) {
+      src.initFile().setBackingFileName(str_to_data(backing_file_name));
+    } else if (should_copy_mmap_region(km, stat)) {
+      // Make executable files accessible to debuggers by copying the whole
+      // thing into the trace directory. We don't get to compress the data and
+      // the entire file is copied, not just the used region, which is why we
+      // don't do this for all files.
+      // Don't bother trying to copy [vdso].
+      if ((km.prot() & PROT_EXEC) && copy_file(file_name, &backing_file_name)) {
+        src.initFile().setBackingFileName(str_to_data(backing_file_name));
+      } else {
+        src.setTrace();
+      }
+    } else {
+      // should_copy_mmap_region's heuristics determined it was OK to just map
+      // the file here even if it's MAP_SHARED. So try cloning again to avoid
+      // the possibility of the file changing between recording and replay.
+      if (!try_clone_file(t, file_name, &backing_file_name)) {
+        // Try hardlinking file into the trace directory. This will avoid
+        // replay failures if the original file is deleted or replaced (but not
+        // if it is overwritten in-place). If try_hardlink_file fails it
+        // just returns the original file name.
+        // A relative backing_file_name is relative to the trace directory.
+        if (!try_hardlink_file(file_name, &backing_file_name)) {
+          // Don't ever use `file_name` for the `backing_file_name` because it
+          // contains the pid of a recorded process and will not work!
+          backing_file_name = km.fsname();
+        }
+        files_assumed_immutable.insert(
+            make_pair(make_pair(stat.st_dev, stat.st_ino), backing_file_name));
+      }
+      src.initFile().setBackingFileName(str_to_data(backing_file_name));
     }
-    src.initFile().setBackingFileName(str_to_data(backing_file_name));
   }
 
   try {
@@ -911,11 +957,10 @@ KernelMapping TraceReader::read_mapped_region(MappedData* data, bool* found,
         break;
       case trace::MMap::Source::Which::FILE: {
         data->source = SOURCE_FILE;
-        static const string clone_prefix("mmap_clone_");
         string backing_file_name =
             data_to_str(src.getFile().getBackingFileName());
-        bool is_clone =
-            backing_file_name.substr(0, clone_prefix.size()) == clone_prefix;
+        bool is_clone = starts_with(backing_file_name, "mmap_clone_");
+        bool is_copy = starts_with(backing_file_name, "mmap_copy_");
         if (backing_file_name[0] != '/') {
           backing_file_name = dir() + "/" + backing_file_name;
         }
@@ -928,7 +973,7 @@ KernelMapping TraceReader::read_mapped_region(MappedData* data, bool* found,
           FATAL() << "Invalid statSize";
         }
         bool has_stat_buf = mode != 0 || uid != 0 || gid != 0 || mtime != 0;
-        if (!is_clone && validate == VALIDATE && has_stat_buf) {
+        if (!is_clone && !is_copy && validate == VALIDATE && has_stat_buf) {
           struct stat backing_stat;
           if (stat(backing_file_name.c_str(), &backing_stat)) {
             FATAL() << "Failed to stat " << backing_file_name

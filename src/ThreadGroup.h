@@ -24,16 +24,16 @@ class ThreadDb;
  * the ancestor of all other threads in the group.  Each constituent
  * task must own a reference to this.
  */
-class TaskGroup : public HasTaskSet {
+class ThreadGroup : public HasTaskSet {
 public:
-  TaskGroup(Session* session, TaskGroup* parent, pid_t tgid, pid_t real_tgid,
-            uint32_t serial);
-  ~TaskGroup();
+  ThreadGroup(Session* session, ThreadGroup* parent, pid_t tgid,
+              pid_t real_tgid, uint32_t serial);
+  ~ThreadGroup();
 
-  typedef std::shared_ptr<TaskGroup> shr_ptr;
+  typedef std::shared_ptr<ThreadGroup> shr_ptr;
 
   /**
-   * Mark the members of this task group as "unstable",
+   * Mark the members of this thread group as "unstable",
    * meaning that even though a task may look runnable, it
    * actually might not be.  (And so |waitpid(-1)| should be
    * used to schedule the next task.)
@@ -72,7 +72,7 @@ public:
    *
    * So why destabilization?  After (2), rr can't block on the
    * task shutting down (|waitpid(tid)|), because the kernel
-   * harvests the LWPs of the dying task group in an unknown
+   * harvests the LWPs of the dying thread group in an unknown
    * order (which we shouldn't assume, even if we could guess
    * it).  If rr blocks on the task harvest, it will (usually)
    * deadlock.
@@ -82,7 +82,7 @@ public:
    * "schedule".  If it guesses and blocks on another task in
    * the group's status-change, it will (usually) deadlock.
    *
-   * So destabilizing a task group, from rr's perspective, means
+   * So destabilizing a thread group, from rr's perspective, means
    * handing scheduling control back to the kernel and not
    * trying to harvest tasks before detaching from them.
    *
@@ -90,7 +90,7 @@ public:
    * status changes happen as a result of rr resuming the
    * execution of a task.  This is required to keep tracees in
    * known states, preventing events from happening "behind rr's
-   * back".  However, destabilizing a task group means that
+   * back".  However, destabilizing a thread group means that
    * these kinds of changes are possible, in theory.
    *
    * Currently, instability is a one-way street; it's only used
@@ -106,37 +106,33 @@ public:
   Session* session() const { return session_; }
   void forget_session() { session_ = nullptr; }
 
-  TaskGroup* parent() { return parent_; }
-  const std::set<TaskGroup*>& children() { return children_; }
+  ThreadGroup* parent() { return parent_; }
+  const std::set<ThreadGroup*>& children() { return children_; }
 
-  TaskGroupUid tguid() const { return TaskGroupUid(tgid, serial); }
+  ThreadGroupUid tguid() const { return ThreadGroupUid(tgid, serial); }
 
   // We don't allow tasks to make themselves undumpable. If they try,
   // record that here and lie about it if necessary.
   bool dumpable;
 
-  // Whether this task group has execed
+  // Whether this thread group has execed
   bool execed;
 
   // True when a task in the task-group received a SIGSEGV because we
   // couldn't push a signal handler frame. Only used during recording.
   bool received_sigframe_SIGSEGV;
 
-  ThreadDb* thread_db();
-
 private:
-  TaskGroup(const TaskGroup&) = delete;
-  TaskGroup operator=(const TaskGroup&) = delete;
+  ThreadGroup(const ThreadGroup&) = delete;
+  ThreadGroup operator=(const ThreadGroup&) = delete;
 
   Session* session_;
-  /** Parent TaskGroup, or nullptr if it's not a tracee (rr or init). */
-  TaskGroup* parent_;
+  /** Parent ThreadGroup, or nullptr if it's not a tracee (rr or init). */
+  ThreadGroup* parent_;
 
-  std::set<TaskGroup*> children_;
+  std::set<ThreadGroup*> children_;
 
   uint32_t serial;
-
-  std::unique_ptr<ThreadDb> thread_db_;
 };
 
 } // namespace rr

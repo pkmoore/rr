@@ -157,6 +157,7 @@ private:
 RecordTask::RecordTask(RecordSession& session, pid_t _tid, uint32_t serial,
                        SupportedArch a)
     : Task(session, _tid, _tid, serial, a),
+      ticks_at_last_recorded_syscall_exit(0),
       time_at_start_of_last_timeslice(0),
       priority(0),
       in_round_robin_queue(false),
@@ -188,7 +189,9 @@ RecordTask::RecordTask(RecordSession& session, pid_t _tid, uint32_t serial,
       stashed_signals_blocking_more_signals(false),
       break_at_syscallbuf_traced_syscalls(false),
       break_at_syscallbuf_untraced_syscalls(false),
-      break_at_syscallbuf_final_instruction(false) {
+      break_at_syscallbuf_final_instruction(false),
+      next_pmc_interrupt_is_for_user(false),
+      did_record_robust_futex_changes(false) {
   push_event(Event::sentinel());
   if (session.tasks().empty()) {
     // Initial tracee. It inherited its state from this process, so set it up.
@@ -325,6 +328,7 @@ void RecordTask::post_wait_clone(Task* cloned_from, int flags) {
   robust_futex_list = rt->robust_futex_list;
   robust_futex_list_len = rt->robust_futex_list_len;
   tsc_mode = rt->tsc_mode;
+  cpuid_mode = rt->cpuid_mode;
   if (CLONE_SHARE_SIGHANDLERS & flags) {
     sighandlers = rt->sighandlers;
   } else {
@@ -744,7 +748,7 @@ void RecordTask::send_synthetic_SIGCHLD_if_necessary() {
       // check to see if any thread in the ptracer process is in a waitpid that
       // could read the status of 'tracee'. If it is, we should wake up that
       // thread. Otherwise we send SIGCHLD to the ptracer thread.
-      for (Task* t : task_group()->task_set()) {
+      for (Task* t : thread_group()->task_set()) {
         auto rt = static_cast<RecordTask*>(t);
         if (rt->is_waiting_for_ptrace(tracee)) {
           wake_task = rt;
@@ -757,7 +761,7 @@ void RecordTask::send_synthetic_SIGCHLD_if_necessary() {
     }
   }
   if (!need_signal) {
-    for (TaskGroup* child_tg : task_group()->children()) {
+    for (ThreadGroup* child_tg : thread_group()->children()) {
       for (Task* child : child_tg->task_set()) {
         RecordTask* rchild = static_cast<RecordTask*>(child);
         if (rchild->emulated_SIGCHLD_pending) {
@@ -766,7 +770,7 @@ void RecordTask::send_synthetic_SIGCHLD_if_necessary() {
           // that
           // could read the status of 'tracee'. If it is, we should wake up that
           // thread. Otherwise we send SIGCHLD to the ptracer thread.
-          for (Task* t : task_group()->task_set()) {
+          for (Task* t : thread_group()->task_set()) {
             auto rt = static_cast<RecordTask*>(t);
             if (rt->is_waiting_for(rchild)) {
               wake_task = rt;
@@ -850,7 +854,7 @@ bool RecordTask::set_siginfo_for_synthetic_SIGCHLD(siginfo_t* si) {
     }
   }
 
-  for (TaskGroup* child_tg : task_group()->children()) {
+  for (ThreadGroup* child_tg : thread_group()->children()) {
     for (Task* child : child_tg->task_set()) {
       auto rchild = static_cast<RecordTask*>(child);
       if (rchild->emulated_SIGCHLD_pending) {
@@ -869,7 +873,7 @@ bool RecordTask::set_siginfo_for_synthetic_SIGCHLD(siginfo_t* si) {
 bool RecordTask::is_waiting_for_ptrace(RecordTask* t) {
   // This task's process must be a ptracer of t.
   if (!t->emulated_ptracer ||
-      t->emulated_ptracer->task_group() != task_group()) {
+      t->emulated_ptracer->thread_group() != thread_group()) {
     return false;
   }
   // XXX need to check |options| to make sure this task is eligible!!
@@ -894,7 +898,7 @@ bool RecordTask::is_waiting_for_ptrace(RecordTask* t) {
 
 bool RecordTask::is_waiting_for(RecordTask* t) {
   // t must be a child of this task.
-  if (t->task_group()->parent() != task_group().get()) {
+  if (t->thread_group()->parent() != thread_group().get()) {
     return false;
   }
   switch (in_wait_type) {
@@ -1011,7 +1015,7 @@ bool RecordTask::has_any_actionable_signal() {
 
 void RecordTask::emulate_SIGCONT() {
   // All threads in the process are resumed.
-  for (Task* t : task_group()->task_set()) {
+  for (Task* t : thread_group()->task_set()) {
     auto rt = static_cast<RecordTask*>(t);
     LOG(debug) << "setting " << tid << " to NOT_STOPPED due to SIGCONT";
     rt->emulated_stop_pending = false;
@@ -1036,7 +1040,7 @@ void RecordTask::signal_delivered(int sig) {
       // Fall through...
       case SIGSTOP:
         // All threads in the process are stopped.
-        for (Task* t : task_group()->task_set()) {
+        for (Task* t : thread_group()->task_set()) {
           auto rt = static_cast<RecordTask*>(t);
           rt->apply_group_stop(sig);
         }
@@ -1218,7 +1222,6 @@ void RecordTask::stash_sig() {
 
   const siginfo_t& si = get_siginfo();
   stashed_signals.push_back(StashedSignal(si, is_deterministic_signal(this)));
-  wait_status = WaitStatus();
   // Once we've stashed a signal, stop at the next traced/untraced syscall to
   // check whether we need to process the signal before it runs.
   stashed_signals_blocking_more_signals =
@@ -1639,9 +1642,11 @@ void RecordTask::record_event(const Event& ev, FlushSyscallbuf flush,
       extra_registers = &extra_regs();
     }
   }
-  if (strace_output) {
-    std::cerr << "Regs: " << registers << " " << extra_registers << std::endl;
+
+  if (ev.is_syscall_event() && ev.Syscall().state == EXITING_SYSCALL) {
+    ticks_at_last_recorded_syscall_exit = tick_count();
   }
+
   trace_writer().write_frame(this, ev, registers, extra_registers);
   LOG(debug) << "Wrote event " << ev << " for time " << current_time;
 
@@ -1658,7 +1663,7 @@ void RecordTask::record_event(const Event& ev, FlushSyscallbuf flush,
 
 bool RecordTask::is_fatal_signal(int sig,
                                  SignalDeterministic deterministic) const {
-  if (task_group()->received_sigframe_SIGSEGV) {
+  if (thread_group()->received_sigframe_SIGSEGV) {
     // Can't be blocked, caught or ignored
     return true;
   }
@@ -1765,6 +1770,38 @@ void RecordTask::set_tid_and_update_serial(pid_t tid) {
   hpc.set_tid(tid);
   this->tid = rec_tid = tid;
   serial = session().next_task_serial();
+}
+
+template <typename Arch>
+static void maybe_restore_original_syscall_registers_arch(RecordTask* t,
+                                                          void* local_addr) {
+  if (!local_addr) {
+    return;
+  }
+  auto locals = reinterpret_cast<preload_thread_locals<Arch>*>(local_addr);
+  static_assert(sizeof(*locals) <= PRELOAD_THREAD_LOCALS_SIZE,
+                "bad PRELOAD_THREAD_LOCALS_SIZE");
+  if (!locals->original_syscall_parameters) {
+    return;
+  }
+  auto args = t->read_mem(locals->original_syscall_parameters.rptr());
+  Registers r = t->regs();
+  if (args.no != r.syscallno()) {
+    // Maybe a preparatory syscall before the real syscall (e.g. sys_read)
+    return;
+  }
+  r.set_arg1(args.args[0]);
+  r.set_arg2(args.args[1]);
+  r.set_arg3(args.args[2]);
+  r.set_arg4(args.args[3]);
+  r.set_arg5(args.args[4]);
+  r.set_arg6(args.args[5]);
+  t->set_regs(r);
+}
+
+void RecordTask::maybe_restore_original_syscall_registers() {
+  RR_ARCH_FUNCTION(maybe_restore_original_syscall_registers_arch, arch(), this,
+                   preload_thread_locals());
 }
 
 } // namespace rr

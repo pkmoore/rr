@@ -5,6 +5,7 @@
 
 #include <unistd.h>
 
+#include <map>
 #include <memory>
 #include <set>
 #include <string>
@@ -205,9 +206,10 @@ public:
   void make_latest_trace();
 
 private:
-  std::string try_hardlink_file(const std::string& file_name);
+  bool try_hardlink_file(const std::string& file_name, std::string* new_name);
   bool try_clone_file(RecordTask* t, const std::string& file_name,
                       std::string* new_name);
+  bool copy_file(const std::string& file_name, std::string* new_name);
 
   CompressedWriter& writer(Substream s) { return *writers[s]; }
   const CompressedWriter& writer(Substream s) const { return *writers[s]; }
@@ -216,8 +218,11 @@ private:
   /**
    * Files that have already been mapped without being copied to the trace,
    * i.e. that we have already assumed to be immutable.
+   * We store the file name under which we assumed it to be immutable, since
+   * a file may be accessed through multiple names, only some of which
+   * are immutable.
    */
-  std::set<std::pair<dev_t, ino_t>> files_assumed_immutable;
+  std::map<std::pair<dev_t, ino_t>, std::string> files_assumed_immutable;
   std::vector<RawDataMetadata> raw_recs;
   uint32_t mmap_count;
   bool supports_file_data_cloning_;

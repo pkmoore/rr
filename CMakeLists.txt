@@ -32,7 +32,7 @@ set(WILL_RUN_TESTS ${BUILD_TESTS} CACHE BOOL "Run tests")
 # debian is happy with it.  However, "_" is illegal in debs, while RPM
 # is cool with it.  Sigh.
 set(rr_VERSION_MAJOR 5)
-set(rr_VERSION_MINOR 0)
+set(rr_VERSION_MINOR 1)
 set(rr_VERSION_PATCH 0)
 
 add_definitions(-DRR_VERSION="${rr_VERSION_MAJOR}.${rr_VERSION_MINOR}.${rr_VERSION_PATCH}")
@@ -47,7 +47,7 @@ set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -g3")
 set(RR_FLAGS_DEBUG "-Wall -Wextra -Werror -O0 -DDEBUG -UNDEBUG")
 set(RR_FLAGS_RELEASE "-Wall -Wextra -O2 -UDEBUG -DNDEBUG")
 set(RR_TEST_FLAGS "${RR_FLAGS_DEBUG}")
-if(CMAKE_BUILD_TYPE MATCHES "DEBUG")
+if(CMAKE_BUILD_TYPE MATCHES "Debug")
   set(RR_FLAGS ${RR_FLAGS_DEBUG})
 else()
   set(RR_FLAGS ${RR_FLAGS_RELEASE})
@@ -411,7 +411,7 @@ set(RR_SOURCES
   src/Session.cc
   src/StdioMonitor.cc
   src/Task.cc
-  src/TaskGroup.cc
+  src/ThreadGroup.cc
   src/ThreadDb.cc
   src/TraceFrame.cc
   src/TraceStream.cc
@@ -445,6 +445,7 @@ if(RR_BUILD_SHARED)
   set_target_properties(rrbin PROPERTIES ENABLE_EXPORTS true OUTPUT_NAME rr)
   set_target_properties(rrbin PROPERTIES INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/lib")
   set_target_properties(rrbin PROPERTIES INSTALL_RPATH_USE_LINK_PATH true)
+  set_target_properties(brotli PROPERTIES POSITION_INDEPENDENT_CODE ON)
   target_link_libraries(rrbin rr)
   install(TARGETS rr
     RUNTIME DESTINATION bin
@@ -816,9 +817,11 @@ set(BASIC_TESTS
   scm_rights
   seccomp
   seccomp_desched
+  seccomp_kill_exit
   seccomp_null
   seccomp_sigsys_args
   seccomp_sigsys_sigtrap
+  seccomp_sigsys_syscallbuf
   seccomp_tsync
   seccomp_veto_exec
   self_shebang
@@ -833,6 +836,7 @@ set(BASIC_TESTS
   setsid
   setuid
   shm
+  shm_unmap
   sigaction_old
   sigaltstack
   sigchld_interrupt_signal
@@ -937,6 +941,7 @@ set(TESTS_WITH_PROGRAM
   async_signal_syscalls2
   async_signal_syscalls_siginfo
   async_usr1
+  blacklist
   block_clone_checkpoint
   block_clone_interrupted
   block_clone_syscallbuf_overflow
@@ -955,6 +960,8 @@ set(TESTS_WITH_PROGRAM
   checksum_sanity
   check_lost_interrupts
   clone_interruption
+  # Disabled because it fails
+  # clone_share_vm
   clone_vfork
   conditional_breakpoint_calls
   conditional_breakpoint_offload
@@ -967,6 +974,7 @@ set(TESTS_WITH_PROGRAM
   dev_tty
   diversion_syscall
   dlopen
+  exec_failed
   exec_many
   execve_loop
   exit_codes
@@ -1046,6 +1054,9 @@ set(TESTS_WITH_PROGRAM
   ttyname
   unexpected_stack_growth
   user_ignore_sig
+  vdso_gettimeofday_stack
+  vdso_clock_gettime_stack
+  vdso_time_stack
   vfork
   vsyscall_reverse_next
   wait_for_all

@@ -38,12 +38,12 @@ class RecordTask;
 class ReplaySession;
 class ScopedFd;
 class Session;
-class TaskGroup;
+class ThreadGroup;
 
 enum CloneFlags {
   /**
    * The child gets a semantic copy of all parent resources (and
-   * becomes a new task group).  This is the semantics of the
+   * becomes a new thread group).  This is the semantics of the
    * fork() syscall.
    */
   CLONE_SHARE_NOTHING = 0,
@@ -52,8 +52,8 @@ enum CloneFlags {
    * parent.
    */
   CLONE_SHARE_SIGHANDLERS = 1 << 0,
-  /** Child will join its parent's task group. */
-  CLONE_SHARE_TASK_GROUP = 1 << 1,
+  /** Child will join its parent's thread group. */
+  CLONE_SHARE_THREAD_GROUP = 1 << 1,
   /** Child will share its parent's address space. */
   CLONE_SHARE_VM = 1 << 2,
   /** Child will share its parent's file descriptor table. */
@@ -515,12 +515,12 @@ public:
 
   void clear_wait_status() { wait_status = WaitStatus(); }
 
-  /** Return the task group this belongs to. */
-  std::shared_ptr<TaskGroup> task_group() const { return tg; }
+  /** Return the thread group this belongs to. */
+  std::shared_ptr<ThreadGroup> thread_group() const { return tg; }
 
   /** Return the id of this task's recorded thread group. */
   pid_t tgid() const;
-  /** Return id of real OS task group. */
+  /** Return id of real OS thread group. */
   pid_t real_tgid() const;
 
   TaskUid tuid() const { return TaskUid(rec_tid, serial); }
@@ -668,31 +668,10 @@ public:
    */
   void open_mem_fd_if_needed();
 
-  /**
-   * Look up a TLS address for this thread.  |offset| and
-   * |load_module| are as specified in the qGetTLSAddr packet.  If the
-   * address is found, set |*result| and return true.  Otherwise,
-   * return false.
-   */
-  bool get_tls_address(size_t offset, remote_ptr<void> load_module,
-                       remote_ptr<void>* result);
-
-  /**
-   * Indicate that the symbol |name| has the given address.
-   */
-  void register_symbol(const std::string& name, remote_ptr<void> address);
-
-  /**
-   * Return a set of the names of all the symbols that might be needed
-   * by libthread_db.  Also clears the current mapping of symbol names
-   * to addresses.
-   */
-  const std::set<std::string> get_symbols_and_clear_map();
-
   /* True when any assumptions made about the status of this
    * process have been invalidated, and must be re-established
    * with a waitpid() call. Only applies to tasks which are dying, usually
-   * due to a signal sent to the entire task group. */
+   * due to a signal sent to the entire thread group. */
   bool unstable;
   /* exit(), or exit_group() with one task, has been called, so
    * the exit can be treated as stable. */
@@ -980,6 +959,8 @@ protected:
 
   void maybe_workaround_singlestep_bug();
 
+  void* preload_thread_locals();
+
   uint32_t serial;
   // The address space of this task.
   AddressSpace::shr_ptr as;
@@ -1017,8 +998,8 @@ protected:
   bool extra_registers_known;
   // The session we're part of.
   Session* session_;
-  // The task group this belongs to.
-  std::shared_ptr<TaskGroup> tg;
+  // The thread group this belongs to.
+  std::shared_ptr<ThreadGroup> tg;
   // Entries set by |set_thread_area()| or the |tls| argument to |clone()|
   // (when that's a user_desc). May be more than one due to different
   // entry_numbers.

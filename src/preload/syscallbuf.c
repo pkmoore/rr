@@ -1597,12 +1597,6 @@ static long sys_open(const struct syscall_info* call) {
   const char* pathname = (const char*)call->args[0];
   int flags = call->args[1];
   mode_t mode = call->args[2];
-
-  /* NB: not arming the desched event is technically correct,
-   * since open() can't deadlock if it blocks.  However, not
-   * allowing descheds here may cause performance issues if the
-   * open does block for a while.  Err on the side of simplicity
-   * until we have perf data. */
   void* ptr;
   long ret;
 
@@ -1620,6 +1614,37 @@ static long sys_open(const struct syscall_info* call) {
   }
 
   ret = untraced_syscall3(syscallno, pathname, flags, mode);
+  return commit_raw_syscall(syscallno, ptr, ret);
+}
+
+static long sys_openat(const struct syscall_info* call) {
+  const int syscallno = SYS_openat;
+  int dirfd = call->args[0];
+  const char* pathname = (const char*)call->args[1];
+  int flags = call->args[2];
+  mode_t mode = call->args[3];
+  void* ptr;
+  long ret;
+
+  assert(syscallno == call->no);
+
+  /* The strcmp()s done here are OK because we're not in the
+   * critical section yet.
+   * Make non-AT_FDCWD calls with relative paths take the rr path so we can
+   * handle things correctly. New glibc open() implementation uses openat with
+   * AT_FDCWD.
+   */
+  int treat_as_open = dirfd == AT_FDCWD || pathname[0] == '/';
+  if (!treat_as_open || !allow_buffered_open(pathname)) {
+    return traced_raw_syscall(call);
+  }
+
+  ptr = prep_syscall();
+  if (!start_commit_buffered_syscall(syscallno, ptr, MAY_BLOCK)) {
+    return traced_raw_syscall(call);
+  }
+
+  ret = untraced_syscall4(syscallno, dirfd, pathname, flags, mode);
   return commit_raw_syscall(syscallno, ptr, ret);
 }
 
@@ -2460,6 +2485,7 @@ static long syscall_hook_internal(const struct syscall_info* call) {
     CASE_GENERIC_NONBLOCKING(mknod);
     CASE(mprotect);
     CASE(open);
+    CASE(openat);
     CASE(poll);
 #if defined(__x86_64__)
     CASE(pread64);
@@ -2541,6 +2567,8 @@ RR_HIDDEN long syscall_hook(const struct syscall_info* call) {
     return traced_raw_syscall(call);
   }
 
+  thread_locals->original_syscall_parameters = call;
+
   if (impose_syscall_delay) {
     do_delay();
   }
@@ -2596,5 +2624,6 @@ RR_HIDDEN long syscall_hook(const struct syscall_info* call) {
                                thread_locals->notify_control_msg);
     thread_locals->notify_control_msg = NULL;
   }
+  thread_locals->original_syscall_parameters = NULL;
   return result;
 }

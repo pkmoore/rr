@@ -90,6 +90,11 @@ static void install_filter(void) {
     BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_ioctl, 0, 1),
     /* Trigger SIGSYS */
     BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
+    /* Jump forward 1 instruction if system call number
+       is not SYS_sched_yield */
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_sched_yield, 0, 1),
+    /* Kill process */
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL),
     /* Destination of system call number mismatch: allow other
        system calls */
     BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)
@@ -163,10 +168,13 @@ int main(void) {
   test_assert(1 == read(pipe_fds[0], &ch, 1));
 
   test_assert(syscall(SYS_geteuid) == 42);
-  open("/dev/null", O_RDONLY);
+  /* Use syscall directly since glibc 2.26 uses SYS_openat to implement open. */
+  syscall(SYS_open, "/dev/null", O_RDONLY);
   test_assert(count_SIGSYS == 2);
 
   atomic_puts("SUCCESS");
 
+  sched_yield();
+  abort();
   return 0;
 }

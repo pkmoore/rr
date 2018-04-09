@@ -209,7 +209,7 @@ public:
    * Returns true if the next step for this session is to exit a syscall with
    * the given number.
    */
-  bool next_step_is_syscall_exit(int syscallno);
+  bool next_step_is_successful_syscall_exit(int syscallno);
 
   /**
    * The current ReplayStepKey.
@@ -314,9 +314,9 @@ private:
                                      const StepConstraints& constraints);
   void check_ticks_consistency(ReplayTask* t, const Event& ev);
   void check_pending_sig(ReplayTask* t);
-  void continue_or_step(ReplayTask* t, const StepConstraints& constraints,
-                        TicksRequest tick_request,
-                        ResumeRequest resume_how = RESUME_SYSEMU);
+  Completion continue_or_step(ReplayTask* t, const StepConstraints& constraints,
+                              TicksRequest tick_request,
+                              ResumeRequest resume_how = RESUME_SYSEMU);
   Completion advance_to_ticks_target(ReplayTask* t,
                                      const StepConstraints& constraints);
   Completion emulate_deterministic_signal(ReplayTask* t, int sig,
