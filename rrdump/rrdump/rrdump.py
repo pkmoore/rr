@@ -14,6 +14,7 @@ state_dict['open_fds'] = [0, 1, 2]
 state_dict['syscalls_made'] = []
 state_dict['time_call_results'] = []
 state_dict['brks'] = []
+state_dict['gettimeofdays'] = []
 proc_pipe = None
 proc_pipe_name = 'rrdump_proc.pipe'
 
@@ -52,6 +53,10 @@ def process_brk(flags, start, size, prot):
                                'start': start,
                                'size': size,
                                'prot': prot})
+
+def process_gettimeofday(seconds, microseconds):
+    state_dict['gettimeofdays'].append({'seconds': seconds,
+                                        'microseconds': microseconds})
 
 def dump_state(event):
     name = str(event) + '_state.json'

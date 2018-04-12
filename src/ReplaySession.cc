@@ -10,6 +10,8 @@
 
 #include <algorithm>
 
+#include <sys/time.h>
+
 #include "AutoRemoteSyscalls.h"
 #include "Flags.h"
 #include "ReplayTask.h"
@@ -23,6 +25,7 @@
 #include "util.h"
 
 extern PyObject* process_syscall_func;
+extern PyObject* process_gettimeofday_func;
 
 using namespace std;
 
@@ -489,7 +492,7 @@ Completion ReplaySession::enter_syscall(ReplayTask* t,
   if (current_trace_frame().event().Syscall().state == ENTERING_SYSCALL) {
     rep_after_enter_syscall(t);
   }
-  rrdump_process_syscall(t->current_trace_frame().regs(), t->arch(), true);
+  rrdump_process_syscall(t, true);
   return COMPLETE;
 }
 
@@ -511,15 +514,19 @@ Completion ReplaySession::exit_syscall(ReplayTask* t) {
     flags |= ReplayTask::IGNORE_ESI;
   }
   t->validate_regs(flags);
-  rrdump_process_syscall(t->current_trace_frame().regs(), t->arch(), false);
+  rrdump_process_syscall(t,  false);
   return COMPLETE;
 }
 
-  void ReplaySession::rrdump_process_syscall(Registers regs, SupportedArch arch, bool is_entry){
+void ReplaySession::rrdump_process_syscall(ReplayTask* t, bool is_entry) {
   PyObject* state_dict;
   PyObject* name;
   PyObject* entering;
-  if((name = PyString_FromString(syscall_name(regs.original_syscallno(), arch).c_str())) == NULL) {
+  std::string name_str;
+  Registers regs = t->current_trace_frame().regs();
+  SupportedArch arch = t->arch();
+  name_str = syscall_name(regs.original_syscallno(), arch);
+  if((name = PyString_FromString(name_str.c_str())) == NULL) {
     std::cerr << "Failed to parse name into PyString" << std::endl;
   }
   entering = PyBool_FromLong(is_entry);
@@ -554,9 +561,35 @@ Completion ReplaySession::exit_syscall(ReplayTask* t) {
     std::cerr << "Calling process_syscall failed" << std::endl;
     PyErr_Print();
   }
+
+  if((name_str.compare("gettimeofday") == 0) && !is_entry) {
+    rrdump_process_gettimeofday(t);
+  }
+
   Py_DECREF(state_dict);
   Py_DECREF(name);
   Py_DECREF(entering);
+}
+
+void ReplaySession::rrdump_process_gettimeofday(ReplayTask* t) {
+  PyObject* seconds;
+  PyObject* microseconds;
+  size_t nbytes = sizeof(struct timeval);
+  char buf[nbytes];
+  struct timeval* tval;
+  remote_ptr<void> addr = t->current_trace_frame().regs().arg1();
+  t->read_bytes_helper(addr, nbytes, buf);
+  tval = (struct timeval*)buf;
+  if((seconds = PyLong_FromLong(tval->tv_sec)) == NULL) {
+    std::cerr << "Couldn't parse tv_sec" << std::endl;
+  }
+  if((microseconds = PyLong_FromLong(tval->tv_usec)) == NULL) {
+    std::cerr << "Couldn't parse tv_usec" << std::endl;
+  }
+  if(PyObject_CallFunctionObjArgs(process_gettimeofday_func, seconds, microseconds, NULL) == NULL) {
+    std::cerr << "Calling process_syscall failed" << std::endl;
+    PyErr_Print();
+  }
 }
 
 
