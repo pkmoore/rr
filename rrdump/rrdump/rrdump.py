@@ -26,6 +26,7 @@ def write_to_pipe(data):
             os.unlink(proc_pipe_name)
         os.mkfifo(proc_pipe_name)
         proc_pipe = open(proc_pipe_name, 'w', 0)
+    print('Writing:', data)
     proc_pipe.write(data)
 
 def close_pipe():
@@ -41,7 +42,7 @@ def process_syscall(state):
         close_exit_handler(state)
     if state['name'] == 'socketcall' and not state['entering']:
         # socket, accept, accept4
-        if state['arg1'] == 1 or state['arg1'] == 5 or state['arg1'] == 19:
+        if state['arg1'] == 1 or state['arg1'] == 5 or state['arg1'] == 18:
             add_result_fd(state)
     if state['name'] == 'time' and not state['entering']:
         time_exit_handler(state)
@@ -53,6 +54,14 @@ def process_brk(flags, start, size, prot):
                                'start': start,
                                'size': size,
                                'prot': prot})
+
+def process_pipe(fd1, fd2):
+    global state_dict
+    if fd1 in state_dict['open_fds'] or fd2 in state_dict['open_fds']:
+        raise Exception('Pipe returned already open file descriptor: ({}->{})'
+                        .format(fd1, fd2))
+    state_dict['open_fds'].append(fd1)
+    state_dict['open_fds'].append(fd2)
 
 def process_gettimeofday(seconds, microseconds):
     state_dict['gettimeofdays'].append({'seconds': seconds,
