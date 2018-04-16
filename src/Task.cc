@@ -1050,8 +1050,9 @@ void Task::resume_execution(ResumeRequest how, WaitRequest wait_how,
   if(spin_off_on_next_resume_execution) {
     write_mem(REMOTE_PTR_FIELD(preload_globals, in_diversion), (unsigned char)1);
     set_syscallbuf_locked(1);
-    kill(tid, SIGSTOP);
-    ptrace(PTRACE_DETACH, tid, 0, 0);
+    std::cout << "Detaching: " << tid << std::endl;
+    int result = ptrace(PTRACE_DETACH, tid, 0, SIGSTOP);
+    std::cout << "Result: " << result << std::endl;
     spun_off = true;
     unstable = true;
     return;
@@ -2598,6 +2599,7 @@ static void run_initial_child(Session& session, const ScopedFd& error_fd,
                              const std::vector<std::string>& envp,
                              pid_t rec_tid) {
   DEBUG_ASSERT(session.tasks().size() == 0);
+  std::cout << "Inside task spawn" << std::endl;
 
   if (trace.bound_to_cpu() >= 0) {
     // Set CPU affinity now, after we've created any helper threads
