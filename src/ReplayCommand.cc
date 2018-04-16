@@ -120,7 +120,7 @@ struct ReplayFlags {
   /* When true, echo tracee stdout/stderr writes to console. */
   bool redirect;
 
-  std::vector<int> divert_on_event;
+  std::vector<std::pair<int, int>> divert_on_event;
 
   // When true make all private mappings shared with the tracee by default
   // to test the corresponding code.
@@ -171,8 +171,12 @@ static bool parse_replay_arg(vector<string>& args, ReplayFlags& flags) {
   }
   std::string events_str;
   std::string delimiter = ",";
-  int event_i;
+  std::string proc_event_sep = ":";
+  std::string str_pair;
+  std::string str_first;
+  std::string str_second;
   size_t pos;
+  int sep_pos;
 
   switch (opt.short_name) {
     case 'a':
@@ -244,8 +248,16 @@ static bool parse_replay_arg(vector<string>& args, ReplayFlags& flags) {
       }
       while(events_str.length() > 0) {
         pos = events_str.find(delimiter);
-        event_i = std::stoi(events_str.substr(0, pos), nullptr, 10);
-        flags.divert_on_event.push_back(event_i);
+        str_pair = events_str.substr(0, pos);
+        sep_pos = str_pair.find(proc_event_sep);
+        str_first = str_pair.substr(0, sep_pos);
+        str_second = str_pair.substr(sep_pos+1, std::string::npos);
+        flags.divert_on_event.push_back(std::make_pair(std::stoi(str_first,
+                                                                 nullptr,
+                                                                 10),
+                                                       std::stoi(str_second,
+                                                                 nullptr,
+                                                                 10)));
         events_str.erase(0, pos + delimiter.length());
       }
       break;
@@ -359,17 +371,24 @@ static void serve_replay_no_debugger(const string& trace_dir,
     }
 
     FrameTime before_time = replay_session->trace_reader().time();
-    if(std::find(flags.divert_on_event.begin(), flags.divert_on_event.end(), before_time) != flags.divert_on_event.end()) {
+    auto itr = std::find_if(flags.divert_on_event.begin(),
+                         flags.divert_on_event.end(),
+                         [&before_time](const std::pair<int, int>& arg) {
+                           return arg.second == (int)before_time; });
+    if (itr != flags.divert_on_event.end()) {
+      std::pair<int, int> p = *itr;
       // HACK HACK HACK:  Work around for each event being "handled" twice
       if(before_time != last_event_handled) { 
         DiversionSession::shr_ptr diversion_session = replay_session->clone_diversion();
-        rrdump_dump_state(int(before_time));
         RunCommand rc = RUN_CONTINUE;
         for (auto& v : diversion_session->tasks()) {
             Task* t = v.second;
             t->spin_off_on_next_resume_execution = true;
             diversion_session->diversion_step(t, rc, 0);
+          if (p.first == t->rec_tid) {
+            rrdump_dump_state(int(before_time));
             rrdump_write_to_pipe(before_time, t->tid);
+          }
         }
         last_event_handled = before_time;
       }

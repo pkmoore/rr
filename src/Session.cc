@@ -200,7 +200,7 @@ void Session::kill_all_tasks() {
 
     if (t->spun_off) {
       t->destroy();
-      return;
+      continue;
     }
 
     if (!t->is_stopped) {
