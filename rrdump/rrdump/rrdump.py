@@ -20,13 +20,11 @@ proc_pipe_name = 'rrdump_proc.pipe'
 
 def write_to_pipe(data):
     global proc_pipe
-    print('Inside write to pipe')
     if not proc_pipe:
         if os.path.exists(proc_pipe_name):
             os.unlink(proc_pipe_name)
         os.mkfifo(proc_pipe_name)
         proc_pipe = open(proc_pipe_name, 'w', 0)
-    print('Writing:', data)
     proc_pipe.write(data)
 
 def close_pipe():
@@ -49,7 +47,6 @@ def process_syscall(state):
     state_dict['syscalls_made'].append(state)
 
 def process_brk(flags, start, size, prot):
-    print('In process brk')
     state_dict['brks'].append({'flags': flags,
                                'start': start,
                                'size': size,
