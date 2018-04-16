@@ -26,6 +26,7 @@
 
 extern PyObject* process_syscall_func;
 extern PyObject* process_gettimeofday_func;
+extern PyObject* process_pipe_func;
 
 using namespace std;
 
@@ -565,10 +566,37 @@ void ReplaySession::rrdump_process_syscall(ReplayTask* t, bool is_entry) {
   if((name_str.compare("gettimeofday") == 0) && !is_entry) {
     rrdump_process_gettimeofday(t);
   }
+  if((name_str.compare("pipe") == 0) && !is_entry) {
+    rrdump_process_pipe(t);
+  }
 
   Py_DECREF(state_dict);
   Py_DECREF(name);
   Py_DECREF(entering);
+}
+
+void ReplaySession::rrdump_process_pipe(ReplayTask* t) {
+  PyObject* fd1;
+  PyObject* fd2;
+  size_t nbytes = sizeof(int) * 2;
+  unsigned char buf[nbytes];
+  int* fd1_ptr;
+  int* fd2_ptr;
+  remote_ptr<void> addr = t->current_trace_frame().regs().arg1();
+  t->read_bytes_helper(addr, nbytes, buf);
+  fd1_ptr = (int*)buf;
+  fd2_ptr = (int*)(buf + sizeof(int));
+  if((fd1 = PyLong_FromLong(*fd1_ptr)) == NULL) {
+    FATAL() << "Couldn't parse fd1";
+  }
+  if((fd2 = PyLong_FromLong(*fd2_ptr)) == NULL) {
+    FATAL() << "Couldn't parse fd1";
+  }
+  if(PyObject_CallFunctionObjArgs(process_pipe_func, fd1, fd2, NULL) == NULL) {
+    PyErr_Print();
+    FATAL() << "calling process_pipe_func failed";
+
+  }
 }
 
 void ReplaySession::rrdump_process_gettimeofday(ReplayTask* t) {
