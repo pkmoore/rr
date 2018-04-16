@@ -700,7 +700,6 @@ void rrdump_process_brk(KernelMapping km) {
     if((prot_obj = PyInt_FromLong((long)km.prot())) == NULL) {
         std::cerr << "failed to parse prot into PyInt" << std::endl;
     }
-    std::cout << "Before call" << std::endl;
     if(PyObject_CallFunctionObjArgs(process_brk_func,
                                     flags_obj,
                                     start_obj,
@@ -710,7 +709,6 @@ void rrdump_process_brk(KernelMapping km) {
         std::cerr << "Calling process brk failed" << std::endl;
         PyErr_Print();
     }
-    std::cout << "After call" << std::endl;
     Py_DECREF(flags_obj);
     Py_DECREF(start_obj);
     Py_DECREF(size_obj);
