@@ -10,6 +10,7 @@
 
 #include <Python.h>
 #include <sstream>
+#include "ReplayTask.h"
 
 #include <fstream>
 
@@ -387,8 +388,11 @@ static void serve_replay_no_debugger(const string& trace_dir,
             diversion_session->diversion_step(t, rc, 0);
           if (p.first == t->rec_tid) {
             rrdump_dump_state(int(before_time));
-            rrdump_write_to_pipe(before_time, t->tid);
+            rrdump_write_to_pipe(before_time, (ReplayTask*)t, true);
+          } else {
+            rrdump_write_to_pipe(before_time, (ReplayTask*)t, false);
           }
+
         }
         last_event_handled = before_time;
       }
@@ -652,10 +656,14 @@ void rrdump_dump_state(int event) {
   }
 }
 
-void rrdump_write_to_pipe(int ft, int tid) {
+void rrdump_write_to_pipe(int ft, rr::ReplayTask* t, bool inject) {
     PyObject* proc_string_obj;
     ostringstream os;
-    os << "EVENT: " << ft << " PID: " << tid << "\n";
+    os << (inject ? "INJECT: " : "DONT_INJECT: ")
+       << "EVENT: " << ft
+       << " PID: " << t->tid
+       << " REC_PID: " << t->rec_tid
+       << "\n";
     if((proc_string_obj = PyString_FromString(os.str().c_str())) == NULL) {
         std::cerr << "Failed to create python string" << std::endl;
     }

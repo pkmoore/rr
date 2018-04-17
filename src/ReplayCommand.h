@@ -5,6 +5,8 @@
 
 #include "Command.h"
 
+#include "ReplayTask.h"
+
 namespace rr {
 
 class ReplayCommand : public Command {
@@ -23,7 +25,7 @@ protected:
 
 void rrdump_dump_state(int event);
 
-void rrdump_write_to_pipe(int ft, int tid);
+void rrdump_write_to_pipe(int ft, rr::ReplayTask* t, bool inject);
 
 void rrdump_close_pipe();
 
