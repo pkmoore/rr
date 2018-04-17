@@ -609,13 +609,13 @@ void ReplaySession::rrdump_process_gettimeofday(ReplayTask* t) {
   t->read_bytes_helper(addr, nbytes, buf);
   tval = (struct timeval*)buf;
   if((seconds = PyLong_FromLong(tval->tv_sec)) == NULL) {
-    std::cerr << "Couldn't parse tv_sec" << std::endl;
+    FATAL() << "Couldn't parse tv_sec";
   }
   if((microseconds = PyLong_FromLong(tval->tv_usec)) == NULL) {
-    std::cerr << "Couldn't parse tv_usec" << std::endl;
+    FATAL() << "Couldn't parse tv_usec";
   }
   if(PyObject_CallFunctionObjArgs(process_gettimeofday_func, seconds, microseconds, NULL) == NULL) {
-    std::cerr << "Calling process_syscall failed" << std::endl;
+    FATAL() << "Calling process_gettimeofday failed";
     PyErr_Print();
   }
 }
@@ -623,19 +623,19 @@ void ReplaySession::rrdump_process_gettimeofday(ReplayTask* t) {
 
 void ReplaySession::rrdump_insert_register_value_into_dict(PyObject* dict, std::string key, int value) {
   if(dict == NULL) {
-    std::cerr << "Couldn't insert key:value. Dict is null" << std::endl;
+    FATAL() << "Couldn't insert key:value. Dict is null";
     return;
   }
   Py_INCREF(dict);
   PyObject* value_obj;
     if((value_obj = PyInt_FromLong((long)value)) == NULL) {
-    std::cerr << "Failed to parse value into PyInt" << std::endl;
+    FATAL() << "Failed to parse value into PyInt";
   }
   if(PyDict_SetItemString(dict,
                           key.c_str(),
                           value_obj) != 0)
   {
-    std::cerr << "Failed to set key: " << key << " value: " << value << std::endl;
+    FATAL() << "Failed to set key: " << key << " value: " << value;
   }
   Py_DECREF(dict);
   Py_DECREF(value_obj);
