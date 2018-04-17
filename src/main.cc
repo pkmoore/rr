@@ -203,6 +203,7 @@ PyObject* process_syscall_func;
 PyObject* process_brk_func;
 PyObject* process_gettimeofday_func;
 PyObject* process_pipe_func;
+PyObject* process_fcntl64_func;
 PyObject* dump_state_func;
 PyObject* write_to_pipe_func;
 PyObject* close_pipe_func;
@@ -226,6 +227,7 @@ int main(int argc, char* argv[]) {
   std::string cpp_process_brk_func_name = "process_brk";
   std::string cpp_process_gettimeofday_func_name = "process_gettimeofday";
   std::string cpp_process_pipe_func_name = "process_pipe";
+  std::string cpp_process_fcntl64_func_name = "process_fcntl64";
   std::string cpp_dump_state_func_name = "dump_state";
   std::string cpp_write_to_pipe_func_name = "write_to_pipe";
   std::string cpp_close_pipe_func_name = "close_pipe";
@@ -237,6 +239,8 @@ int main(int argc, char* argv[]) {
                                                    cpp_process_gettimeofday_func_name.c_str());
   process_pipe_func = PyDict_GetItemString(py_rrdump_dict,
                                            cpp_process_pipe_func_name.c_str());
+  process_fcntl64_func = PyDict_GetItemString(py_rrdump_dict,
+                                              cpp_process_fcntl64_func_name.c_str());
   dump_state_func = PyDict_GetItemString(py_rrdump_dict,
                                          cpp_dump_state_func_name.c_str());
   write_to_pipe_func = PyDict_GetItemString(py_rrdump_dict,
@@ -248,6 +252,7 @@ int main(int argc, char* argv[]) {
      (!PyCallable_Check(process_brk_func))               ||
      (!PyCallable_Check(process_gettimeofday_func))      ||
      (!PyCallable_Check(process_pipe_func))              ||
+     (!PyCallable_Check(process_fcntl64_func))           ||
      (!PyCallable_Check(dump_state_func))                ||
      (!PyCallable_Check(write_to_pipe_func))             ||
      (!PyCallable_Check(close_pipe_func)))

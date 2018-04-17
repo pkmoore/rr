@@ -339,6 +339,7 @@ private:
   void rrdump_insert_register_value_into_dict(PyObject* dict, std::string key, int value);
   void rrdump_process_gettimeofday(ReplayTask* t);
   void rrdump_process_pipe(ReplayTask* t);
+  void rrdump_process_fcntl64(ReplayTask* t);
 
   std::shared_ptr<EmuFs> emu_fs;
   TraceReader trace_in;

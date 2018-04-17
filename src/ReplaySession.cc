@@ -11,6 +11,7 @@
 #include <algorithm>
 
 #include <sys/time.h>
+#include <fcntl.h>
 
 #include "AutoRemoteSyscalls.h"
 #include "Flags.h"
@@ -27,6 +28,7 @@
 extern PyObject* process_syscall_func;
 extern PyObject* process_gettimeofday_func;
 extern PyObject* process_pipe_func;
+extern PyObject* process_fcntl64_func;
 
 using namespace std;
 
@@ -569,6 +571,9 @@ void ReplaySession::rrdump_process_syscall(ReplayTask* t, bool is_entry) {
   if((name_str.compare("pipe") == 0) && !is_entry) {
     rrdump_process_pipe(t);
   }
+  if((name_str.compare("fcntl64") == 0) && !is_entry) {
+    rrdump_process_fcntl64(t);
+  }
 
   Py_DECREF(state_dict);
   Py_DECREF(name);
@@ -596,6 +601,25 @@ void ReplaySession::rrdump_process_pipe(ReplayTask* t) {
     PyErr_Print();
     FATAL() << "calling process_pipe_func failed";
 
+  }
+}
+
+void ReplaySession::rrdump_process_fcntl64(ReplayTask* t) {
+  PyObject* fd;
+  int fd_int;
+  int cmd;
+  int result;
+  cmd = t->current_trace_frame().regs().arg2();
+  result = t->current_trace_frame().regs().syscall_result();
+  if(cmd == F_DUPFD && result > -1) {
+    fd_int = t->current_trace_frame().regs().syscall_result();
+    if((fd = PyLong_FromLong(fd_int)) == NULL) {
+      FATAL() << "Couldn't parse fd";
+    }
+    if(PyObject_CallFunctionObjArgs(process_fcntl64_func, fd, NULL) == NULL) {
+      std::cerr << "Calling process_fcntl64 failed";
+      PyErr_Print();
+    }
   }
 }
 

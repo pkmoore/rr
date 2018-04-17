@@ -64,6 +64,13 @@ def process_gettimeofday(seconds, microseconds):
     state_dict['gettimeofdays'].append({'seconds': seconds,
                                         'microseconds': microseconds})
 
+def process_fcntl64(fd):
+    global state_dict
+    if fd in state_dict['open_fds']:
+        raise Exception('fcntl64 used already open file descriptor: {})'
+                        .format(fd))
+    state_dict['open_fds'].append(fd)
+
 def dump_state(event):
     name = str(event) + '_state.json'
     with open(name, 'w') as f:
