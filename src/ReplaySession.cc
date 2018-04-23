@@ -27,7 +27,6 @@
 
 extern PyObject* process_syscall_func;
 extern PyObject* process_gettimeofday_func;
-extern PyObject* process_pipe_func;
 extern PyObject* process_fcntl64_func;
 
 using namespace std;
@@ -525,16 +524,25 @@ void ReplaySession::rrdump_process_syscall(ReplayTask* t, bool is_entry) {
   PyObject* state_dict;
   PyObject* name;
   PyObject* entering;
+  PyObject* new_fds = NULL;
+  std::string new_fds_key = "new_fds";
+  PyObject* new_fds_key_obj;
+  PyObject* closed_fds = NULL;
+  std::string closed_fds_key = "closed_fds";
+  PyObject* closed_fds_key_obj;
+
   std::string name_str;
   Registers regs = t->current_trace_frame().regs();
   SupportedArch arch = t->arch();
   name_str = syscall_name(regs.original_syscallno(), arch);
   if((name = PyString_FromString(name_str.c_str())) == NULL) {
-    std::cerr << "Failed to parse name into PyString" << std::endl;
+    PyErr_Print();
+    FATAL() << "Failed to parse name into PyString";
   }
   entering = PyBool_FromLong(is_entry);
   if((state_dict = PyDict_New()) == NULL) {
-    std::cerr << "Failed to create state dict" << std::endl;
+    PyErr_Print();
+    FATAL() << "Failed to create state dict";
   }
 
   std::string name_key = "name";
@@ -542,47 +550,83 @@ void ReplaySession::rrdump_process_syscall(ReplayTask* t, bool is_entry) {
                           name_key.c_str(),
                           name) != 0)
   {
-    std::cerr << "Failed to set key: name" << std::endl;
+    PyErr_Print();
+    FATAL() << "Failed to set key: name";
   }
   std::string entering_key = "entering";
   if(PyDict_SetItemString(state_dict,
                           entering_key.c_str(),
                           entering) != 0)
   {
-    std::cerr << "Failed to set key: entering" << std::endl;
-  }
-  rrdump_insert_register_value_into_dict(state_dict, "orig_syscallno", regs.original_syscallno());
-  rrdump_insert_register_value_into_dict(state_dict, "arg1", regs.arg1());
-  rrdump_insert_register_value_into_dict(state_dict, "arg2", regs.arg2());
-  rrdump_insert_register_value_into_dict(state_dict, "arg3", regs.arg3());
-  rrdump_insert_register_value_into_dict(state_dict, "arg4", regs.arg4());
-  rrdump_insert_register_value_into_dict(state_dict, "arg5", regs.arg5());
-  rrdump_insert_register_value_into_dict(state_dict, "arg6", regs.arg6());
-  rrdump_insert_register_value_into_dict(state_dict, "result", regs.syscall_result());
-
-  if(PyObject_CallFunctionObjArgs(process_syscall_func, state_dict, NULL) == NULL) {
-    std::cerr << "Calling process_syscall failed" << std::endl;
     PyErr_Print();
+    FATAL() << "Failed to set key: entering";
+  }
+  rrdump_insert_value_into_dict(state_dict, "orig_syscallno", regs.original_syscallno());
+  rrdump_insert_value_into_dict(state_dict, "arg1", regs.arg1_signed());
+  rrdump_insert_unsigned_value_into_dict(state_dict, "arg1_unsigned", regs.arg1());
+  rrdump_insert_value_into_dict(state_dict, "arg2", regs.arg2_signed());
+  rrdump_insert_unsigned_value_into_dict(state_dict, "arg2_unsigned", regs.arg2());
+  rrdump_insert_value_into_dict(state_dict, "arg3", regs.arg3_signed());
+  rrdump_insert_unsigned_value_into_dict(state_dict, "arg3_unsigned", regs.arg3());
+  rrdump_insert_value_into_dict(state_dict, "arg4", regs.arg4_signed());
+  rrdump_insert_unsigned_value_into_dict(state_dict, "arg4_unsigned", regs.arg4());
+  rrdump_insert_value_into_dict(state_dict, "arg5", regs.arg5_signed());
+  rrdump_insert_unsigned_value_into_dict(state_dict, "arg5_unsigned", regs.arg5());
+  rrdump_insert_value_into_dict(state_dict, "arg6", regs.arg6_signed());
+  rrdump_insert_unsigned_value_into_dict(state_dict, "arg6_unsigned", regs.arg6());
+  rrdump_insert_value_into_dict(state_dict, "result", regs.syscall_result());
+  rrdump_insert_unsigned_value_into_dict(state_dict, "result_unsigned", regs.syscall_result());
+  rrdump_insert_value_into_dict(state_dict, "rec_tid", t->rec_tid);
+
+
+  if((new_fds_key_obj = PyString_FromString(new_fds_key.c_str())) == NULL) {
+    PyErr_Print();
+    FATAL() << "Couldn't create closed_fds_key_obj string object";
+  }
+
+  if((closed_fds_key_obj = PyString_FromString(closed_fds_key.c_str())) == NULL) {
+    PyErr_Print();
+    FATAL() << "Couldn't create new_fds_key_obj string object";
   }
 
   if((name_str.compare("gettimeofday") == 0) && !is_entry) {
     rrdump_process_gettimeofday(t);
   }
   if((name_str.compare("pipe") == 0) && !is_entry) {
-    rrdump_process_pipe(t);
+    new_fds = rrdump_process_pipe(t);
   }
   if((name_str.compare("fcntl64") == 0) && !is_entry) {
-    rrdump_process_fcntl64(t);
+    new_fds = rrdump_process_fcntl64(t);
   }
 
+  if(new_fds) {
+    if(PyDict_SetItem(state_dict, new_fds_key_obj, new_fds) == -1) {
+      PyErr_Print();
+      std::cerr << "Couldn't add new_fds to dict";
+    }
+    Py_DECREF(new_fds);
+  }
+  if(closed_fds) {
+    if(PyDict_SetItem(state_dict, closed_fds_key_obj, closed_fds) == -1) {
+      PyErr_Print();
+      std::cerr << "Couldn't add closed_fds to dict";
+    }
+    Py_DECREF(closed_fds);
+  }
+
+  if(PyObject_CallFunctionObjArgs(process_syscall_func, state_dict, NULL) == NULL) {
+    PyErr_Print();
+    std::cerr << "Calling process_syscall failed";
+  }
+
+  Py_DECREF(new_fds_key_obj);
+  Py_DECREF(closed_fds_key_obj);
   Py_DECREF(state_dict);
   Py_DECREF(name);
   Py_DECREF(entering);
 }
 
-void ReplaySession::rrdump_process_pipe(ReplayTask* t) {
-  PyObject* fd1;
-  PyObject* fd2;
+PyObject* ReplaySession::rrdump_process_pipe(ReplayTask* t) {
   size_t nbytes = sizeof(int) * 2;
   unsigned char buf[nbytes];
   int* fd1_ptr;
@@ -591,36 +635,57 @@ void ReplaySession::rrdump_process_pipe(ReplayTask* t) {
   t->read_bytes_helper(addr, nbytes, buf);
   fd1_ptr = (int*)buf;
   fd2_ptr = (int*)(buf + sizeof(int));
-  if((fd1 = PyLong_FromLong(*fd1_ptr)) == NULL) {
-    FATAL() << "Couldn't parse fd1";
-  }
-  if((fd2 = PyLong_FromLong(*fd2_ptr)) == NULL) {
-    FATAL() << "Couldn't parse fd1";
-  }
-  if(PyObject_CallFunctionObjArgs(process_pipe_func, fd1, fd2, NULL) == NULL) {
+  PyObject* fd;
+  PyObject* new_fds;
+  if((new_fds = PyList_New(0)) == NULL) {
     PyErr_Print();
-    FATAL() << "calling process_pipe_func failed";
-
+    FATAL() << "Couldn't create new fds list when processing pipe";
   }
+  if((fd = PyInt_FromLong(*fd1_ptr)) == NULL) {
+    PyErr_Print();
+    FATAL() << "Couldn't parse fd to PyLong";
+  }
+  if(PyList_Append(new_fds, fd) == -1) {
+    PyErr_Print();
+    FATAL() << "Couldn't append first fd to new_fds";
+  }
+  Py_DECREF(fd);
+  if((fd = PyInt_FromLong(*fd2_ptr)) == NULL) {
+    PyErr_Print();
+    FATAL() << "Couldn't parse fd to PyLong";
+  }
+  if(PyList_Append(new_fds, fd) == -1) {
+    PyErr_Print();
+    FATAL() << "Couldn't append second fd to new_fds";
+  }
+  Py_DECREF(fd);
+  return new_fds;
 }
 
-void ReplaySession::rrdump_process_fcntl64(ReplayTask* t) {
-  PyObject* fd;
-  int fd_int;
-  int cmd;
+PyObject* ReplaySession::rrdump_process_fcntl64(ReplayTask* t) {
+  int cmd;;
   int result;
+  PyObject* new_fds;
+  PyObject* fd;
   cmd = t->current_trace_frame().regs().arg2();
   result = t->current_trace_frame().regs().syscall_result();
   if(cmd == F_DUPFD && result > -1) {
-    fd_int = t->current_trace_frame().regs().syscall_result();
-    if((fd = PyLong_FromLong(fd_int)) == NULL) {
-      FATAL() << "Couldn't parse fd";
-    }
-    if(PyObject_CallFunctionObjArgs(process_fcntl64_func, fd, NULL) == NULL) {
-      std::cerr << "Calling process_fcntl64 failed";
+    if((new_fds = PyList_New(0)) == NULL) {
       PyErr_Print();
+      FATAL() << "Couldn't create new fds list when processing pipe";
     }
+    if((fd = PyInt_FromLong(result)) == NULL) {
+      PyErr_Print();
+      FATAL() << "Couldn't parse fd to PyLong";
+    }
+    if(PyList_Append(new_fds, fd) == -1) {
+      PyErr_Print();
+      FATAL() << "Couldn't append first fd to new_fds";
+    }
+    Py_DECREF(fd);
+    return new_fds;
   }
+  return NULL;
 }
 
 void ReplaySession::rrdump_process_gettimeofday(ReplayTask* t) {
@@ -633,38 +698,65 @@ void ReplaySession::rrdump_process_gettimeofday(ReplayTask* t) {
   t->read_bytes_helper(addr, nbytes, buf);
   tval = (struct timeval*)buf;
   if((seconds = PyLong_FromLong(tval->tv_sec)) == NULL) {
+    PyErr_Print();
     FATAL() << "Couldn't parse tv_sec";
   }
   if((microseconds = PyLong_FromLong(tval->tv_usec)) == NULL) {
+    PyErr_Print();
     FATAL() << "Couldn't parse tv_usec";
   }
   if(PyObject_CallFunctionObjArgs(process_gettimeofday_func, seconds, microseconds, NULL) == NULL) {
-    FATAL() << "Calling process_gettimeofday failed";
     PyErr_Print();
+    std::cerr << "Calling process_gettimeofday failed";
   }
 }
 
-
-void ReplaySession::rrdump_insert_register_value_into_dict(PyObject* dict, std::string key, int value) {
+void ReplaySession::rrdump_insert_value_into_dict(PyObject* dict, std::string key, int value) {
   if(dict == NULL) {
+    PyErr_Print();
     FATAL() << "Couldn't insert key:value. Dict is null";
     return;
   }
   Py_INCREF(dict);
   PyObject* value_obj;
     if((value_obj = PyInt_FromLong((long)value)) == NULL) {
+    PyErr_Print();
     FATAL() << "Failed to parse value into PyInt";
   }
   if(PyDict_SetItemString(dict,
                           key.c_str(),
                           value_obj) != 0)
   {
+    PyErr_Print();
     FATAL() << "Failed to set key: " << key << " value: " << value;
   }
   Py_DECREF(dict);
   Py_DECREF(value_obj);
 }
 
+// HACK HACK HACK: GET RID OF DUPE METHOD
+void ReplaySession::rrdump_insert_unsigned_value_into_dict(PyObject* dict, std::string key, unsigned int value) {
+  if(dict == NULL) {
+    PyErr_Print();
+    FATAL() << "Couldn't insert key:value. Dict is null";
+    return;
+  }
+  Py_INCREF(dict);
+  PyObject* value_obj;
+    if((value_obj = PyLong_FromUnsignedLong((unsigned long)value)) == NULL) {
+    PyErr_Print();
+    FATAL() << "Failed to parse value into PyInt";
+  }
+  if(PyDict_SetItemString(dict,
+                          key.c_str(),
+                          value_obj) != 0)
+  {
+    PyErr_Print();
+    FATAL() << "Failed to set key: " << key << " value: " << value;
+  }
+  Py_DECREF(dict);
+  Py_DECREF(value_obj);
+}
 
 
 void ReplaySession::check_pending_sig(ReplayTask* t) {
