@@ -1051,8 +1051,7 @@ void Task::resume_execution(ResumeRequest how, WaitRequest wait_how,
     write_mem(REMOTE_PTR_FIELD(preload_globals, in_diversion), (unsigned char)1);
     set_syscallbuf_locked(1);
     std::cout << "Detaching: " << tid << std::endl;
-    int result = ptrace(PTRACE_DETACH, tid, 0, SIGSTOP);
-    std::cout << "Result: " << result << std::endl;
+    ptrace(PTRACE_DETACH, tid, 0, SIGSTOP);
     spun_off = true;
     unstable = true;
     return;
