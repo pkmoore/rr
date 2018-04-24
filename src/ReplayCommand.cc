@@ -349,6 +349,7 @@ static uint64_t to_microseconds(const struct timeval& tv) {
 
 static void serve_replay_no_debugger(const string& trace_dir,
                                      const ReplayFlags& flags) {
+  std::vector<std::pair<int, int>> events = flags.divert_on_event;
   ReplaySession::shr_ptr replay_session = ReplaySession::create(trace_dir);
   replay_session->set_flags(session_flags(flags));
   uint32_t step_count = 0;
@@ -372,12 +373,11 @@ static void serve_replay_no_debugger(const string& trace_dir,
     }
 
     FrameTime before_time = replay_session->trace_reader().time();
-    auto itr = std::find_if(flags.divert_on_event.begin(),
-                         flags.divert_on_event.end(),
-                         [&before_time](const std::pair<int, int>& arg) {
-                           return arg.second == (int)before_time; });
-    if (itr != flags.divert_on_event.end()) {
-      std::pair<int, int> p = *itr;
+    auto pred = [&before_time](const std::pair<int, int>& arg) {
+      return arg.second == (int)before_time;
+    };
+    std::vector<std::pair<int, int>>::iterator itr = std::find_if(events.begin(), events.end(), pred);
+    if (itr != events.end()) {
       // HACK HACK HACK:  Work around for each event being "handled" twice
       if(before_time != last_event_handled) { 
         DiversionSession::shr_ptr diversion_session = replay_session->clone_diversion();
@@ -386,13 +386,16 @@ static void serve_replay_no_debugger(const string& trace_dir,
             Task* t = v.second;
             t->spin_off_on_next_resume_execution = true;
             diversion_session->diversion_step(t, rc, 0);
-          if (p.first == t->rec_tid) {
+          if (itr->first == t->rec_tid) {
             rrdump_dump_state(int(before_time));
             rrdump_write_to_pipe(before_time, (ReplayTask*)t, true);
           } else {
             rrdump_write_to_pipe(before_time, (ReplayTask*)t, false);
           }
-
+        }
+        events.erase(itr);
+        if(events.size() == 0) {
+            rrdump_close_pipe();
         }
         last_event_handled = before_time;
       }
@@ -425,9 +428,6 @@ static void serve_replay_no_debugger(const string& trace_dir,
     DEBUG_ASSERT(!result.break_status.breakpoint_hit);
     DEBUG_ASSERT(cmd == RUN_SINGLESTEP ||
                  !result.break_status.singlestep_complete);
-  }
-  if(flags.divert_on_event.size() > 0) {
-      rrdump_close_pipe();
   }
   LOG(info) << "Replayer successfully finished";
 }
