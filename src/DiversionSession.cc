@@ -160,7 +160,9 @@ DiversionSession::DiversionResult DiversionSession::diversion_step(
     return result;
   }
 
-  process_syscall(t, t->regs().original_syscallno());
+  if(!t->spun_off) {
+    process_syscall(t, t->regs().original_syscallno());
+  }
   check_for_watchpoint_changes(t, result.break_status);
   return result;
 }
