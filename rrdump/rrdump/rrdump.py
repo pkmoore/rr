@@ -12,7 +12,7 @@ import os.path
 state_dict = {}
 state_dict['open_fds'] = {}
 state_dict['syscalls_made'] = []
-state_dict['time_call_results'] = []
+state_dict['times'] = []
 state_dict['brks'] = []
 state_dict['gettimeofdays'] = []
 state_dict['clock_gettimes'] = []
@@ -76,10 +76,6 @@ def process_syscall(state):
         if state['result'] > -1:
             _remove_fd_for_proc(state['arg1'], state['rec_tid'])
 
-    # Handle time-related calls
-    if state['name'] == 'time' and not state['entering']:
-        time_exit_handler(state)
-
     # Handle clone
     if state['name'] == 'clone' and not state['entering']:
         clone_flags = state['arg1_unsigned']
@@ -131,11 +127,10 @@ def process_clock_gettime(clock_id, seconds, nanoseconds):
     state_dict['clock_gettimes'].append({'clock_id': clock_id,
                                          'seconds': seconds,
                                          'nanoseconds': nanoseconds})
+def process_time(time):
+    state_dict['times'].append(time)
 
 def dump_state(event):
     name = str(event) + '_state.json'
     with open(name, 'w') as f:
         json.dump(state_dict, f)
-
-def time_exit_handler(state):
-    state_dict['time_call_results'].append(state['result'])

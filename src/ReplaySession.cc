@@ -26,6 +26,7 @@
 #include "util.h"
 
 extern PyObject* process_syscall_func;
+extern PyObject* process_time_func;
 extern PyObject* process_gettimeofday_func;
 extern PyObject* process_clock_gettime_func;
 extern PyObject* process_fcntl64_func;
@@ -590,6 +591,9 @@ void ReplaySession::rrdump_process_syscall(ReplayTask* t, bool is_entry) {
     FATAL() << "Couldn't create new_fds_key_obj string object";
   }
 
+  if((name_str.compare("time") == 0) && !is_entry) {
+    rrdump_process_time(t);
+  }
   if((name_str.compare("gettimeofday") == 0) && !is_entry) {
     rrdump_process_gettimeofday(t);
   }
@@ -692,6 +696,20 @@ PyObject* ReplaySession::rrdump_process_fcntl64(ReplayTask* t) {
   return NULL;
 }
 
+void ReplaySession::rrdump_process_time(ReplayTask* t) {
+  PyObject* time;
+  int result;
+  result = t->current_trace_frame().regs().syscall_result();
+  if((time = PyInt_FromLong(result)) == NULL) {
+    PyErr_Print();
+    FATAL() << "Couldn't decode time result";
+  }
+  if(PyObject_CallFunctionObjArgs(process_time_func, time, NULL) == NULL) {
+    PyErr_Print();
+    std::cerr << "Calling process_time failed";
+  }
+}
+
 void ReplaySession::rrdump_process_gettimeofday(ReplayTask* t) {
   PyObject* seconds;
   PyObject* microseconds;
@@ -716,33 +734,33 @@ void ReplaySession::rrdump_process_gettimeofday(ReplayTask* t) {
 }
 
 void ReplaySession::rrdump_process_clock_gettime(ReplayTask* t) {
-    PyObject* clock_id;
-    PyObject* seconds;
-    PyObject* nanoseconds;
-    unsigned int clock_id_int;
-    size_t nbytes = sizeof(struct timespec);
-    char buf[nbytes];
-    struct timespec* tspec;
-    clock_id_int = t->current_trace_frame().regs().arg1();
-    remote_ptr<void> addr = t->current_trace_frame().regs().arg2();
-    t->read_bytes_helper(addr, nbytes, buf);
-    tspec = (struct timespec*)buf;
-    if((clock_id = PyLong_FromLong(clock_id_int)) == NULL) {
-        PyErr_Print();
-        FATAL() << "Couldn't decode clock_id";
-    }
-    if((seconds = PyLong_FromLong(tspec->tv_sec)) == NULL) {
-        PyErr_Print();
-        FATAL() << "Couldn't decode tv_sec";
-    }
-    if((nanoseconds = PyLong_FromLong(tspec->tv_nsec)) == NULL) {
-        PyErr_Print();
-        FATAL() << "Couldn't decode tv_nsec";
-    }
-    if(PyObject_CallFunctionObjArgs(process_clock_gettime_func, clock_id, seconds, nanoseconds, NULL) == NULL) {
-        PyErr_Print();
-        std::cerr << "Calling process_clock_gettime failed";
-    }
+  PyObject* clock_id;
+  PyObject* seconds;
+  PyObject* nanoseconds;
+  unsigned int clock_id_int;
+  size_t nbytes = sizeof(struct timespec);
+  char buf[nbytes];
+  struct timespec* tspec;
+  clock_id_int = t->current_trace_frame().regs().arg1();
+  remote_ptr<void> addr = t->current_trace_frame().regs().arg2();
+  t->read_bytes_helper(addr, nbytes, buf);
+  tspec = (struct timespec*)buf;
+  if((clock_id = PyLong_FromLong(clock_id_int)) == NULL) {
+    PyErr_Print();
+    FATAL() << "Couldn't decode clock_id";
+  }
+  if((seconds = PyLong_FromLong(tspec->tv_sec)) == NULL) {
+    PyErr_Print();
+    FATAL() << "Couldn't decode tv_sec";
+  }
+  if((nanoseconds = PyLong_FromLong(tspec->tv_nsec)) == NULL) {
+    PyErr_Print();
+    FATAL() << "Couldn't decode tv_nsec";
+  }
+  if(PyObject_CallFunctionObjArgs(process_clock_gettime_func, clock_id, seconds, nanoseconds, NULL) == NULL) {
+    PyErr_Print();
+    std::cerr << "Calling process_clock_gettime failed";
+  }
 }
 
 void ReplaySession::rrdump_insert_value_into_dict(PyObject* dict, std::string key, int value) {
@@ -753,7 +771,7 @@ void ReplaySession::rrdump_insert_value_into_dict(PyObject* dict, std::string ke
   }
   Py_INCREF(dict);
   PyObject* value_obj;
-    if((value_obj = PyInt_FromLong((long)value)) == NULL) {
+  if((value_obj = PyInt_FromLong((long)value)) == NULL) {
     PyErr_Print();
     FATAL() << "Failed to parse value into PyInt";
   }
@@ -777,7 +795,7 @@ void ReplaySession::rrdump_insert_unsigned_value_into_dict(PyObject* dict, std::
   }
   Py_INCREF(dict);
   PyObject* value_obj;
-    if((value_obj = PyLong_FromUnsignedLong((unsigned long)value)) == NULL) {
+  if((value_obj = PyLong_FromUnsignedLong((unsigned long)value)) == NULL) {
     PyErr_Print();
     FATAL() << "Failed to parse value into PyInt";
   }
@@ -791,7 +809,6 @@ void ReplaySession::rrdump_insert_unsigned_value_into_dict(PyObject* dict, std::
   Py_DECREF(dict);
   Py_DECREF(value_obj);
 }
-
 
 void ReplaySession::check_pending_sig(ReplayTask* t) {
   if (!t->stop_sig()) {

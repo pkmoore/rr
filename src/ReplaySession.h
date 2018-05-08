@@ -338,6 +338,7 @@ private:
   void rrdump_process_syscall(ReplayTask* t, bool is_entry);
   void rrdump_insert_value_into_dict(PyObject* dict, std::string key, int value);
   void rrdump_insert_unsigned_value_into_dict(PyObject* dict, std::string key, unsigned value);
+  void rrdump_process_time(ReplayTask* t);
   void rrdump_process_gettimeofday(ReplayTask* t);
   void rrdump_process_clock_gettime(ReplayTask* t);
   PyObject* rrdump_process_pipe(ReplayTask* t);
