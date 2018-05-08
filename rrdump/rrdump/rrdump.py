@@ -15,6 +15,7 @@ state_dict['syscalls_made'] = []
 state_dict['time_call_results'] = []
 state_dict['brks'] = []
 state_dict['gettimeofdays'] = []
+state_dict['clock_gettimes'] = []
 proc_pipe = None
 proc_pipe_name = 'rrdump_proc.pipe'
 
@@ -125,6 +126,11 @@ def process_brk(flags, start, size, prot):
 def process_gettimeofday(seconds, microseconds):
     state_dict['gettimeofdays'].append({'seconds': seconds,
                                         'microseconds': microseconds})
+
+def process_clock_gettime(clock_id, seconds, nanoseconds):
+    state_dict['clock_gettimes'].append({'clock_id': clock_id,
+                                         'seconds': seconds,
+                                         'nanoseconds': nanoseconds})
 
 def dump_state(event):
     name = str(event) + '_state.json'
