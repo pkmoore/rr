@@ -470,6 +470,7 @@ target_link_libraries(rr
   -lrt
   -lpython2.7
   brotli
+  ${CMAKE_SOURCE_DIR}/libprintstrace.a
 )
 
 if(staticlibs)
