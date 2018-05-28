@@ -457,7 +457,16 @@ else()
   post_build_executable(rr)
   set(RR_BIN rr)
 endif()
-add_dependencies(rr Generated Pages)
+
+# Compile libprintstrace.a in the correct spot then copy it to where we need it
+add_custom_target(libprintstrace.a
+                  ALL
+                  WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/third-party/strace/"
+                  COMMAND make -j2
+                  COMMAND cp ./libprintstrace.a ${CMAKE_SOURCE_DIR}
+                  VERBATIM)
+
+add_dependencies(rr Generated Pages libprintstrace.a)
 
 option(strip "Strip debug info from rr binary")
 
