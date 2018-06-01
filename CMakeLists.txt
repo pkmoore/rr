@@ -462,7 +462,11 @@ endif()
 add_custom_target(libprintstrace.a
                   ALL
                   WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/third-party/strace/"
+                  COMMAND automake
+                  COMMAND make clean
+                  COMMAND ./configure
                   COMMAND make -j2
+                  COMMAND make -j2 libprintstrace.a
                   COMMAND cp ./libprintstrace.a ${CMAKE_SOURCE_DIR}
                   VERBATIM)
 

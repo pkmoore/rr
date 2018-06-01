@@ -37,7 +37,6 @@ TESTS_MX32 = tests-mx32
 endif
 SUBDIRS = . tests $(TESTS_M32) $(TESTS_MX32)
 
-bin_PROGRAMS = strace
 man_MANS = strace.1 strace-log-merge.1
 bin_SCRIPTS = strace-graph strace-log-merge
 
@@ -63,6 +62,7 @@ include xlat/Makemodule.am
 
 strace_CPPFLAGS = $(AM_CPPFLAGS)
 strace_CFLAGS = $(AM_CFLAGS)
+strace_CFLAGS += -DLIBPRINTSTRACE_COMPILE
 strace_LDFLAGS =
 strace_LDADD = libstrace.a $(clock_LIBS) $(timer_LIBS)
 noinst_LIBRARIES = libstrace.a
@@ -1207,3 +1207,12 @@ $(srcdir)/CREDITS: $(srcdir)/CREDITS.in $(srcdir)/.mailmap \
 export TAR_OPTIONS = --owner=0 --group=0 --numeric-owner --mode=go-w,go+rX
 
 endif
+
+EXCLUDE_OBJS=strace-statfs64.o strace-ucopy.o
+OBJECTS=$(wildcard *.o)
+NEWOBJS=$(filter-out $(EXCLUDE_OBJS),$(OBJECTS))
+
+.PHONY: libprintstrace.a
+
+libprintstrace.a: $(NEWOBJS)
+	ar rcs libprintstrace.a $(NEWOBJS)
