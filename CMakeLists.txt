@@ -458,15 +458,10 @@ else()
   set(RR_BIN rr)
 endif()
 
-# Compile libprintstrace.a in the correct spot then copy it to where we need it
 add_custom_target(libprintstrace.a
                   ALL
                   WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/third-party/strace/"
-                  COMMAND automake
-                  COMMAND make clean
-                  COMMAND ./configure
-                  COMMAND make -j2
-                  COMMAND make -j2 libprintstrace.a
+                  COMMAND ./build_libprintstrace.sh
                   COMMAND cp ./libprintstrace.a ${CMAKE_SOURCE_DIR}
                   VERBATIM)
 

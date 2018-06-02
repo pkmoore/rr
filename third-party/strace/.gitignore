@@ -71,3 +71,4 @@
 Makefile
 Makefile.in
 core
+libprintstrace.a
