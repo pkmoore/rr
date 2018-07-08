@@ -5,5 +5,4 @@
 # make
 make clean
 make CFLAGS=-DLIBPRINTSTRACE_COMPILE -j2 || true
-make -f othermake libprintstrace.a
-
+make -f Makefile.libstrace libprintstrace.a
