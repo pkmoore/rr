@@ -4,37 +4,55 @@ LD := gcc
 LIBS_PATH := ./libs/
 CPPFLAGS += -D_GNU_SOURCE=1 -D__STDC_FORMAT_MACROS=1
 CPPFLAGS += -D_POSIX_C_SOURCE=199506 -D_XOPEN_SOURCE=600
-CPPFLAGS += -DHAVE_CONFIG_H -D_BSD_SOURCE=1 -DLIBPRINTSTRACE_COMPILE
-CFLAGS += -g3 -Wall -Wextra -pedantic -std=gnu99 -fPIC -melf_i386
+CPPFLAGS += -DHAVE_CONFIG_H -D_DEFAULT_SOURCE=1
+# CPPFLAGS += -DLIBPRINTSTRACE_COMPILE
+CFLAGS += -march=i486 -g3 -Wall -Wextra -pedantic -std=gnu99 -fPIC -m32
 CFLAGS += -Wno-long-long -Wno-unused-parameter -fuse-ld=gold
 CFLAGS += -Wno-missing-field-initializers -fno-omit-frame-pointer
 CFLAGS += -fdiagnostics-show-option -I./ -I./linux -I./linux/i386
-LDFLAGS += -fuse-ld=gold -g3 -rdynamic -fPIC -melf_i386
+LDFLAGS += -g3 -Wl,--export-dynamic -fPIC -m32
 LDLIBS += -L$(LIBS_PATH) -lrt
 
-EXCLUDE_OBJS := strace-main.o strace-statfs64.o strace-main.o strace-ucopy.o
+EXCLUDE_OBJS := trace-statfs64.o strace-main.o strace-ucopy.o
 OBJECTS = $(wildcard *.o)
 NEW_OBJS = $(filter-out $(EXCLUDE_OBJS),$(OBJECTS))
 
 all:
 	$(MAKE) libstrace.so libprintstrace.a
 
-.PHONY: all clean main print_vars
+.PHONY: all clean i686 main print_vars shared static
+
+# use a 32-bit cross compiler for build
+i686: CC_FOR_BUILD=i686-elf-gcc
+i686: LD_FOR_BUILD=i686-elf-ld
+i686:
+	./bootstrap
+	@$(MAKE) all
 
 print_vars:
-	@echo $(NEW_OBJSa)
+	@echo $(NEW_OBJS)
 
-libstrace.so: $(NEW_OBJS) strace.o
-	$(LD) $< $(LDFLAGS) -shared -Wl,soname,$@.1 -o $@.1.0.1
+shared:
+	@$(MAKE) libstrace.so
+
+shared:
+	@$(MAKE) libprintstrace.a
+
+libstrace.so: libprintstrace.a
+	$(LD) -shared $< $(LDFLAGS) $(LDLIBS) -Wl,-soname,$@.1 -o $@.1.0.1
 	@mkdir -pv $(LIBS_PATH)/
 	@cp -fv $@.1.0.1 $(LIBS_PATH)/
 	@ln -sfv $(LIBS_PATH)/$@.1.0.1 $(LIBS_PATH)/$@.1
 	@ln -sfv $(LIBS_PATH)/$@.1.0.1 $(LIBS_PATH)/$@
 
-libprintstrace.a: $(NEW_OBJS)
+libprintstrace.a: $(NEW_OBJS) strace.o strace-lib.o
 	$(AR) rcs $@ $(NEW_OBJS)
+	@mkdir -pv $(LIBS_PATH)/
+	@cp -fv $@ $(LIBS_PATH)/
+	echo $^
 
-strace-main: strace-main.o
+# currently broken
+strace: strace-lib.o strace-main.o syscall.o
 	$(LD) $(LDFLAGS) $^ $(LDLIBS) -o $@
 
 strace-main.o: main.c
