@@ -25,24 +25,11 @@
 #include "replay_syscall.h"
 #include "util.h"
 
-#include "strace_defs.h"
-
 extern PyObject* process_syscall_func;
 extern PyObject* process_time_func;
 extern PyObject* process_gettimeofday_func;
 extern PyObject* process_clock_gettime_func;
 extern PyObject* process_fcntl64_func;
-
-extern struct tcb *current_tcp;
-
-struct tcb tcp;
-
-FILE* strace_outfile = NULL;
-
-static bool saw_first_execve = false;
-static bool after_first_execve = false;
-
-static rr::ReplayTask* current_replay_task;
 
 using namespace std;
 
@@ -508,46 +495,6 @@ Completion ReplaySession::enter_syscall(ReplayTask* t,
 
   if (current_trace_frame().event().Syscall().state == ENTERING_SYSCALL) {
     rep_after_enter_syscall(t);
-  }
-
-  if(t->current_trace_frame().regs().original_syscallno() == 11) {
-    saw_first_execve = true;
-  }
-  if(saw_first_execve) {
-    if(t->current_trace_frame().regs().original_syscallno() != 11) {
-      after_first_execve = true;
-    }
-  }
-
-  if(after_first_execve) {
-    if (strace_outfile == NULL) {
-      strace_outfile = fopen("strace_out.strace", "w");
-    }
-    // Set up global reference to the current task to call from our
-    // overridden copies of umoven and umovestr
-    current_replay_task = t;
-    // Data that we need to decode.  We can set this stuff each time
-    current_tcp = &tcp;
-    printing_tcp = &tcp;
-    clear_regs(&tcp); // Unset regs error
-    tcp._priv_data = NULL; // Must be initialized to null
-    tcp.curcol = 0; // reset to 1 each time?
-    tcp.outf = strace_outfile;
-    tcp.pid = t->rec_tid;
-    tcp.scno = t->current_trace_frame().regs().original_syscallno();
-    // These values go into registers
-    tcp.u_rval   = t->current_trace_frame().regs().syscall_result();
-    tcp.u_arg[0] = t->current_trace_frame().regs().arg1();
-    tcp.u_arg[1] = t->current_trace_frame().regs().arg2();
-    tcp.u_arg[2] = t->current_trace_frame().regs().arg3();
-    tcp.u_arg[3] = t->current_trace_frame().regs().arg4();
-    tcp.u_arg[4] = t->current_trace_frame().regs().arg5();
-    tcp.u_arg[5] = t->current_trace_frame().regs().arg6();
-    int res = syscall_entering_decode(&tcp);
-    // We must save the return value from here
-    res = syscall_entering_trace(&tcp, 0);
-    // And pass it in here
-    syscall_entering_finish(&tcp, res);
   }
 
   rrdump_process_syscall(t, true);
@@ -1772,25 +1719,6 @@ ReplayTask* ReplaySession::setup_replay_one_trace_frame(ReplayTask* t) {
         rep_prepare_run_to_syscall(t, &current_step);
       } else {
         rep_process_syscall(t, &current_step);
-          if(after_first_execve) {
-            // Set up global reference to the current task to call from our
-            // overridden copies of umoven and umovestr
-            current_replay_task = t;
-            current_tcp = &tcp;
-            printing_tcp = &tcp;
-            clear_regs(&tcp);
-            tcp.pid = t->rec_tid;
-            tcp.scno = t->current_trace_frame().regs().original_syscallno();
-            // When to set return value?
-            tcp.u_rval   = t->current_trace_frame().regs().syscall_result();
-            // Must have a struct ts allocated even if we don't use it
-            struct timespec ts = {};
-            int res = syscall_exiting_decode(&tcp, &ts);
-            // We must also save the return value here
-            syscall_exiting_trace(&tcp, NULL, res);
-            // And pass it in here
-            syscall_exiting_finish(&tcp);
-          }
 
         if (current_step.action == TSTEP_RETIRE) {
           t->on_syscall_exit(current_step.syscall.number,
@@ -1950,29 +1878,3 @@ ReplayTask* ReplaySession::find_task(const TaskUid& tuid) const {
 }
 
 } // namespace rr
-
-extern "C" {
-int umoven(struct tcb *, kernel_ulong_t addr, unsigned int len, void *laddr) {
-  rr::remote_ptr<void> r_addr = rr::remote_ptr<void>(addr);
-  char buffer[len];
-  current_replay_task->read_bytes_helper(r_addr, len, buffer);
-  memcpy(laddr, buffer, len);
-  return 0;
-}
-
-int umovestr(struct tcb *, kernel_ulong_t addr, unsigned int len, char *laddr) {
-  rr::remote_ptr<void> r_addr;
-  char* orig_addr = laddr;
-  while(len) {
-    r_addr = rr::remote_ptr<void>(addr);
-    current_replay_task->read_bytes_helper(r_addr, 1, laddr);
-    if(memchr(laddr, '\0', 1)) {
-      return laddr - orig_addr;
-    }
-    len -= 1;
-    laddr+= 1;
-    addr+= 1;
-  }
-  return len;
-}
-}

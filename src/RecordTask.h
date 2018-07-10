@@ -56,7 +56,6 @@ enum SignalDisposition { SIGNAL_DEFAULT, SIGNAL_IGNORE, SIGNAL_HANDLER };
  */
 class RecordTask : public Task {
 public:
-  bool strace_output = false;
   RecordTask(RecordSession& session, pid_t _tid, uint32_t serial,
              SupportedArch a);
 
