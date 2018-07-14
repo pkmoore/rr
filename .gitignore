@@ -1,26 +1,93 @@
+# Directories
+32/
+obj/
+dist/
+.idea/
+share/
+Testing/
+.settings/
+CMakeFiles/
+_CPack_Packages/
+third-party/strace/libs/
+third-party/strace/shared.1.0.1
+
+# Misc and backup files
 *~
 .cproject
 CMakeCache.txt
-CMakeFiles/
 cmake_install.cmake
 CPackConfig.cmake
 CPackSourceConfig.cmake
-_CPack_Packages/
 CTestTestfile.cmake
 Debug
-dist/
 install_manifest.txt
 Makefile
 Profile
-obj/
 .project
+vgcore*
 *.log
 *.orig
 *.rej
 *.pyc
 *.record
 *.replay
-.settings/
-Testing/
-.idea/
+.*.swn
+.*.swo
 .*.swp
+tags
+TAGS
+*cscope.*
+test32
+test32.c
+
+# Binaries
+cepl
+t/*
+!t/*.c
+!t/*.h
+*.out
+
+# Profiling
+*.gcda
+*.gcno
+
+# Object files
+*.o
+*.ko
+*.obj
+*.elf
+
+# Precompiled Headers
+*.gch
+*.pch
+*.d
+
+# Libraries
+*.lib
+*.a
+*.la
+*.lo
+*.old
+
+# Shared objects (inc. Windows DLLs)
+*.dll
+*.so
+*.so.*
+*.dylib
+
+# Executables
+*.exe
+*.out
+*.app
+*.i*86
+*.x86_64
+*.hex
+
+# Debug files
+*.su
+*.dSYM/
+*.tar.gz
+debug.mk
+asan.mk
+
+# vi:ft=cfg:
