@@ -6,7 +6,6 @@
 #define _GNU_SOURCE 1
 #define _POSIX_C_SOURCE 2
 
-#include <assert.h>
 #include <errno.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -52,7 +51,11 @@ inline static int atomic_puts(const char* str) {
   return atomic_printf("%s\n", str);
 }
 
-#define test_assert(cond) assert("FAILED: !" && check_cond(cond))
+#define test_assert(cond)                                                      \
+  do {                                                                         \
+    if (!check_cond(cond))                                                     \
+      abort();                                                                 \
+  } while (0)
 
 __attribute__((format(printf, 1, 2))) inline static void caught_test_failure(
     const char* fmt, ...) {
@@ -76,5 +79,7 @@ inline static double now_double(void) {
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return ts.tv_sec + ts.tv_nsec / 1000000000.0;
 }
+
+inline static long get_page_size(void) { return sysconf(_SC_PAGE_SIZE); }
 
 #endif

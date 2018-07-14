@@ -3,7 +3,6 @@
 #ifndef RR_ADDRESS_SPACE_H_
 #define RR_ADDRESS_SPACE_H_
 
-#include <assert.h>
 #include <inttypes.h>
 #include <linux/kdev_t.h>
 #include <sys/mman.h>
@@ -25,6 +24,7 @@
 #include "PropertyTable.h"
 #include "TaskishUid.h"
 #include "TraceStream.h"
+#include "core.h"
 #include "kernel_abi.h"
 #include "remote_code_ptr.h"
 #include "util.h"
@@ -89,14 +89,14 @@ public:
   }
 
   void assert_valid() const {
-    assert(end() >= start());
-    assert(size() % page_size() == 0);
-    assert(!(flags_ & ~map_flags_mask));
-    assert(offset % page_size() == 0);
+    DEBUG_ASSERT(end() >= start());
+    DEBUG_ASSERT(size() % page_size() == 0);
+    DEBUG_ASSERT(!(flags_ & ~map_flags_mask));
+    DEBUG_ASSERT(offset % page_size() == 0);
   }
 
   KernelMapping extend(remote_ptr<void> end) const {
-    assert(end >= MemoryRange::end());
+    DEBUG_ASSERT(end >= MemoryRange::end());
     return KernelMapping(start(), end, fsname_, device_, inode_, prot_, flags_,
                          offset);
   }
@@ -105,7 +105,7 @@ public:
                          offset);
   }
   KernelMapping subrange(remote_ptr<void> start, remote_ptr<void> end) const {
-    assert(start >= MemoryRange::start() && end <= MemoryRange::end());
+    DEBUG_ASSERT(start >= MemoryRange::start() && end <= MemoryRange::end());
     return KernelMapping(
         start, end, fsname_, device_, inode_, prot_, flags_,
         offset + (is_real_device() ? start - MemoryRange::start() : 0));
@@ -275,7 +275,9 @@ public:
       IS_PATCH_STUBS = 0x4,
       // This mapping has been created by the replayer to guarantee SIGBUS
       // in a region whose backing file was too short during recording.
-      IS_SIGBUS_REGION = 0x8
+      IS_SIGBUS_REGION = 0x8,
+      // This mapping is the rr page
+      IS_RR_PAGE = 0x10
     };
     uint32_t flags;
   };
@@ -307,7 +309,7 @@ public:
    * This can only be called during recording.
    */
   remote_ptr<void> current_brk() const {
-    assert(!brk_end.is_null());
+    DEBUG_ASSERT(!brk_end.is_null());
     return brk_end;
   }
 
@@ -423,6 +425,17 @@ public:
   bool has_mapping(remote_ptr<void> addr) const;
 
   /**
+   * If the given memory region is mapped into the local address space, obtain
+   * the local address from which the `size` bytes at `addr` can be accessed.
+   */
+  uint8_t* local_mapping(remote_ptr<void> addr, size_t size);
+
+  /**
+   * Return true if the rr page is mapped at its expected address.
+   */
+  bool has_rr_page() const;
+
+  /**
    * Object that generates robust iterators through the memory map. The
    * memory map can be updated without invalidating iterators, as long as
    * Mappings are not added or removed.
@@ -443,7 +456,7 @@ public:
       }
       bool operator!=(const iterator& other) const { return !(*this == other); }
       const Mapping* operator->() const { return &to_it()->second; }
-      Mapping operator*() const { return to_it()->second; }
+      const Mapping& operator*() const { return to_it()->second; }
       iterator& operator=(const iterator& other) {
         this->~iterator();
         new (this) iterator(other);
@@ -579,6 +592,15 @@ public:
    */
   std::vector<WatchConfig> consume_watchpoint_changes();
 
+  void set_shm_size(remote_ptr<void> addr, size_t bytes) {
+    shm_sizes[addr] = bytes;
+  }
+  /**
+   * Dies if no shm size is registered for the address.
+   */
+  size_t get_shm_size(remote_ptr<void> addr) { return shm_sizes[addr]; }
+  void remove_shm_size(remote_ptr<void> addr) { shm_sizes.erase(addr); }
+
   /**
    * Make [addr, addr + num_bytes) inaccessible within this
    * address space.
@@ -609,7 +631,7 @@ public:
   void set_mem_fd(ScopedFd&& fd) { child_mem_fd = std::move(fd); }
 
   Monkeypatcher& monkeypatcher() {
-    assert(monkeypatch_state);
+    DEBUG_ASSERT(monkeypatch_state);
     return *monkeypatch_state;
   }
 
@@ -665,6 +687,8 @@ public:
   };
   static std::vector<SyscallType> rr_page_syscalls();
   static const SyscallType* rr_page_syscall_from_exit_point(remote_code_ptr ip);
+  static const SyscallType* rr_page_syscall_from_entry_point(
+      remote_code_ptr ip);
 
   /**
    * Return a pointer to 8 bytes of 0xFF
@@ -684,8 +708,8 @@ public:
    */
   void did_fork_into(Task* t);
 
-  void set_first_run_event(TraceFrame::Time event) { first_run_event_ = event; }
-  TraceFrame::Time first_run_event() { return first_run_event_; }
+  void set_first_run_event(FrameTime event) { first_run_event_ = event; }
+  FrameTime first_run_event() { return first_run_event_; }
 
   const std::vector<uint8_t>& saved_auxv() { return saved_auxv_; }
   void save_auxv(Task* t);
@@ -848,18 +872,18 @@ private:
     Breakpoint(const Breakpoint& o) = default;
     // AddressSpace::destroy_all_breakpoints() can cause this
     // destructor to be invoked while we have nonzero total
-    // refcount, so the most we can assert is that the refcounts
+    // refcount, so the most we can DEBUG_ASSERT is that the refcounts
     // are valid.
-    ~Breakpoint() { assert(internal_count >= 0 && user_count >= 0); }
+    ~Breakpoint() { DEBUG_ASSERT(internal_count >= 0 && user_count >= 0); }
 
     void ref(BreakpointType which) {
-      assert(internal_count >= 0 && user_count >= 0);
+      DEBUG_ASSERT(internal_count >= 0 && user_count >= 0);
       ++*counter(which);
     }
     int unref(BreakpointType which) {
-      assert(internal_count > 0 || user_count > 0);
+      DEBUG_ASSERT(internal_count > 0 || user_count > 0);
       --*counter(which);
-      assert(internal_count >= 0 && user_count >= 0);
+      DEBUG_ASSERT(internal_count >= 0 && user_count >= 0);
       return internal_count + user_count;
     }
 
@@ -886,9 +910,9 @@ private:
                   "Must have the same size.");
 
     int* counter(BreakpointType which) {
-      assert(BKPT_INTERNAL == which || BKPT_USER == which);
+      DEBUG_ASSERT(BKPT_INTERNAL == which || BKPT_USER == which);
       int* p = BKPT_USER == which ? &user_count : &internal_count;
-      assert(*p >= 0);
+      DEBUG_ASSERT(*p >= 0);
       return p;
     }
   };
@@ -921,15 +945,15 @@ private:
     int unwatch(int which) {
       assert_valid();
       if (EXEC_BIT & which) {
-        assert(exec_count > 0);
+        DEBUG_ASSERT(exec_count > 0);
         --exec_count;
       }
       if (READ_BIT & which) {
-        assert(read_count > 0);
+        DEBUG_ASSERT(read_count > 0);
         --read_count;
       }
       if (WRITE_BIT & which) {
-        assert(write_count > 0);
+        DEBUG_ASSERT(write_count > 0);
         --write_count;
       }
       return exec_count + read_count + write_count;
@@ -941,7 +965,7 @@ private:
     }
 
     void assert_valid() const {
-      assert(exec_count >= 0 && read_count >= 0 && write_count >= 0);
+      DEBUG_ASSERT(exec_count >= 0 && read_count >= 0 && write_count >= 0);
     }
 
     // Watchpoints stay alive until all watched access typed have
@@ -976,6 +1000,9 @@ private:
   remote_ptr<void> brk_end;
   /* All segments mapped into this address space. */
   MemoryMap mem;
+  /* Sizes of SYSV shm segments, by address. We use this to determine the size
+   * of memory regions unmapped via shmdt(). */
+  std::map<remote_ptr<void>, size_t> shm_sizes;
   std::set<remote_ptr<void>> monitored_mem;
   /* madvise DONTFORK regions */
   std::set<MemoryRange> dont_fork;
@@ -1013,7 +1040,7 @@ private:
    * The time of the first event that ran code for a task in this address space.
    * 0 if no such event has occurred.
    */
-  TraceFrame::Time first_run_event_;
+  FrameTime first_run_event_;
 
   /**
    * For each architecture, the offset of a syscall instruction with that

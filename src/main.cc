@@ -5,15 +5,23 @@
 #include <limits.h>
 #include <linux/version.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/utsname.h>
+
+#include "Python.h"
+
+#include "strace_defs.h"
 
 #include <sstream>
 
 #include "Command.h"
 #include "Flags.h"
 #include "RecordCommand.h"
+#include "ReplayCommand.h"
+#include "core.h"
 #include "log.h"
+#include "util.h"
 
 using namespace std;
 
@@ -43,62 +51,11 @@ void assert_prerequisites(bool use_syscall_buffer) {
   }
 }
 
-void check_performance_settings() {
-  if (Flags::get().suppress_environment_warnings) {
-    return;
-  }
-
-  // NB: we hard-code "cpu0" here because rr pins itself and all
-  // tracees to cpu 0.  We don't care about the other CPUs.
-  ScopedFd fd("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor",
-              O_RDONLY);
-  if (0 > fd) {
-    // If the file doesn't exist, the system probably
-    // doesn't have the ability to frequency-scale, for
-    // example a VM.
-    LOG(info) << "Unable to check CPU-frequency governor.";
-    return;
-  }
-  char governor[PATH_MAX];
-  ssize_t nread = read(fd, governor, sizeof(governor) - 1);
-  if (0 > nread) {
-    FATAL() << "Unable to read cpu0's frequency governor.";
-  }
-  governor[nread] = '\0';
-  ssize_t len = strlen(governor);
-  if (len > 0) {
-    // Eat the '\n'.
-    governor[len - 1] = '\0';
-  }
-  LOG(info) << "cpu0's frequency governor is '" << governor << "'";
-  if (strcmp("performance", governor)) {
-    fprintf(stderr,
-            "\n"
-            "rr: Warning: Your CPU frequency governor is '%s'.  rr strongly\n"
-            "    recommends that you use the 'performance' governor.  Not "
-            "using the\n"
-            "    'performance' governor can cause rr to be at least 2x slower\n"
-            "    on laptops.\n"
-            "\n"
-            "    On Fedora-based systems, you can enable the 'performance' "
-            "governor\n"
-            "    by running the following commands:\n"
-            "\n"
-            "    $ sudo dnf install kernel-tools\n"
-            "    $ sudo cpupower frequency-set -g performance\n"
-            "\n",
-            governor);
-    // TODO: It would be nice to bail here or do something
-    // clever to enable the 'performance' just for rr, but
-    // that seems too hard at the moment.
-  }
-}
-
 void print_version(FILE* out) { fprintf(out, "rr version %s\n", RR_VERSION); }
 
 void print_global_options(FILE* out) {
   fputs(
-      "Common options:\n"
+      "Global options:\n"
       "  --disable-cpuid-faulting   disable use of CPUID faulting\n"
       "  -A, --microarch=<NAME>     force rr to assume it's running on a CPU\n"
       "                             with microarch NAME even if runtime "
@@ -142,8 +99,6 @@ void print_global_options(FILE* out) {
       "                             suppress warnings about issues in the\n"
       "                             environment that rr has no control over\n"
       "  -T, --dump-at=TIME         dump memory at global timepoint TIME\n"
-      "  -V, --verbose              log messages that may not be urgently \n"
-      "                             critical to the user\n"
       "\n"
       "Use RR_LOG to control logging; e.g. RR_LOG=all:warn,Task:debug\n",
       out);
@@ -151,9 +106,12 @@ void print_global_options(FILE* out) {
 
 void print_usage(FILE* out) {
   print_version(out);
-  fputs("Usage:\n", out);
+  fputs("\nUsage:\n", out);
   Command::print_help_all(out);
-  fputc('\n', out);
+  fputs("\nIf no subcommand is provided, we check if the first non-option\n"
+        "argument is a directory. If it is, we assume the 'replay' subcommand\n"
+        "otherwise we assume the 'record' subcommand.\n\n",
+        out);
   print_global_options(out);
 }
 
@@ -178,7 +136,6 @@ bool parse_global_option(std::vector<std::string>& args) {
     { 'S', "suppress-environment-warnings", NO_PARAMETER },
     { 'T', "dump-at", HAS_PARAMETER },
     { 'U', "cpu-unbound", NO_PARAMETER },
-    { 'V', "verbose", NO_PARAMETER },
   };
 
   ParsedOption opt;
@@ -202,7 +159,7 @@ bool parse_global_option(std::vector<std::string>& args) {
         LOG(info) << "checksumming on all events";
         flags.checksum = Flags::CHECKSUM_ALL;
       } else {
-        flags.checksum = atoi(opt.value.c_str());
+        flags.checksum = strtoll(opt.value.c_str(), NULL, 10);
         LOG(info) << "checksumming on at event " << flags.checksum;
       }
       break;
@@ -210,7 +167,7 @@ bool parse_global_option(std::vector<std::string>& args) {
       if (opt.value == "RDTSC") {
         flags.dump_on = Flags::DUMP_ON_RDTSC;
       } else {
-        flags.dump_on = atoi(opt.value.c_str());
+        flags.dump_on = strtoll(opt.value.c_str(), NULL, 10);
       }
       break;
     case 'E':
@@ -229,13 +186,13 @@ bool parse_global_option(std::vector<std::string>& args) {
       flags.suppress_environment_warnings = true;
       break;
     case 'T':
-      flags.dump_at = atoi(opt.value.c_str());
+      flags.dump_at = strtoll(opt.value.c_str(), NULL, 10);
       break;
     case 'N':
       show_version = true;
       break;
     default:
-      assert(0 && "Invalid flag");
+      DEBUG_ASSERT(0 && "Invalid flag");
   }
   return true;
 }
@@ -244,8 +201,88 @@ bool parse_global_option(std::vector<std::string>& args) {
 
 using namespace rr;
 
+PyObject* process_syscall_func;
+PyObject* process_brk_func;
+PyObject* process_time_func;
+PyObject* process_gettimeofday_func;
+PyObject* process_clock_gettime_func;
+PyObject* dump_state_func;
+PyObject* write_to_pipe_func;
+PyObject* close_pipe_func;
+
+
+extern struct tcb *current_tcp;
+extern bool print_pid_pfx;
+extern int acolumn;
+extern char *acolumn_spaces;
+extern unsigned int max_strlen;
+
 int main(int argc, char* argv[]) {
+  // This is also set up by strace.  Needs to be run once
+  acolumn_spaces = (char*)xmalloc(acolumn + 1);
+  memset(acolumn_spaces, ' ', acolumn);
+  acolumn_spaces[acolumn] = '\0';
+  // Tell strace to be super verbose and filter nothing
+  qualify("trace=all");
+  qualify("abbrev=none");
+  qualify("verbose=all");
+  qualify("signal=all");
+  print_pid_pfx = true; // Tell strace to print out the PID information
+  max_strlen = 65535;
+
+  PyObject* py_rrdump_modname;
+  PyObject* py_rrdump_module;
+  PyObject* py_rrdump_dict;
+  Py_Initialize();
+  std::string cpp_rrdump_modname = "rrdump.rrdump";
+  if((py_rrdump_modname = PyString_FromString(cpp_rrdump_modname.c_str())) == NULL) {
+    FATAL() << "Failed to parse modname into string";
+  }
+  if((py_rrdump_module = PyImport_Import(py_rrdump_modname)) == NULL) {
+    FATAL() << "Module import failed";
+  }
+  if((py_rrdump_dict = PyModule_GetDict(py_rrdump_module)) == NULL) {
+    FATAL() << "Module dict get failed";
+  }
+  std::string cpp_process_syscall_func_name = "process_syscall";
+  std::string cpp_process_brk_func_name = "process_brk";
+  std::string cpp_process_time_func_name = "process_time";
+  std::string cpp_process_gettimeofday_func_name = "process_gettimeofday";
+  std::string cpp_process_clock_gettime_func_name = "process_clock_gettime";
+  std::string cpp_dump_state_func_name = "dump_state";
+  std::string cpp_write_to_pipe_func_name = "write_to_pipe";
+  std::string cpp_close_pipe_func_name = "close_pipe";
+  process_syscall_func = PyDict_GetItemString(py_rrdump_dict,
+                                              cpp_process_syscall_func_name.c_str());
+  process_brk_func = PyDict_GetItemString(py_rrdump_dict,
+                                          cpp_process_brk_func_name.c_str());
+  process_time_func = PyDict_GetItemString(py_rrdump_dict,
+                                           cpp_process_time_func_name.c_str());
+  process_gettimeofday_func = PyDict_GetItemString(py_rrdump_dict,
+                                                   cpp_process_gettimeofday_func_name.c_str());
+  process_clock_gettime_func = PyDict_GetItemString(py_rrdump_dict,
+                                                    cpp_process_clock_gettime_func_name.c_str());
+  dump_state_func = PyDict_GetItemString(py_rrdump_dict,
+                                         cpp_dump_state_func_name.c_str());
+  write_to_pipe_func = PyDict_GetItemString(py_rrdump_dict,
+                                            cpp_write_to_pipe_func_name.c_str());
+  close_pipe_func = PyDict_GetItemString(py_rrdump_dict,
+                                         cpp_close_pipe_func_name.c_str());
+
+  if((!PyCallable_Check(process_syscall_func))           ||
+     (!PyCallable_Check(process_brk_func))               ||
+     (!PyCallable_Check(process_time_func))              ||
+     (!PyCallable_Check(process_gettimeofday_func))      ||
+     (!PyCallable_Check(process_clock_gettime_func))     ||
+     (!PyCallable_Check(dump_state_func))                ||
+     (!PyCallable_Check(write_to_pipe_func))             ||
+     (!PyCallable_Check(close_pipe_func)))
+  {
+    FATAL() << "Failed to collect required python functions";
+  }
+
   init_random();
+  raise_resource_limits();
 
   vector<string> args;
   for (int i = 1; i < argc; ++i) {
@@ -273,8 +310,16 @@ int main(int argc, char* argv[]) {
       print_usage(stderr);
       return 1;
     }
-    command = RecordCommand::get();
+    if (is_directory(args[0].c_str())) {
+      command = ReplayCommand::get();
+    } else {
+      command = RecordCommand::get();
+    }
   }
+  auto result = command->run(args);
+  Py_DECREF(py_rrdump_modname);
+  Py_DECREF(py_rrdump_module);
+  Py_Finalize();
 
-  return command->run(args);
+  return result;
 }

@@ -2,7 +2,6 @@
 
 #include "RecordCommand.h"
 
-#include <assert.h>
 #include <linux/capability.h>
 #include <sys/prctl.h>
 #include <sysexits.h>
@@ -13,6 +12,7 @@
 #include "RecordSession.h"
 #include "StringVectorToCharArray.h"
 #include "WaitStatus.h"
+#include "core.h"
 #include "kernel_metadata.h"
 #include "log.h"
 #include "main.h"
@@ -121,6 +121,8 @@ struct RecordFlags {
 
   bool setuid_sudo;
 
+  bool strace_output;
+
   RecordFlags()
       : max_ticks(Scheduler::DEFAULT_MAX_TICKS),
         ignore_sig(0),
@@ -136,7 +138,8 @@ struct RecordFlags {
         wait_for_all(false),
         ignore_nested(false),
         scarce_fds(false),
-        setuid_sudo(false) {}
+        setuid_sudo(false),
+        strace_output(false) {}
 };
 
 static void parse_signal_name(ParsedOption& opt) {
@@ -150,7 +153,7 @@ static void parse_signal_name(ParsedOption& opt) {
       opt.int_value = i;
       return;
     }
-    assert(signame[0] == 'S' && signame[1] == 'I' && signame[2] == 'G');
+    DEBUG_ASSERT(signame[0] == 'S' && signame[1] == 'I' && signame[2] == 'G');
     if (signame.substr(3) == opt.value) {
       opt.int_value = i;
       return;
@@ -181,7 +184,8 @@ static bool parse_record_arg(vector<string>& args, RecordFlags& flags) {
     { 't', "continue-through-signal", HAS_PARAMETER },
     { 'u', "cpu-unbound", NO_PARAMETER },
     { 'v', "env", HAS_PARAMETER },
-    { 'w', "wait", NO_PARAMETER }
+    { 'w', "wait", NO_PARAMETER },
+    { 'q', "strace-output", NO_PARAMETER}
   };
   ParsedOption opt;
   auto args_copy = args;
@@ -266,8 +270,11 @@ static bool parse_record_arg(vector<string>& args, RecordFlags& flags) {
     case 'w':
       flags.wait_for_all = true;
       break;
+    case 'q':
+        flags.strace_output = true;
+        break;
     default:
-      assert(0 && "Unknown option");
+      DEBUG_ASSERT(0 && "Unknown option");
   }
 
   args = args_copy;
@@ -290,7 +297,7 @@ static void handle_SIGTERM(__attribute__((unused)) int sig) {
     static const char msg[] =
         "Received SIGTERM while an earlier one was pending.  We're "
         "probably wedged.\n";
-    write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    write_all(STDERR_FILENO, msg, sizeof(msg) - 1);
     notifying_abort();
   }
   term_request = true;
@@ -327,17 +334,29 @@ static void setup_session_from_flags(RecordSession& session,
   }
 }
 
+static RecordSession* static_session;
+
+// This can be called during debugging to close the trace so it can be used
+// later.
+void force_close_record_session() {
+  if (static_session) {
+    static_session->terminate_recording();
+  }
+}
+
 static WaitStatus record(const vector<string>& args, const RecordFlags& flags) {
   LOG(info) << "Start recording...";
 
   auto session = RecordSession::create(
-      args, flags.extra_env, flags.use_syscall_buffer, flags.bind_cpu);
+    args, flags.extra_env, flags.use_syscall_buffer, flags.bind_cpu, flags.strace_output);
   setup_session_from_flags(*session, flags);
+
+  static_session = session.get();
 
   if (flags.print_trace_dir >= 0) {
     const string& dir = session->trace_writer().dir();
-    write(flags.print_trace_dir, dir.c_str(), dir.size());
-    write(flags.print_trace_dir, "\n", 1);
+    write_all(flags.print_trace_dir, dir.c_str(), dir.size());
+    write_all(flags.print_trace_dir, "\n", 1);
   }
 
   // Install signal handlers after creating the session, to ensure they're not
@@ -354,6 +373,7 @@ static WaitStatus record(const vector<string>& args, const RecordFlags& flags) {
   } while (step_result.status == RecordSession::STEP_CONTINUE && !term_request);
 
   session->terminate_recording();
+  static_session = nullptr;
 
   switch (step_result.status) {
     case RecordSession::STEP_CONTINUE:
@@ -368,7 +388,7 @@ static WaitStatus record(const vector<string>& args, const RecordFlags& flags) {
       return WaitStatus::for_exit_code(EX_UNAVAILABLE);
 
     default:
-      assert(0 && "Unknown exit status");
+      DEBUG_ASSERT(0 && "Unknown exit status");
       return WaitStatus();
   }
 }
@@ -397,7 +417,7 @@ static void reset_uid_sudo() {
   // and the capabilities in the child
   std::string sudo_uid = getenv("SUDO_UID");
   std::string sudo_gid = getenv("SUDO_GID");
-  assert(!sudo_uid.empty() && !sudo_gid.empty());
+  DEBUG_ASSERT(!sudo_uid.empty() && !sudo_gid.empty());
   uid_t tracee_uid = stoi(sudo_uid);
   gid_t tracee_gid = stoi(sudo_gid);
   // Setuid will drop effective capabilities. Save them now and set them
@@ -446,7 +466,6 @@ int RecordCommand::run(vector<string>& args) {
   }
 
   assert_prerequisites(flags.use_syscall_buffer);
-  check_performance_settings();
 
   if (flags.setuid_sudo) {
     if (geteuid() != 0 || getenv("SUDO_UID") == NULL) {

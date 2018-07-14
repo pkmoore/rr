@@ -2,7 +2,6 @@
 
 #include "kernel_metadata.h"
 
-#include <assert.h>
 #include <errno.h>
 #include <linux/shm.h>
 #include <signal.h>
@@ -41,6 +40,12 @@ string ptrace_event_name(int event) {
     CASE(PTRACE_EVENT_SECCOMP_OBSOLETE);
     CASE(PTRACE_EVENT_SECCOMP);
     CASE(PTRACE_EVENT_STOP);
+    /* Special-case this so we don't need to sprintf in this common case.
+     * This case is common because we often pass ptrace_event_name(event) to
+     * assertions when event is 0.
+     */
+    case 0:
+      return "PTRACE_EVENT(0)";
     default: {
       char buf[100];
       sprintf(buf, "PTRACE_EVENT(%d)", event);
@@ -130,6 +135,12 @@ string signal_name(int sig) {
     CASE(SIGIO);
     CASE(SIGPWR);
     CASE(SIGSYS);
+    /* Special-case this so we don't need to sprintf in this common case.
+     * This case is common because we often pass signal_name(sig) to assertions
+     * when sig is 0.
+     */
+    case 0:
+      return "signal(0)";
     default: {
       char buf[100];
       sprintf(buf, "signal(%d)", sig);

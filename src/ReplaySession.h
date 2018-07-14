@@ -6,6 +6,8 @@
 #include <memory>
 #include <set>
 
+#include <Python.h>
+
 #include "AddressSpace.h"
 #include "CPUIDBugDetector.h"
 #include "DiversionSession.h"
@@ -110,7 +112,7 @@ struct ReplayResult {
 
 /**
  * An indicator of how much progress the ReplaySession has made within a given
- * (TraceFrame::Time, Ticks) pair. These can only be used for comparisons, to
+ * (FrameTime, Ticks) pair. These can only be used for comparisons, to
  * check whether two ReplaySessions are in the same state and to help
  * order their states temporally.
  */
@@ -187,6 +189,10 @@ public:
    * for replay to reach.
    */
   const TraceFrame& current_trace_frame() const { return trace_frame; }
+  /**
+   * Time of the current frame
+   */
+  FrameTime current_frame_time() const { return trace_frame.time(); }
 
   /**
    * The Task for the current trace record.
@@ -203,7 +209,7 @@ public:
    * Returns true if the next step for this session is to exit a syscall with
    * the given number.
    */
-  bool next_step_is_syscall_exit(int syscallno);
+  bool next_step_is_successful_syscall_exit(int syscallno);
 
   /**
    * The current ReplayStepKey.
@@ -226,7 +232,7 @@ public:
     explicit StepConstraints(RunCommand command)
         : command(command), stop_at_time(0), ticks_target(0) {}
     RunCommand command;
-    TraceFrame::Time stop_at_time;
+    FrameTime stop_at_time;
     Ticks ticks_target;
     // When the RunCommand is RUN_SINGLESTEP_FAST_FORWARD, stop if the next
     // singlestep would enter one of the register states in this list.
@@ -308,9 +314,9 @@ private:
                                      const StepConstraints& constraints);
   void check_ticks_consistency(ReplayTask* t, const Event& ev);
   void check_pending_sig(ReplayTask* t);
-  void continue_or_step(ReplayTask* t, const StepConstraints& constraints,
-                        TicksRequest tick_request,
-                        ResumeRequest resume_how = RESUME_SYSEMU);
+  Completion continue_or_step(ReplayTask* t, const StepConstraints& constraints,
+                              TicksRequest tick_request,
+                              ResumeRequest resume_how = RESUME_SYSEMU);
   Completion advance_to_ticks_target(ReplayTask* t,
                                      const StepConstraints& constraints);
   Completion emulate_deterministic_signal(ReplayTask* t, int sig,
@@ -328,6 +334,15 @@ private:
                                       BreakStatus& break_status);
 
   void clear_syscall_bp();
+
+  void rrdump_process_syscall(ReplayTask* t, bool is_entry);
+  void rrdump_insert_value_into_dict(PyObject* dict, std::string key, int value);
+  void rrdump_insert_unsigned_value_into_dict(PyObject* dict, std::string key, unsigned value);
+  void rrdump_process_time(ReplayTask* t);
+  void rrdump_process_gettimeofday(ReplayTask* t);
+  void rrdump_process_clock_gettime(ReplayTask* t);
+  PyObject* rrdump_process_pipe(ReplayTask* t);
+  PyObject* rrdump_process_fcntl64(ReplayTask* t);
 
   std::shared_ptr<EmuFs> emu_fs;
   TraceReader trace_in;

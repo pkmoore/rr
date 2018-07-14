@@ -5,6 +5,8 @@
 
 #include "TraceStream.h"
 
+#include "AddressSpace.h"
+
 namespace rr {
 
 class ReplayTask;
@@ -32,6 +34,7 @@ void rep_process_syscall(ReplayTask* t, ReplayTraceStep* step);
  */
 void process_grow_map(ReplayTask* t);
 
+void rrdump_process_brk(KernelMapping km);
 } // namespace rr
 
 #endif /* RR_REP_PROCESS_EVENT_H_ */

@@ -3,39 +3,17 @@
 #ifndef RR_UTIL_H_
 #define RR_UTIL_H_
 
+#include "signal.h"
+
 #include <array>
 #include <map>
 #include <set>
 #include <string>
 #include <vector>
 
-#include "Event.h"
 #include "ScopedFd.h"
 #include "TraceFrame.h"
 #include "remote_ptr.h"
-
-#ifndef __has_attribute
-#define __has_attribute(x) 0
-#endif
-#ifndef __has_cpp_attribute
-#define __has_cpp_attribute(x) 0
-#endif
-
-/// RR_FALLTHROUGH - Mark fallthrough cases in switch statements.
-#if defined(__cplusplus) && __cplusplus > 201402L &&                           \
-    __has_cpp_attribute(fallthrough)
-#define RR_FALLTHROUGH [[fallthrough]]
-#elif !__cplusplus
-// Workaround for llvm.org/PR23435, since clang 3.6 and below emit a spurious
-// error when __has_cpp_attribute is given a scoped attribute in C mode.
-#define RR_FALLTHROUGH
-#elif __has_cpp_attribute(clang::fallthrough)
-#define RR_FALLTHROUGH [[clang::fallthrough]]
-#elif defined(__GNUC__) && __GNUC__ >= 7
-#define RR_FALLTHROUGH __attribute__((fallthrough))
-#else
-#define RR_FALLTHROUGH
-#endif
 
 namespace rr {
 
@@ -47,40 +25,10 @@ namespace rr {
  * place can move out of this file.
  */
 
+struct Event;
 class KernelMapping;
 class Task;
 class TraceFrame;
-
-template <typename T, size_t N> constexpr size_t array_length(T (&)[N]) {
-  return N;
-}
-
-template <typename T, size_t N>
-constexpr size_t array_length(std::array<T, N>&) {
-  return N;
-}
-
-template <typename T> T return_dummy_value() {
-  T v;
-  memset(&v, 1, sizeof(T));
-  return v;
-}
-template <typename T> bool check_type_has_no_holes() {
-  T v;
-  memset(&v, 2, sizeof(T));
-  v = return_dummy_value<T>();
-  return memchr(&v, 2, sizeof(T)) == NULL;
-}
-/**
- * Returns true when type T has no holes. Preferably should not be defined
- * at all otherwise.
- * This is not 100% reliable since the check_type_has_no_holes may be
- * compiled to copy holes. However, it has detected at least two bugs.
- */
-template <typename T> bool type_has_no_holes() {
-  static bool check = check_type_has_no_holes<T>();
-  return check;
-}
 
 enum Completion { COMPLETE, INCOMPLETE };
 
@@ -104,37 +52,35 @@ void dump_binary_data(const char* filename, const char* label,
  * "trace_0/12345_111_foo".  The returned name is not guaranteed to be
  * unique, caveat emptor.
  */
-void format_dump_filename(Task* t, TraceFrame::Time global_time,
-                          const char* tag, char* filename,
-                          size_t filename_size);
+void format_dump_filename(Task* t, FrameTime global_time, const char* tag,
+                          char* filename, size_t filename_size);
 
 /**
- * Return true if the user requested memory be dumped at |f|.
+ * Return true if the user requested memory be dumped at this event/time.
  */
-bool should_dump_memory(const TraceFrame& f);
+bool should_dump_memory(const Event& event, FrameTime time);
 /**
  * Dump all of the memory in |t|'s address to the file
  * "[trace_dir]/[t->tid]_[global_time]_[tag]".
  */
-void dump_process_memory(Task* t, TraceFrame::Time global_time,
-                         const char* tag);
+void dump_process_memory(Task* t, FrameTime global_time, const char* tag);
 
 /**
  * Return true if the user has requested |t|'s memory be
- * checksummed at |f|.
+ * checksummed at this event/time.
  */
-bool should_checksum(const TraceFrame& f);
+bool should_checksum(const Event& event, FrameTime time);
 /**
  * Write a checksum of each mapped region in |t|'s address space to a
  * special log, where it can be read by |validate_process_memory()|
  * during replay.
  */
-void checksum_process_memory(Task* t, TraceFrame::Time global_time);
+void checksum_process_memory(Task* t, FrameTime global_time);
 /**
  * Validate the checksum of |t|'s address space that was written
  * during recording.
  */
-void validate_process_memory(Task* t, TraceFrame::Time global_time);
+void validate_process_memory(Task* t, FrameTime global_time);
 
 /**
  * Return nonzero if the rr session is probably not interactive (that
@@ -173,8 +119,7 @@ signal_action default_action(int sig);
 SignalDeterministic is_deterministic_signal(Task* t);
 
 /**
- * Return nonzero if a mapping of |filename| with metadata |stat|,
- * using |flags| and |prot|, should almost certainly be copied to
+ * Return nonzero if a mapping of |mapping| should almost certainly be copied to
  * trace; i.e., the file contents are likely to change in the interval
  * between recording and replay.  Zero is returned /if we think we can
  * get away/ with not copying the region.  That doesn't mean it's
@@ -226,6 +171,9 @@ struct CPUIDData {
 };
 CPUIDData cpuid(uint32_t code, uint32_t subrequest);
 
+/**
+ * Return all CPUID values supported by this CPU.
+ */
 struct CPUIDRecord {
   uint32_t eax_in;
   // UINT32_MAX means ECX not relevant
@@ -234,7 +182,24 @@ struct CPUIDRecord {
 };
 std::vector<CPUIDRecord> all_cpuid_records();
 
+/**
+ * Returns true if CPUID faulting is supported by the kernel and hardware and
+ * is actually working.
+ */
 bool cpuid_faulting_works();
+
+/**
+ * Locate a CPUID record for the give parameters, or return nullptr if there
+ * isn't one.
+ */
+const CPUIDRecord* find_cpuid_record(const std::vector<CPUIDRecord>& records,
+                                     uint32_t eax, uint32_t ecx);
+
+/**
+ * Return true if the trace's CPUID values are "compatible enough" with our
+ * CPU's CPUID values.
+ */
+bool cpuid_compatible(const std::vector<CPUIDRecord>& trace_records);
 
 struct CloneParameters {
   remote_ptr<void> stack;
@@ -254,7 +219,7 @@ CloneParameters extract_clone_parameters(Task* t);
 const int NOT_ELF = 0x10000;
 int read_elf_class(const std::string& filename);
 
-bool trace_instructions_up_to_event(TraceFrame::Time event);
+bool trace_instructions_up_to_event(FrameTime event);
 
 /* Helpful for broken debuggers */
 
@@ -278,13 +243,15 @@ std::vector<std::string> read_proc_status_fields(pid_t tid, const char* name,
                                                  const char* name2 = nullptr,
                                                  const char* name3 = nullptr);
 
+bool is_zombie_process(pid_t pid);
+
 /**
  * Mainline Linux kernels use an invisible (to /proc/<pid>/maps) guard page
  * for stacks. grsecurity kernels don't.
  */
 bool uses_invisible_guard_page();
 
-void copy_file(Task* t, int dest_fd, int src_fd);
+bool copy_file(int dest_fd, int src_fd);
 
 #if defined(__has_feature)
 #if __has_feature(memory_sanitizer)
@@ -341,9 +308,16 @@ XSaveLayout xsave_layout_from_trace(const std::vector<CPUIDRecord> records);
  */
 inline size_t xsave_area_size() { return xsave_native_layout().full_size; }
 
-inline uint64_t signal_bit(int sig) { return uint64_t(1) << (sig - 1); }
+inline sig_set_t signal_bit(int sig) { return sig_set_t(1) << (sig - 1); }
 
 uint64_t rr_signal_mask();
+
+inline bool is_kernel_trap(int si_code) {
+  /* XXX unable to find docs on which of these "should" be
+   * right.  The SI_KERNEL code is seen in the int3 test, so we
+   * at least need to handle that. */
+  return si_code == TRAP_BRKPT || si_code == SI_KERNEL;
+}
 
 enum ProbePort { DONT_PROBE = 0, PROBE_PORT };
 
@@ -366,7 +340,15 @@ void dump_rr_stack();
 void check_for_leaks();
 
 /**
- * Returns $TMPDIR or "/tmp".
+ * Create directory `str`, creating parent directories as needed.
+ * `dir_type` is printed in error messages. Fails if the resulting directory
+ * is not writeable.
+ */
+void ensure_dir(const std::string& dir, const char* dir_type, mode_t mode);
+
+/**
+ * Returns $TMPDIR or "/tmp". We call ensure_dir to make sure the directory
+ * exists and is writeable.
  */
 const char* tmp_dir();
 
@@ -410,6 +392,36 @@ enum BindCPU { BIND_CPU = -2, UNBOUND_CPU = -1 };
 
 /* Convert a BindCPU to a specific CPU number */
 int choose_cpu(BindCPU bind_cpu);
+
+/* Updates an IEEE 802.3 CRC-32 least significant bit first from each byte in
+ * |buf|.  Pre- and post-conditioning is not performed in this function and so
+ * should be performed by the caller, as required. */
+uint32_t crc32(uint32_t crc, unsigned char* buf, size_t len);
+
+/* Like write(2) but any error or "device full" is treated as fatal. We also
+ * ensure that all bytes are written by looping on short writes. */
+void write_all(int fd, const void* buf, size_t size);
+
+/* Returns true if |path| is an accessible directory. Returns false if there
+ * was an error.
+ */
+bool is_directory(const char* path);
+
+/**
+ * Read bytes from `fd` into `buf` from `offset` until the read returns an
+ * error or 0 or the buffer is full. Returns total bytes read or -1 for error.
+ */
+ssize_t read_to_end(const ScopedFd& fd, size_t offset, void* buf, size_t size);
+
+/**
+ * Raise resource limits, in particular the open file descriptor count.
+ */
+void raise_resource_limits();
+
+/**
+ * Restore the initial resource limits for this process.
+ */
+void restore_initial_resource_limits();
 
 } // namespace rr
 

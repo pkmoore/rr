@@ -1,7 +1,7 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
 #include "nsutils.h"
-#include "rrutil.h"
+#include "util.h"
 
 #include <linux/securebits.h>
 
@@ -90,6 +90,6 @@ int main(int argc, char* argv[]) {
 
   test_assert(1 == prctl(PR_CAPBSET_READ, CAP_SYS_ADMIN));
 
-  atomic_printf("EXIT-SUCCESS");
+  atomic_puts("EXIT-SUCCESS");
   return 0;
 }

@@ -5,6 +5,7 @@
 #include "Command.h"
 #include "TraceStream.h"
 #include "TraceTaskEvent.h"
+#include "core.h"
 #include "main.h"
 
 using namespace std;
@@ -88,7 +89,7 @@ static int find_exit_code(pid_t pid, const vector<TraceTaskEvent>& events,
       if (status.type() == WaitStatus::EXIT) {
         return status.exit_code();
       }
-      assert(status.type() == WaitStatus::FATAL_SIGNAL);
+      DEBUG_ASSERT(status.type() == WaitStatus::FATAL_SIGNAL);
       return -status.fatal_sig();
     }
     update_tid_to_pid_map(tid_to_pid, e);
@@ -102,8 +103,12 @@ static int ps(const string& trace_dir, FILE* out) {
   fprintf(out, "PID\tPPID\tEXIT\tCMD\n");
 
   vector<TraceTaskEvent> events;
-  while (trace.good()) {
-    events.push_back(trace.read_task_event());
+  while (true) {
+    TraceTaskEvent r = trace.read_task_event();
+    if (r.type() == TraceTaskEvent::NONE) {
+      break;
+    }
+    events.push_back(r);
   }
 
   if (events.empty() || events[0].type() != TraceTaskEvent::EXEC) {

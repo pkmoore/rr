@@ -3,6 +3,21 @@
 #ifndef RR_PRELOAD_INTERFACE_H_
 #define RR_PRELOAD_INTERFACE_H_
 
+/* Bump this whenever the interface between syscallbuf and rr changes in a way
+ * that would require changes to replay. So be very careful making changes to
+ * this file! Many changes would require a bump in this value, and support
+ * code in rr to handle old protocol versions. And when we bump it we'll need
+ * to figure out a way to test the old protocol versions.
+ * To be clear, changes that only affect recording and not replay, such as
+ * changes to the layout of syscall_patch_hook, do not need to bump this.
+ * Note also that SYSCALLBUF_PROTOCOL_VERSION is stored in the trace header, so
+ * replay always has access to the SYSCALLBUF_PROTOCOL_VERSION used during
+ * recording, even before the preload library is ever loaded.
+ *
+ * Version 0: initial rr 5.0.0 release
+ */
+#define SYSCALLBUF_PROTOCOL_VERSION 0
+
 #ifdef RR_IMPLEMENT_PRELOAD
 /* Avoid using <string.h> library functions */
 static inline int streq(const char* s1, const char* s2) {
@@ -52,6 +67,17 @@ static inline int strprefix(const char* s1, const char* s2) {
     ++s2;
   }
   return 1;
+}
+
+static inline const char* extract_file_name(const char* s) {
+  const char* ret = s;
+  while (*s) {
+    if (*s == '/') {
+      ret = s + 1;
+    }
+    ++s;
+  }
+  return ret;
 }
 
 /* This header file is included by preload.c and various rr .cc files. It
@@ -105,7 +131,7 @@ static inline int strprefix(const char* s1, const char* s2) {
 /* PRELOAD_THREAD_LOCALS_ADDR should not change.
  * Tools depend on this address. */
 #define PRELOAD_THREAD_LOCALS_ADDR (RR_PAGE_ADDR + PAGE_SIZE)
-#define PRELOAD_THREAD_LOCALS_SIZE 88
+#define PRELOAD_THREAD_LOCALS_SIZE 104
 
 /* "Magic" (rr-implemented) syscalls that we use to initialize the
  * syscallbuf.
@@ -158,11 +184,15 @@ static inline int strprefix(const char* s1, const char* s2) {
 #ifdef RR_IMPLEMENT_PRELOAD
 #define TEMPLATE_ARCH
 #define PTR(T) T*
+#define PTR_ARCH(T) T*
 #define VOLATILE volatile
+#define SIGNED_LONG long
 #else
 #define TEMPLATE_ARCH template <typename Arch>
 #define PTR(T) typename Arch::template ptr<T>
+#define PTR_ARCH(T) typename Arch::template ptr<T<Arch>>
 #define VOLATILE
+#define SIGNED_LONG typename Arch::signed_long
 #endif
 
 /**
@@ -175,11 +205,15 @@ static inline int strprefix(const char* s1, const char* s2) {
  * instruction that follows a syscall instruction.
  * Each instance of this struct describes an instruction that can follow a
  * syscall and a hook function to patch with.
+ *
+ * This is not (and must not ever be) used during replay so we can change it
+ * without bumping SYSCALLBUF_PROTOCOL_VERSION.
  */
 struct syscall_patch_hook {
   uint8_t is_multi_instruction;
   uint8_t next_instruction_length;
-  uint8_t next_instruction_bytes[6];
+  /* Avoid any padding or anything that would make the layout arch-specific. */
+  uint8_t next_instruction_bytes[14];
   uint64_t hook_address;
 };
 
@@ -236,6 +270,16 @@ struct preload_globals {
 };
 
 /**
+ * Represents syscall params.  Makes it simpler to pass them around,
+ * and avoids pushing/popping all the data for calls.
+ */
+TEMPLATE_ARCH
+struct syscall_info {
+  SIGNED_LONG no;
+  SIGNED_LONG args[6];
+};
+
+/**
  * Can be architecture dependent. The rr process does not manipulate
  * these except to save and restore the values on task switches so that
  * the values are always effectively local to the current task. rr also
@@ -246,18 +290,39 @@ struct preload_globals {
  */
 TEMPLATE_ARCH
 struct preload_thread_locals {
-  /* The offsets of these fields are hardcoded in syscall_hook.S and
-   * assembly_templates.py. Try to avoid changing them! */
-  /* Pointer to alt-stack used by syscallbuf stubs (allocated at the end of
-   * the scratch buffer */
+  /* The offset of this field MUST NOT CHANGE, it is part of the preload ABI
+   * rr depends on.
+   * Offset of this field is hardcoded in syscall_hook.S and
+   * assembly_templates.py.
+   * Pointer to alt-stack used by syscallbuf stubs (allocated at the end of
+   * the scratch buffer.
+   */
   PTR(void) syscallbuf_stub_alt_stack;
-  /* Where syscall result will be (or during replay, has been) saved.
-   * The offset of this field MUST NOT CHANGE, it is part of the preload ABI
-   * tools can depend on. */
+  /* The offset of this field MUST NOT CHANGE, it is part of the preload ABI
+   * tools can depend on.
+   * Where syscall result will be (or during replay, has been) saved.
+   */
   PTR(int64_t) pending_untraced_syscall_result;
-  /* scratch space used by stub code */
+  /* The offset of this field MUST NOT CHANGE, it is part of the preload ABI
+   * rr depends on.
+   * Scratch space used by stub code.
+   */
   PTR(void) stub_scratch_1;
+  /* The offset of this field MUST NOT CHANGE, it is part of the preload ABI
+   * rr depends on.
+   */
   int alt_stack_nesting_level;
+  /**
+   * We could use this later.
+   */
+  int unused_padding;
+  /* The offset of this field MUST NOT CHANGE, it is part of the preload ABI
+   * rr depends on. It contains the parameters to the patched syscall, or
+   * zero if we're not processing a buffered syscall. Do not depend on this
+   * existing during replay, some traces with SYSCALLBUF_PROTOCOL_VERSION 0
+   * don't have it.
+   */
+  PTR_ARCH(const struct syscall_info) original_syscall_parameters;
 
   /* Nonzero when thread-local state like the syscallbuf has been
    * initialized.  */
@@ -499,9 +564,18 @@ inline static long stored_record_size(size_t length) {
  * too much by piling on.
  */
 inline static int is_blacklisted_filename(const char* filename) {
-  return strprefix("/dev/dri/", filename) ||
-         streq("/dev/nvidiactl", filename) ||
-         streq("/usr/share/alsa/alsa.conf", filename);
+  const char* f;
+  if (strprefix("/dev/dri/", filename) || streq("/dev/nvidiactl", filename) ||
+      streq("/usr/share/alsa/alsa.conf", filename)) {
+    return 1;
+  }
+  f = extract_file_name(filename);
+  return strprefix("rr-test-blacklist-file_name", f) ||
+         strprefix("pulse-shm-", f);
+}
+
+inline static int is_blacklisted_memfd(const char* name) {
+  return streq("pulseaudio", name);
 }
 
 inline static int is_blacklisted_socket(const char* filename) {

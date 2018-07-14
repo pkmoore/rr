@@ -15,13 +15,13 @@
 #include "Registers.h"
 #include "ReplaySession.h"
 #include "ReplayTimeline.h"
+#include "core.h"
 
 namespace rr {
 
 /**
- * Descriptor for task within a task group.  Note: on linux, we can
- * uniquely identify any thread by its |tid| (ignoring pid
- * namespaces).
+ * Descriptor for task.  Note: on linux, we can uniquely identify any thread
+ * by its |tid| (in rr's pid namespace).
  */
 struct GdbThreadId {
   GdbThreadId(pid_t pid = -1, pid_t tid = -1) : pid(pid), tid(tid) {}
@@ -74,6 +74,7 @@ enum GdbRequestType {
 
   /* These use params.target. */
   DREQ_GET_AUXV,
+  DREQ_GET_EXEC_FILE,
   DREQ_GET_IS_THREAD_ALIVE,
   DREQ_GET_THREAD_EXTRA_INFO,
   DREQ_SET_CONTINUE_THREAD,
@@ -132,6 +133,15 @@ enum GdbRequestType {
 
   // qSymbol packet, uses params.sym.
   DREQ_QSYMBOL,
+
+  // vFile:setfs packet, uses params.file_setfs.
+  DREQ_FILE_SETFS,
+  // vFile:open packet, uses params.file_open.
+  DREQ_FILE_OPEN,
+  // vFile:pread packet, uses params.file_pread.
+  DREQ_FILE_PREAD,
+  // vFile:close packet, uses params.file_close.
+  DREQ_FILE_CLOSE,
 };
 
 enum GdbRestartType {
@@ -170,7 +180,11 @@ struct GdbRequest {
         cont_(other.cont_),
         text_(other.text_),
         tls_(other.tls_),
-        sym_(other.sym_) {}
+        sym_(other.sym_),
+        file_setfs_(other.file_setfs_),
+        file_open_(other.file_open_),
+        file_pread_(other.file_pread_),
+        file_close_(other.file_close_) {}
   GdbRequest& operator=(const GdbRequest& other) {
     this->~GdbRequest();
     new (this) GdbRequest(other);
@@ -213,66 +227,115 @@ struct GdbRequest {
     remote_ptr<void> address;
     std::string name;
   } sym_;
+  struct FileSetfs {
+    pid_t pid;
+  } file_setfs_;
+  struct FileOpen {
+    std::string file_name;
+    // In system format, not gdb's format
+    int flags;
+    int mode;
+  } file_open_;
+  struct FilePread {
+    int fd;
+    size_t size;
+    uint64_t offset;
+  } file_pread_;
+  struct FileClose {
+    int fd;
+  } file_close_;
 
   Mem& mem() {
-    assert(type >= DREQ_MEM_FIRST && type <= DREQ_MEM_LAST);
+    DEBUG_ASSERT(type >= DREQ_MEM_FIRST && type <= DREQ_MEM_LAST);
     return mem_;
   }
   const Mem& mem() const {
-    assert(type >= DREQ_MEM_FIRST && type <= DREQ_MEM_LAST);
+    DEBUG_ASSERT(type >= DREQ_MEM_FIRST && type <= DREQ_MEM_LAST);
     return mem_;
   }
   Watch& watch() {
-    assert(type >= DREQ_WATCH_FIRST && type <= DREQ_WATCH_LAST);
+    DEBUG_ASSERT(type >= DREQ_WATCH_FIRST && type <= DREQ_WATCH_LAST);
     return watch_;
   }
   const Watch& watch() const {
-    assert(type >= DREQ_WATCH_FIRST && type <= DREQ_WATCH_LAST);
+    DEBUG_ASSERT(type >= DREQ_WATCH_FIRST && type <= DREQ_WATCH_LAST);
     return watch_;
   }
   GdbRegisterValue& reg() {
-    assert(type >= DREQ_REG_FIRST && type <= DREQ_REG_LAST);
+    DEBUG_ASSERT(type >= DREQ_REG_FIRST && type <= DREQ_REG_LAST);
     return reg_;
   }
   const GdbRegisterValue& reg() const {
-    assert(type >= DREQ_REG_FIRST && type <= DREQ_REG_LAST);
+    DEBUG_ASSERT(type >= DREQ_REG_FIRST && type <= DREQ_REG_LAST);
     return reg_;
   }
   Restart& restart() {
-    assert(type == DREQ_RESTART);
+    DEBUG_ASSERT(type == DREQ_RESTART);
     return restart_;
   }
   const Restart& restart() const {
-    assert(type == DREQ_RESTART);
+    DEBUG_ASSERT(type == DREQ_RESTART);
     return restart_;
   }
   Cont& cont() {
-    assert(type == DREQ_CONT);
+    DEBUG_ASSERT(type == DREQ_CONT);
     return cont_;
   }
   const Cont& cont() const {
-    assert(type == DREQ_CONT);
+    DEBUG_ASSERT(type == DREQ_CONT);
     return cont_;
   }
   const std::string& text() const {
-    assert(type == DREQ_RR_CMD);
+    DEBUG_ASSERT(type == DREQ_RR_CMD);
     return text_;
   }
   Tls& tls() {
-    assert(type == DREQ_TLS);
+    DEBUG_ASSERT(type == DREQ_TLS);
     return tls_;
   }
   const Tls& tls() const {
-    assert(type == DREQ_TLS);
+    DEBUG_ASSERT(type == DREQ_TLS);
     return tls_;
   }
   Symbol& sym() {
-    assert(type == DREQ_QSYMBOL);
+    DEBUG_ASSERT(type == DREQ_QSYMBOL);
     return sym_;
   }
   const Symbol& sym() const {
-    assert(type == DREQ_QSYMBOL);
+    DEBUG_ASSERT(type == DREQ_QSYMBOL);
     return sym_;
+  }
+  FileSetfs& file_setfs() {
+    DEBUG_ASSERT(type == DREQ_FILE_SETFS);
+    return file_setfs_;
+  }
+  const FileSetfs& file_setfs() const {
+    DEBUG_ASSERT(type == DREQ_FILE_SETFS);
+    return file_setfs_;
+  }
+  FileOpen& file_open() {
+    DEBUG_ASSERT(type == DREQ_FILE_OPEN);
+    return file_open_;
+  }
+  const FileOpen& file_open() const {
+    DEBUG_ASSERT(type == DREQ_FILE_OPEN);
+    return file_open_;
+  }
+  FilePread& file_pread() {
+    DEBUG_ASSERT(type == DREQ_FILE_PREAD);
+    return file_pread_;
+  }
+  const FilePread& file_pread() const {
+    DEBUG_ASSERT(type == DREQ_FILE_PREAD);
+    return file_pread_;
+  }
+  FileClose& file_close() {
+    DEBUG_ASSERT(type == DREQ_FILE_CLOSE);
+    return file_close_;
+  }
+  const FileClose& file_close() const {
+    DEBUG_ASSERT(type == DREQ_FILE_CLOSE);
+    return file_close_;
   }
 
   /**
@@ -349,6 +412,11 @@ public:
    * if there was an error reading the auxiliary vector.
    */
   void reply_get_auxv(const std::vector<uint8_t>& auxv);
+
+  /**
+   * Reply with the target thread's executable file name
+   */
+  void reply_get_exec_file(const std::string& exec_file);
 
   /**
    * |alive| is true if the requested thread is alive, false if dead.
@@ -468,6 +536,23 @@ public:
   void reply_tls_addr(bool ok, remote_ptr<void> address);
 
   /**
+   * Respond to a vFile:setfs
+   */
+  void reply_setfs(int err);
+  /**
+   * Respond to a vFile:open
+   */
+  void reply_open(int fd, int err);
+  /**
+   * Respond to a vFile:pread
+   */
+  void reply_pread(const uint8_t* bytes, ssize_t len, int err);
+  /**
+   * Respond to a vFile:close
+   */
+  void reply_close(int err);
+
+  /**
    * Create a checkpoint of the given Session with the given id. Delete the
    * existing checkpoint with that id if there is one.
    */
@@ -581,6 +666,7 @@ private:
   void consume_request();
   void send_stop_reply_packet(GdbThreadId thread, int sig,
                               uintptr_t watch_addr = 0);
+  void send_file_error_reply(int system_errno);
 
   // Current request to be processed.
   GdbRequest req;
@@ -590,7 +676,7 @@ private:
   GdbThreadId query_thread;
   // gdb and rr don't work well together in multi-process and
   // multi-exe-image debugging scenarios, so we pretend only
-  // this task group exists when interfacing with gdb
+  // this thread group exists when interfacing with gdb
   pid_t tgid;
   uint32_t cpu_features_;
   // true when "no-ack mode" enabled, in which we don't have

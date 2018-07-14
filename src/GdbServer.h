@@ -12,9 +12,12 @@
 #include "ReplaySession.h"
 #include "ReplayTimeline.h"
 #include "ScopedFd.h"
+#include "ThreadDb.h"
 #include "TraceFrame.h"
 
 namespace rr {
+
+static std::string localhost_addr = "127.0.0.1";
 
 class GdbServer {
   // Not ideal but we can't inherit friend from GdbCommand
@@ -33,7 +36,7 @@ public:
     // If true, wait for the target process to exec() before attaching debugger
     bool require_exec;
     // Wait until at least 'event' has elapsed before attaching
-    TraceFrame::Time event;
+    FrameTime event;
   };
 
   struct ConnectionFlags {
@@ -41,6 +44,7 @@ public:
     // specific port to listen on. If keep_listening is on, wait for another
     // debugger connection after the first one is terminated.
     int dbg_port;
+    std::string dbg_host;
     bool keep_listening;
     // If non-null, then when the gdbserver is set up, we write its connection
     // parameters through this pipe. GdbServer::launch_gdb is passed the
@@ -52,6 +56,7 @@ public:
 
     ConnectionFlags()
         : dbg_port(-1),
+          dbg_host(localhost_addr),
           keep_listening(false),
           debugger_params_write_pipe(nullptr) {}
   };
@@ -198,19 +203,28 @@ private:
    */
   void delete_checkpoint(int checkpoint_id);
 
+  /**
+   * Handle GDB file open requests. If we can serve this read request, add
+   * an entry to `files` with the file contents and return our internal
+   * file descriptor.
+   */
+  int open_file(Session& session, const std::string& file_name);
+
   Target target;
   // dbg is initially null. Once the debugger connection is established, it
   // never changes.
   std::unique_ptr<GdbConnection> dbg;
-  // When dbg is non-null, the TaskGroupUid of the task being debugged. Never
+  // When dbg is non-null, the ThreadGroupUid of the task being debugged. Never
   // changes once the connection is established --- we don't currently
   // support switching gdb between debuggee processes.
-  TaskGroupUid debuggee_tguid;
+  ThreadGroupUid debuggee_tguid;
+  // ThreadDb for debuggee ThreadGroup
+  std::unique_ptr<ThreadDb> thread_db;
   // The TaskUid of the last continued task.
   TaskUid last_continue_tuid;
   // The TaskUid of the last queried task.
   TaskUid last_query_tuid;
-  TraceFrame::Time final_event;
+  FrameTime final_event;
   // siginfo for last notified stop.
   siginfo_t stop_siginfo;
   bool in_debuggee_end_state;
@@ -251,6 +265,13 @@ private:
   std::set<std::string> symbols;
   // Iterator into |symbols|.
   std::set<std::string>::iterator symbols_iter;
+
+  // Contents of opened files. Maps our internal file descriptor to a real
+  // file descriptor. Exposing our real file descriptor values is probably a
+  // bad idea.
+  std::map<int, ScopedFd> files;
+  // The pid for gdb's last vFile:setfs
+  pid_t file_scope_pid;
 };
 
 } // namespace rr

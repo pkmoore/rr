@@ -1,6 +1,5 @@
 /* -*- Mode: C++; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include <assert.h>
 #include <inttypes.h>
 
 #include <limits>
@@ -10,6 +9,7 @@
 #include "AddressSpace.h"
 #include "Command.h"
 #include "TraceStream.h"
+#include "core.h"
 #include "kernel_metadata.h"
 #include "main.h"
 #include "util.h"
@@ -34,7 +34,6 @@ DumpCommand DumpCommand::singleton(
     "  Event specs can be either an event number like `127', or a range\n"
     "  like `1000-5000'.  By default, all events are dumped.\n"
     "  -b, --syscallbuf           dump syscallbuf contents\n"
-    " --g, --generic              dump generic data\n"
     "  -m, --recorded-metadata    dump recorded data metadata\n"
     "  -p, --mmaps                dump mmap data\n"
     "  -r, --raw                  dump trace frames in a more easily\n"
@@ -45,7 +44,6 @@ DumpCommand DumpCommand::singleton(
 
 struct DumpFlags {
   bool dump_syscallbuf;
-  bool dump_generic;
   bool dump_recorded_data_metadata;
   bool dump_mmaps;
   bool raw_dump;
@@ -54,7 +52,6 @@ struct DumpFlags {
 
   DumpFlags()
       : dump_syscallbuf(false),
-        dump_generic(false),
         dump_recorded_data_metadata(false),
         dump_mmaps(false),
         raw_dump(false),
@@ -69,7 +66,6 @@ static bool parse_dump_arg(vector<string>& args, DumpFlags& flags) {
 
   static const OptionSpec options[] = {
     { 'b', "syscallbuf", NO_PARAMETER },
-    { 'g', "generic", NO_PARAMETER },
     { 'm', "recorded-metadata", NO_PARAMETER },
     { 'p', "mmaps", NO_PARAMETER },
     { 'r', "raw", NO_PARAMETER },
@@ -84,9 +80,6 @@ static bool parse_dump_arg(vector<string>& args, DumpFlags& flags) {
   switch (opt.short_name) {
     case 'b':
       flags.dump_syscallbuf = true;
-      break;
-    case 'g':
-      flags.dump_generic = true;
       break;
     case 'm':
       flags.dump_recorded_data_metadata = true;
@@ -107,7 +100,7 @@ static bool parse_dump_arg(vector<string>& args, DumpFlags& flags) {
       flags.only_tid = opt.int_value;
       break;
     default:
-      assert(0 && "Unknown option");
+      DEBUG_ASSERT(0 && "Unknown option");
   }
   return true;
 }
@@ -130,8 +123,9 @@ static void dump_syscallbuf_data(TraceReader& trace, FILE* out,
   auto end_ptr = record_ptr + bytes_remaining;
   while (record_ptr < end_ptr) {
     auto record = reinterpret_cast<const struct syscallbuf_record*>(record_ptr);
+    // Buffered syscalls always use the task arch
     fprintf(out, "  { syscall:'%s', ret:0x%lx, size:0x%lx }\n",
-            syscall_name(record->syscallno, frame.event().arch()).c_str(),
+            syscall_name(record->syscallno, frame.regs().arch()).c_str(),
             (long)record->ret, (long)record->size);
     if (record->size < sizeof(*record)) {
       fprintf(stderr, "Malformed trace file (bad record size)\n");
@@ -212,33 +206,28 @@ static void dump_events_matching(TraceReader& trace, const DumpFlags& flags,
           }
           fprintf(out, "  { map_file:\"%s\", addr:%p, length:%p, "
                        "prot_flags:\"%s\", file_offset:0x%llx, "
+                       "device:%lld, inode:%lld, "
                        "data_file:\"%s\", data_offset:0x%llx, "
                        "file_size:0x%llx }\n",
                   fsname, (void*)km.start().as_int(), (void*)km.size(),
                   prot_flags, (long long)km.file_offset_bytes(),
+                  (long long)km.device(), (long long)km.inode(),
                   data.file_name.c_str(), (long long)data.data_offset_bytes,
                   (long long)data.file_size_bytes);
         }
       }
 
-      TraceReader::RawData data;
-      while (process_raw_data && trace.read_raw_data_for_frame(frame, data)) {
+      TraceReader::RawDataMetadata data;
+      while (process_raw_data && trace.read_raw_data_metadata_for_frame(data)) {
         if (flags.dump_recorded_data_metadata) {
           fprintf(out, "  { tid:%d, addr:%p, length:%p }\n", data.rec_tid,
-                  (void*)data.addr.as_int(), (void*)data.data.size());
+                  (void*)data.addr.as_int(), (void*)data.size);
         }
-      }
-      vector<uint8_t> buf;
-      while (flags.dump_generic && trace.read_generic_for_frame(frame, buf)) {
-        fprintf(out, "  { length:%p }\n", (void*)buf.size());
       }
       if (!flags.raw_dump) {
         fprintf(out, "}\n");
       }
     } else {
-      TraceReader::RawData data;
-      while (process_raw_data && trace.read_raw_data_for_frame(frame, data)) {
-      }
       while (true) {
         TraceReader::MappedData data;
         KernelMapping km = trace.read_mapped_region(&data, nullptr,

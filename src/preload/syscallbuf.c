@@ -249,9 +249,10 @@ static void logmsg(const char* msg) {
   privileged_traced_write(STDERR_FILENO, msg, rrstrlen(msg));
 }
 
-#ifndef NDEBUG
 #define STR_HELPER(x) #x
 #define STR(x) STR_HELPER(x)
+
+#ifndef NDEBUG
 #define assert(cond)                                                           \
   do {                                                                         \
     if (!(cond)) {                                                             \
@@ -260,7 +261,10 @@ static void logmsg(const char* msg) {
     }                                                                          \
   } while (0)
 #else
-#define assert(cond) ((void)0)
+#define assert(cond)                                                           \
+  do {                                                                         \
+    __attribute__((unused)) size_t s = sizeof(cond);                           \
+  } while (0)
 #endif
 
 #define fatal(msg)                                                             \
@@ -524,6 +528,8 @@ static void __attribute__((constructor)) init_process(void) {
   extern RR_HIDDEN void _syscall_hook_trampoline_90_90_90(void);
   extern RR_HIDDEN void _syscall_hook_trampoline_ba_01_00_00_00(void);
   extern RR_HIDDEN void _syscall_hook_trampoline_89_c1_31_d2(void);
+  extern RR_HIDDEN void _syscall_hook_trampoline_c3_0f_1f_84_00_00_00_00_00(
+      void);
 
   struct syscall_patch_hook syscall_patch_hooks[] = {
     /* Many glibc syscall wrappers (e.g. read) have 'syscall' followed
@@ -578,7 +584,12 @@ static void __attribute__((constructor)) init_process(void) {
     { 1,
       4,
       { 0x89, 0xc1, 0x31, 0xd2 },
-      (uintptr_t)_syscall_hook_trampoline_89_c1_31_d2 }
+      (uintptr_t)_syscall_hook_trampoline_89_c1_31_d2 },
+    /* getpid has 'syscall' followed by 'retq; nopl 0x0(%rax,%rax,1) */
+    { 1,
+      9,
+      { 0xc3, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00 },
+      (uintptr_t)_syscall_hook_trampoline_c3_0f_1f_84_00_00_00_00_00 },
   };
 #else
 #error Unknown architecture
@@ -1586,12 +1597,6 @@ static long sys_open(const struct syscall_info* call) {
   const char* pathname = (const char*)call->args[0];
   int flags = call->args[1];
   mode_t mode = call->args[2];
-
-  /* NB: not arming the desched event is technically correct,
-   * since open() can't deadlock if it blocks.  However, not
-   * allowing descheds here may cause performance issues if the
-   * open does block for a while.  Err on the side of simplicity
-   * until we have perf data. */
   void* ptr;
   long ret;
 
@@ -1609,6 +1614,37 @@ static long sys_open(const struct syscall_info* call) {
   }
 
   ret = untraced_syscall3(syscallno, pathname, flags, mode);
+  return commit_raw_syscall(syscallno, ptr, ret);
+}
+
+static long sys_openat(const struct syscall_info* call) {
+  const int syscallno = SYS_openat;
+  int dirfd = call->args[0];
+  const char* pathname = (const char*)call->args[1];
+  int flags = call->args[2];
+  mode_t mode = call->args[3];
+  void* ptr;
+  long ret;
+
+  assert(syscallno == call->no);
+
+  /* The strcmp()s done here are OK because we're not in the
+   * critical section yet.
+   * Make non-AT_FDCWD calls with relative paths take the rr path so we can
+   * handle things correctly. New glibc open() implementation uses openat with
+   * AT_FDCWD.
+   */
+  int treat_as_open = dirfd == AT_FDCWD || pathname[0] == '/';
+  if (!treat_as_open || !allow_buffered_open(pathname)) {
+    return traced_raw_syscall(call);
+  }
+
+  ptr = prep_syscall();
+  if (!start_commit_buffered_syscall(syscallno, ptr, MAY_BLOCK)) {
+    return traced_raw_syscall(call);
+  }
+
+  ret = untraced_syscall4(syscallno, dirfd, pathname, flags, mode);
   return commit_raw_syscall(syscallno, ptr, ret);
 }
 
@@ -2449,6 +2485,7 @@ static long syscall_hook_internal(const struct syscall_info* call) {
     CASE_GENERIC_NONBLOCKING(mknod);
     CASE(mprotect);
     CASE(open);
+    CASE(openat);
     CASE(poll);
 #if defined(__x86_64__)
     CASE(pread64);
@@ -2468,6 +2505,9 @@ static long syscall_hook_internal(const struct syscall_info* call) {
 #endif
 #if defined(SYS_sendto)
     CASE(sendto);
+#endif
+#if defined(SYS_setsockopt)
+    CASE_GENERIC_NONBLOCKING(setsockopt);
 #endif
     CASE_GENERIC_NONBLOCKING(setxattr);
 #if defined(SYS_socketcall)
@@ -2527,6 +2567,8 @@ RR_HIDDEN long syscall_hook(const struct syscall_info* call) {
     return traced_raw_syscall(call);
   }
 
+  thread_locals->original_syscall_parameters = call;
+
   if (impose_syscall_delay) {
     do_delay();
   }
@@ -2582,5 +2624,6 @@ RR_HIDDEN long syscall_hook(const struct syscall_info* call) {
                                thread_locals->notify_control_msg);
     thread_locals->notify_control_msg = NULL;
   }
+  thread_locals->original_syscall_parameters = NULL;
   return result;
 }

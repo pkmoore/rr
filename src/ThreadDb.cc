@@ -3,7 +3,8 @@
 #include "ThreadDb.h"
 #include "GdbServer.h"
 #include "Task.h"
-#include "TaskGroup.h"
+#include "ThreadGroup.h"
+#include "core.h"
 #include "log.h"
 
 extern "C" {
@@ -39,12 +40,15 @@ ps_err_e ps_pglobal_lookup(struct ps_prochandle* h, const char*,
 
 ps_err_e ps_pdread(struct ps_prochandle* h, psaddr_t addr, void* buffer,
                    size_t len) {
+  if (!h->thread_group) {
+    FATAL() << "unexpected ps_pdread call with uninitialized thread_group";
+  }
   bool ok = true;
   uintptr_t uaddr = reinterpret_cast<uintptr_t>(addr);
-  // We need any task associated with the task group.  Here we assume
-  // that all the tasks in the task group share VM, which is enforced
+  // We need any task associated with the thread group.  Here we assume
+  // that all the tasks in the thread group share VM, which is enforced
   // by clone(2).
-  rr::Task* task = *h->task_group->task_set().begin();
+  rr::Task* task = *h->thread_group->task_set().begin();
   task->read_bytes_helper(uaddr, len, buffer, &ok);
   LOG(debug) << "ps_pdread " << ok;
   return ok ? PS_OK : PS_ERR;
@@ -57,8 +61,11 @@ ps_err_e ps_pdwrite(struct ps_prochandle*, psaddr_t, const void*, size_t) {
 
 ps_err_e ps_lgetregs(struct ps_prochandle* h, lwpid_t rec_tid,
                      prgregset_t result) {
-  rr::Task* task = h->task_group->session()->find_task(rec_tid);
-  assert(task != nullptr);
+  if (!h->thread_group) {
+    FATAL() << "unexpected ps_lgetregs call with uninitialized thread_group";
+  }
+  rr::Task* task = h->thread_group->session()->find_task(rec_tid);
+  DEBUG_ASSERT(task != nullptr);
 
   struct ::user_regs_struct regs = task->regs().get_ptrace();
   memcpy(result, static_cast<void*>(&regs), sizeof(regs));
@@ -82,14 +89,18 @@ ps_err_e ps_lsetfpregs(struct ps_prochandle*, lwpid_t, const prfpregset_t*) {
 }
 
 pid_t ps_getpid(struct ps_prochandle* h) {
-  LOG(debug) << "ps_getpid " << h->task_group->tgid;
-  return h->task_group->tgid;
+  LOG(debug) << "ps_getpid " << h->tgid;
+  return h->tgid;
 }
 
 ps_err_e ps_get_thread_area(const struct ps_prochandle* h, lwpid_t rec_tid,
                             int val, psaddr_t* base) {
-  rr::Task* task = h->task_group->session()->find_task(rec_tid);
-  assert(task != nullptr);
+  if (!h->thread_group) {
+    FATAL()
+        << "unexpected ps_get_thread_area call with uninitialized thread_group";
+  }
+  rr::Task* task = h->thread_group->session()->find_task(rec_tid);
+  DEBUG_ASSERT(task != nullptr);
 
   if (task->arch() == rr::x86) {
     unsigned int uval = static_cast<unsigned int>(val);
@@ -121,14 +132,15 @@ ps_err_e ps_get_thread_area(const struct ps_prochandle* h, lwpid_t rec_tid,
   return PS_OK;
 }
 
-rr::ThreadDb::ThreadDb(TaskGroup* task_group)
+rr::ThreadDb::ThreadDb(pid_t tgid)
     : internal_handle(nullptr),
       thread_db_library(nullptr),
       td_ta_delete_fn(nullptr),
       td_thr_tls_get_addr_fn(nullptr),
       td_ta_map_lwp2thr_fn(nullptr) {
-  prochandle.task_group = task_group;
+  prochandle.thread_group = nullptr;
   prochandle.db = this;
+  prochandle.tgid = tgid;
 }
 
 rr::ThreadDb::~ThreadDb() {
@@ -140,7 +152,8 @@ rr::ThreadDb::~ThreadDb() {
   }
 }
 
-const std::set<std::string> rr::ThreadDb::get_symbols_and_clear_map() {
+const std::set<std::string> rr::ThreadDb::get_symbols_and_clear_map(
+    ThreadGroup* thread_group) {
   // If we think the symbol locations might have changed, then we
   // probably need to recreate the handle.
   if (internal_handle) {
@@ -148,8 +161,10 @@ const std::set<std::string> rr::ThreadDb::get_symbols_and_clear_map() {
     internal_handle = nullptr;
   }
 
+  prochandle.thread_group = thread_group;
   symbols.clear();
   load_library();
+  prochandle.thread_group = nullptr;
   return symbol_names;
 }
 
@@ -168,23 +183,28 @@ bool rr::ThreadDb::query_symbol(const char* name, remote_ptr<void>* address) {
   return true;
 }
 
-bool rr::ThreadDb::get_tls_address(pid_t rec_tid, size_t offset,
-                                   remote_ptr<void> load_module,
+bool rr::ThreadDb::get_tls_address(ThreadGroup* thread_group, pid_t rec_tid,
+                                   size_t offset, remote_ptr<void> load_module,
                                    remote_ptr<void>* result) {
+  prochandle.thread_group = thread_group;
   if (!initialize()) {
+    prochandle.thread_group = nullptr;
     return false;
   }
 
   td_thrhandle_t th;
   if (td_ta_map_lwp2thr_fn(internal_handle, rec_tid, &th) != TD_OK) {
+    prochandle.thread_group = nullptr;
     return false;
   }
 
   psaddr_t load_module_addr = reinterpret_cast<psaddr_t>(load_module.as_int());
   psaddr_t addr;
   if (td_thr_tls_get_addr_fn(&th, load_module_addr, offset, &addr) != TD_OK) {
+    prochandle.thread_group = nullptr;
     return false;
   }
+  prochandle.thread_group = nullptr;
   *result = remote_ptr<void>(reinterpret_cast<uintptr_t>(addr));
   return true;
 }

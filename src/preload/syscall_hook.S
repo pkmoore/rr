@@ -29,6 +29,11 @@
 
         .p2align 4
 _syscallbuf_code_start:
+/* Insert a NOP here so no symbol has the same address as __morestack. Otherwise
+   in some configurations (gdb 7.7.1, Ubuntu 14.04) gdb sometimes maps the
+   __morestack address to _syscallbuf_code_start which defeats the morestack
+   hack. */
+        nop
 
 /* See comments about morestack below. For x86-32 our setup doesn't need to be
    as elaborate since we really only care about one entry function. */
@@ -104,21 +109,27 @@ _syscall_hook_trampoline:
         .cfi_adjust_cfa_offset 4
 
         /* $esp points at &info.  Push that pointer on the stack as
-         * our arg for vsyscall_hook(). */
-        movl %esp, %ebx
-        .cfi_def_cfa_register %ebx
+         * our arg for vsyscall_hook().
+         * Use %ebp as our temporary CFA register here. Don't use %ebx or
+         * any other GP register, since x86-64 gdb 7.7 (at least) treats all GP
+         * regs other than %esp/%ebp as *signed* and sign-extends their values.
+         * Having some CFA values sign-extended and others not breaks gdb
+         * stack walking.
+         */
+        movl %esp, %ebp
+        .cfi_def_cfa_register %ebp
 
         /* Align stack to 16 bytes */
         and $0xfffffff0,%esp
 
         sub $12,%esp
-        pushl %ebx
+        pushl %ebp
 
         call syscall_hook
         /* $eax = vsyscall_hook(&info); */
 
         /* Restore ESP */
-        mov %ebx,%esp
+        mov %ebp, %esp
         .cfi_def_cfa_register %esp
 
         /* $eax is now the syscall return value.  Erase |info.no| from the
@@ -468,6 +479,25 @@ SYSCALLHOOK_START(_syscall_hook_trampoline_89_c1_31_d2)
         mov %eax,%ecx
         xor %edx,%edx
 SYSCALLHOOK_END(_syscall_hook_trampoline_89_c1_31_d2)
+
+SYSCALLHOOK_START(_syscall_hook_trampoline_c3_0f_1f_84_00_00_00_00_00)
+        .cfi_offset %rip, 16
+        RSP_IS_CFA_PLUS_OFFSET(24)
+        callq __morestack
+        /* The original instructions after the syscall are
+           retq; nopl 0x0(%rax,%rax,1) */
+        /* We're not returning to the dynamically generated stub, so
+           we need to fix the stack pointer ourselves. */
+        pop %rdx
+        CFA_AT_RSP_OFFSET(0)
+        pop %rsp
+        .cfi_def_cfa %rsp, 0;
+        pop (stub_scratch_1)
+        .cfi_adjust_cfa_offset -8
+        jmp _syscallbuf_final_exit_instruction
+
+        .cfi_endproc
+        .size _syscall_hook_trampoline_c3_0f_1f_84_00_00_00_00_00, .-_syscall_hook_trampoline_c3_0f_1f_84_00_00_00_00_00
 
 #endif /* __x86_64__ */
 

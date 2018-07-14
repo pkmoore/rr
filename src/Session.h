@@ -24,7 +24,7 @@ class RecordSession;
 class ReplaySession;
 class ReplayTask;
 class Task;
-class TaskGroup;
+class ThreadGroup;
 class AutoRemoteSyscalls;
 
 // The following types are used by step() APIs in Session subclasses.
@@ -115,13 +115,13 @@ class Session {
   friend class ReplaySession;
 
 public:
-  // AddressSpaces and TaskGroups are indexed by their first task's TaskUid
+  // AddressSpaces and ThreadGroups are indexed by their first task's TaskUid
   // (effectively), so that if the first task dies and its tid is recycled,
   // we don't get confused. TaskMap is indexed by tid since there can never be
   // two Tasks with the same tid at the same time.
   typedef std::map<AddressSpaceUid, AddressSpace*> AddressSpaceMap;
   typedef std::map<pid_t, Task*> TaskMap;
-  typedef std::map<TaskGroupUid, TaskGroup*> TaskGroupMap;
+  typedef std::map<ThreadGroupUid, ThreadGroup*> ThreadGroupMap;
 
   /**
    * Call |post_exec()| immediately after a tracee has successfully
@@ -160,11 +160,11 @@ public:
   std::shared_ptr<AddressSpace> clone(Task* t,
                                       std::shared_ptr<AddressSpace> vm);
 
-  std::shared_ptr<TaskGroup> create_tg(Task* t);
+  std::shared_ptr<ThreadGroup> create_tg(Task* t);
   /**
    * Return a copy of |tg| with the same mappings.
    */
-  std::shared_ptr<TaskGroup> clone(Task* t, std::shared_ptr<TaskGroup> tg);
+  std::shared_ptr<ThreadGroup> clone(Task* t, std::shared_ptr<ThreadGroup> tg);
 
   /** See Task::clone(). */
   Task* clone(Task* p, int flags, remote_ptr<void> stack, remote_ptr<void> tls,
@@ -182,10 +182,15 @@ public:
   Task* find_task(const TaskUid& tuid) const;
 
   /**
-   * Return the task group whose unique ID is |tguid|, or nullptr if no such
-   * task group exists.
+   * Return the thread group whose unique ID is |tguid|, or nullptr if no such
+   * thread group exists.
    */
-  TaskGroup* find_task_group(const TaskGroupUid& tguid) const;
+  ThreadGroup* find_thread_group(const ThreadGroupUid& tguid) const;
+
+  /**
+   * Find the thread group for a specific pid
+   */
+  ThreadGroup* find_thread_group(pid_t pid) const;
 
   /**
    * Return the AddressSpace whose unique ID is |vmuid|, or nullptr if no such
@@ -205,10 +210,10 @@ public:
    */
   void on_destroy(AddressSpace* vm);
   virtual void on_destroy(Task* t);
-  void on_create(TaskGroup* tg);
-  void on_destroy(TaskGroup* tg);
+  void on_create(ThreadGroup* tg);
+  void on_destroy(ThreadGroup* tg);
 
-  /** Return the set of Tasks being tracekd in this session. */
+  /** Return the set of Tasks being traced in this session. */
   const TaskMap& tasks() const {
     finish_initializing();
     return task_map;
@@ -263,6 +268,12 @@ public:
     PRESERVE_CONTENTS,
     DISCARD_CONTENTS,
   };
+  // Recreate an mmap region that is shared between rr and the tracee. The
+  // caller
+  // is responsible for recreating the data in the new mmap, if `preserve` is
+  // DISCARD_CONTENTS.
+  // OK to call this while 'm' references one of the mappings in remote's
+  // AddressSpace
   static const AddressSpace::Mapping& recreate_shared_mmap(
       AutoRemoteSyscalls& remote, const AddressSpace::Mapping& m,
       PreserveContents preserve = DISCARD_CONTENTS,
@@ -312,7 +323,7 @@ protected:
 
   AddressSpaceMap vm_map;
   TaskMap task_map;
-  TaskGroupMap task_group_map;
+  ThreadGroupMap thread_group_map;
 
   // If non-null, data required to finish initializing the tasks of this
   // session.

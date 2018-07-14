@@ -21,14 +21,14 @@ public:
     size_t offset = symbols[i].name_index;
     return offset < strtab.size() && strcmp(&strtab[offset], name) == 0;
   }
-  uintptr_t file_offset(size_t i) const { return symbols[i].file_offset; }
+  uintptr_t addr(size_t i) const { return symbols[i].addr; }
   size_t size() const { return symbols.size(); }
 
   struct Symbol {
-    Symbol(uintptr_t file_offset, size_t name_index)
-        : file_offset(file_offset), name_index(name_index) {}
+    Symbol(uintptr_t addr, size_t name_index)
+        : addr(addr), name_index(name_index) {}
     Symbol() {}
-    uintptr_t file_offset;
+    uintptr_t addr;
     size_t name_index;
   };
   std::vector<Symbol> symbols;
@@ -51,6 +51,12 @@ public:
   std::vector<char> strtab;
 };
 
+class Debuglink {
+public:
+  std::string filename;
+  uint32_t crc;
+};
+
 class ElfReader {
 public:
   ElfReader(SupportedArch arch);
@@ -70,6 +76,12 @@ public:
   bool ok();
   SymbolTable read_symbols(const char* symtab, const char* strtab);
   DynamicSection read_dynamic();
+  Debuglink read_debuglink();
+  // Returns true and sets file |offset| if ELF address |addr| is mapped from
+  // a section in the ELF file.  Returns false if no section maps to
+  // |addr|.  |addr| is an address indicated by the ELF file, not its
+  // relocated address in memory.
+  bool addr_to_offset(uintptr_t addr, uintptr_t& offset);
 
 private:
   ElfReaderImplBase& impl();
@@ -82,6 +94,9 @@ public:
   ElfFileReader(ScopedFd& fd, SupportedArch arch) : ElfReader(arch), fd(fd) {}
   ElfFileReader(ScopedFd& fd) : ElfReader(identify_arch(fd)), fd(fd) {}
   virtual bool read(size_t offset, size_t size, void* buf);
+  // Finds and opens the debug file corresponding to this reader.
+  // |elf_file_name| is the name of the file already opened by this reader.
+  ScopedFd open_debug_file(const std::string& elf_file_name);
   ScopedFd& fd;
 
   static SupportedArch identify_arch(ScopedFd& fd);

@@ -1,5 +1,4 @@
-from rrutil import *
-import re
+from util import *
 
 send_gdb('c')
 expect_gdb('stopped')

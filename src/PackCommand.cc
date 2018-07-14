@@ -1,6 +1,5 @@
 /* -*- Mode: C++; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include <assert.h>
 #include <dirent.h>
 #include <limits.h>
 #include <pthread.h>
@@ -397,13 +396,28 @@ static void delete_unnecessary_files(const map<string, string>& file_map,
 }
 
 static int pack(const string& trace_dir) {
+  string dir;
+  {
+    // validate trace and produce default trace directory if trace_dir is empty
+    TraceReader reader(trace_dir);
+    dir = reader.dir();
+  }
+
   char buf[PATH_MAX];
-  realpath(trace_dir.c_str(), buf);
+  char* ret = realpath(dir.c_str(), buf);
+  if (!ret) {
+    FATAL() << "realpath failed on " << dir;
+  }
   string abspath(buf);
   map<string, string> canonical_mmapped_files =
       compute_canonical_mmapped_files(abspath);
   rewrite_mmaps(canonical_mmapped_files, abspath);
   delete_unnecessary_files(canonical_mmapped_files, abspath);
+
+  if (!probably_not_interactive(STDOUT_FILENO)) {
+    printf("rr: Packed trace directory `%s'.\n", dir.c_str());
+  }
+
   return 0;
 }
 

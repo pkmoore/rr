@@ -14,6 +14,7 @@
 #include "GdbConnection.h"
 #include "GdbServer.h"
 #include "RecordSession.h"
+#include "core.h"
 #include "ftrace.h"
 #include "kernel_metadata.h"
 #include "util.h"
@@ -87,6 +88,8 @@ _CONSTANT_STATIC deque<char>* log_buffer;
 _CONSTANT_STATIC std::ostream* log_file;
 size_t log_buffer_size;
 
+static void flush_log_file() { log_file->flush(); }
+
 static void init_log_globals() {
   if (log_globals_initialized) {
     return;
@@ -114,6 +117,7 @@ static void init_log_globals() {
       delete file;
     } else {
       log_file = file;
+      atexit(flush_log_file);
     }
   }
 
@@ -128,7 +132,7 @@ static void init_log_globals() {
   char* env = getenv(log_env);
   if (env) {
     env = strdup(env);
-    assert(env);
+    DEBUG_ASSERT(env);
     for (int i = 0; env[i]; ++i) {
       env[i] = simple_to_lower(env[i]);
     }
@@ -281,7 +285,7 @@ static void write_prefix(T& stream, LogLevel level, const char* file, int line,
     stream << file << ":" << line << ":";
   }
   stream << function << "()";
-  if (level <= LOG_warn) {
+  if (level <= LOG_warn && err) {
     stream << " errno: " << errno_name(err);
   }
   stream << "] ";
@@ -315,6 +319,18 @@ NewlineTerminatingOstream::~NewlineTerminatingOstream() {
       notifying_abort();
     }
   }
+}
+
+CleanFatalOstream::CleanFatalOstream(const char* file, int line,
+                                     const char* function) {
+  errno = 0;
+  write_prefix(*this, LOG_fatal, file, line, function);
+}
+
+CleanFatalOstream::~CleanFatalOstream() {
+  cerr << std::endl;
+  flush_log_stream();
+  exit(1);
 }
 
 FatalOstream::FatalOstream(const char* file, int line, const char* function) {

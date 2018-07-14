@@ -69,8 +69,7 @@ void ReplayTask::init_buffers(remote_ptr<void> map_hint) {
   RR_ARCH_FUNCTION(init_buffers_arch, arch(), map_hint);
 }
 
-void ReplayTask::post_exec_syscall(const string& replay_exe,
-                                   TraceTaskEvent& tte) {
+void ReplayTask::post_exec_syscall(const string& replay_exe) {
   Task::post_exec(replay_exe);
 
   // Perform post-exec-syscall tasks now (e.g. opening mem_fd) before we
@@ -78,15 +77,14 @@ void ReplayTask::post_exec_syscall(const string& replay_exe,
   // regular stack instead of having to search the address space for usable
   // pages (which is error prone, e.g. if we happen to find the scratch space
   // allocated by an rr recorder under which we're running).
-  Task::post_exec_syscall(tte);
+  Task::post_exec_syscall();
 
   // Delay setting the replay_regs until here so the original registers
   // are set while we populate AddressSpace. We need that for the kernel
   // to identify the original stack region correctly.
-  registers = current_trace_frame().regs();
+  set_regs(current_trace_frame().regs());
   extra_registers = current_trace_frame().extra_regs();
   ASSERT(this, !extra_registers.empty());
-  set_regs(registers);
   set_extra_regs(extra_registers);
 }
 
@@ -118,6 +116,10 @@ const TraceFrame& ReplayTask::current_trace_frame() {
   return session().current_trace_frame();
 }
 
+FrameTime ReplayTask::current_frame_time() {
+  return current_trace_frame().time();
+}
+
 ssize_t ReplayTask::set_data_from_trace() {
   auto buf = trace_reader().read_raw_data();
   if (!buf.addr.is_null() && buf.data.size() > 0) {
@@ -131,7 +133,7 @@ ssize_t ReplayTask::set_data_from_trace() {
 
 void ReplayTask::apply_all_data_records_from_trace() {
   TraceReader::RawData buf;
-  while (trace_reader().read_raw_data_for_frame(current_trace_frame(), buf)) {
+  while (trace_reader().read_raw_data_for_frame(buf)) {
     if (!buf.addr.is_null() && buf.data.size() > 0) {
       auto t = session().find_task(buf.rec_tid);
       t->write_bytes_helper(buf.addr, buf.data.size(), buf.data.data());

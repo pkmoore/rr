@@ -2,7 +2,6 @@
 
 #include "PerfCounters.h"
 
-#include <assert.h>
 #include <err.h>
 #include <fcntl.h>
 #include <linux/perf_event.h>
@@ -21,6 +20,7 @@
 #include "Flags.h"
 #include "Session.h"
 #include "Task.h"
+#include "core.h"
 #include "kernel_metadata.h"
 #include "log.h"
 #include "util.h"
@@ -32,12 +32,11 @@ namespace rr {
 static bool attributes_initialized;
 static struct perf_event_attr ticks_attr;
 static struct perf_event_attr cycles_attr;
-static struct perf_event_attr page_faults_attr;
 static struct perf_event_attr hw_interrupts_attr;
-static struct perf_event_attr instructions_retired_attr;
 static uint32_t skid_size;
 static bool has_ioc_period_bug;
 static bool has_kvm_in_txcp_bug;
+static bool has_xen_pmi_bug;
 static bool supports_txcp;
 static bool only_one_counter;
 static bool activate_useless_counter;
@@ -68,7 +67,6 @@ struct PmuConfig {
   CpuMicroarch uarch;
   const char* name;
   unsigned rcb_cntr_event;
-  unsigned rinsn_cntr_event;
   unsigned hw_intr_cntr_event;
   uint32_t skid_size;
   bool supported;
@@ -86,27 +84,19 @@ struct PmuConfig {
 
 // XXX please only edit this if you really know what you're doing.
 static const PmuConfig pmu_configs[] = {
-  { IntelKabylake, "Intel Kabylake", 0x5101c4, 0x5100c0, 0x5301cb, 100, true,
+  { IntelKabylake, "Intel Kabylake", 0x5101c4, 0x5301cb, 100, true, false },
+  { IntelSilvermont, "Intel Silvermont", 0x517ec4, 0x5301cb, 100, true, true },
+  { IntelSkylake, "Intel Skylake", 0x5101c4, 0x5301cb, 100, true, false },
+  { IntelBroadwell, "Intel Broadwell", 0x5101c4, 0x5301cb, 100, true, false },
+  { IntelHaswell, "Intel Haswell", 0x5101c4, 0x5301cb, 100, true, false },
+  { IntelIvyBridge, "Intel Ivy Bridge", 0x5101c4, 0x5301cb, 100, true, false },
+  { IntelSandyBridge, "Intel Sandy Bridge", 0x5101c4, 0x5301cb, 100, true,
     false },
-  { IntelSilvermont, "Intel Silvermont", 0x517ec4, 0x5100c0, 0x5301cb, 100,
-    true, true },
-  { IntelSkylake, "Intel Skylake", 0x5101c4, 0x5100c0, 0x5301cb, 100, true,
-    false },
-  { IntelBroadwell, "Intel Broadwell", 0x5101c4, 0x5100c0, 0x5301cb, 100, true,
-    false },
-  { IntelHaswell, "Intel Haswell", 0x5101c4, 0x5100c0, 0x5301cb, 100, true,
-    false },
-  { IntelIvyBridge, "Intel Ivy Bridge", 0x5101c4, 0x5100c0, 0x5301cb, 100, true,
-    false },
-  { IntelSandyBridge, "Intel Sandy Bridge", 0x5101c4, 0x5100c0, 0x5301cb, 100,
-    true, false },
-  { IntelNehalem, "Intel Nehalem", 0x5101c4, 0x5100c0, 0x50011d, 100, true,
-    false },
-  { IntelWestmere, "Intel Westmere", 0x5101c4, 0x5100c0, 0x50011d, 100, true,
-    false },
-  { IntelPenryn, "Intel Penryn", 0, 0, 0, 100, false, false },
-  { IntelMerom, "Intel Merom", 0, 0, 0, 100, false, false },
-  { AMDRyzen, "AMD Ryzen", 0x5100d1, 0x5100c0, 0, 1000, true, false },
+  { IntelNehalem, "Intel Nehalem", 0x5101c4, 0x50011d, 100, true, false },
+  { IntelWestmere, "Intel Westmere", 0x5101c4, 0x50011d, 100, true, false },
+  { IntelPenryn, "Intel Penryn", 0, 0, 100, false, false },
+  { IntelMerom, "Intel Merom", 0, 0, 100, false, false },
+  { AMDRyzen, "AMD Ryzen", 0x5100d1, 0, 1000, true, false },
 };
 
 static string lowercase(const string& s) {
@@ -130,11 +120,22 @@ static CpuMicroarch get_cpu_microarch() {
         return pmu.uarch;
       }
     }
-    FATAL() << "Forced uarch " << Flags::get().forced_uarch << " isn't known.";
+    CLEAN_FATAL() << "Forced uarch " << Flags::get().forced_uarch
+                  << " isn't known.";
+  }
+
+  auto cpuid_vendor = cpuid(CPUID_GETVENDORSTRING, 0);
+  char vendor[13];
+  memcpy(&vendor[0], &cpuid_vendor.ebx, 4);
+  memcpy(&vendor[4], &cpuid_vendor.edx, 4);
+  memcpy(&vendor[8], &cpuid_vendor.ecx, 4);
+  vendor[12] = 0;
+  if (strcmp(vendor, "GenuineIntel") && strcmp(vendor, "AuthenticAMD")) {
+    CLEAN_FATAL() << "Unknown CPU vendor '" << vendor << "'";
   }
 
   auto cpuid_data = cpuid(CPUID_GETFEATURES, 0);
-  unsigned int cpu_type = (cpuid_data.eax & 0xF0FF0);
+  unsigned int cpu_type = cpuid_data.eax & 0xF0FF0;
   unsigned int ext_family = (cpuid_data.eax >> 20) & 0xff;
   switch (cpu_type) {
     case 0x006F0:
@@ -167,6 +168,7 @@ static CpuMicroarch get_cpu_microarch() {
     case 0x50660:
       return IntelBroadwell;
     case 0x406e0:
+    case 0x50650:
     case 0x506e0:
       return IntelSkylake;
     case 0x50670:
@@ -189,7 +191,15 @@ static CpuMicroarch get_cpu_microarch() {
     default:
       break;
   }
-  FATAL() << "CPU " << HEX(cpu_type) << " unknown.";
+
+  if (!strcmp(vendor, "AuthenticAMD")) {
+    CLEAN_FATAL()
+        << "AMD CPUs not supported.\n"
+        << "For Ryzen, see https://github.com/mozilla/rr/issues/2034.\n"
+        << "For post-Ryzen CPUs, please file a Github issue.";
+  } else {
+    CLEAN_FATAL() << "Intel CPU type " << HEX(cpu_type) << " unknown";
+  }
   return UnknownCpu; // not reached
 }
 
@@ -211,7 +221,7 @@ static const uint64_t IN_TXCP = 1ULL << 33;
 static int64_t read_counter(ScopedFd& fd) {
   int64_t val;
   ssize_t nread = read(fd, &val, sizeof(val));
-  assert(nread == sizeof(val));
+  DEBUG_ASSERT(nread == sizeof(val));
   return val;
 }
 
@@ -282,7 +292,7 @@ static void do_branches() {
   // Do NUM_BRANCHES conditional branches that can't be optimized out.
   // 'accumulator' is always odd and can't be zero
   int accumulator = rand() * 2 + 1;
-  for (int i = 0; i < 500 && accumulator; ++i) {
+  for (int i = 0; i < NUM_BRANCHES && accumulator; ++i) {
     accumulator = ((accumulator * 7) + 2) & 0xffffff;
   }
   srand(accumulator);
@@ -307,6 +317,148 @@ static void check_for_kvm_in_txcp_bug() {
   LOG(debug) << "supports txcp=" << supports_txcp;
   LOG(debug) << "has_kvm_in_txcp_bug=" << has_kvm_in_txcp_bug
              << " count=" << count;
+}
+
+static void check_for_xen_pmi_bug() {
+  int32_t count = -1;
+  struct perf_event_attr attr = rr::ticks_attr;
+  attr.sample_period = NUM_BRANCHES - 1;
+  ScopedFd fd = start_counter(0, -1, &attr);
+  if (fd.is_open()) {
+    // Do NUM_BRANCHES conditional branches that can't be optimized out.
+    // 'accumulator' is always odd and can't be zero
+    uint32_t accumulator = rand() * 2 + 1;
+    int raw_fd = fd;
+    asm volatile(
+#if defined(__x86_64__)
+        "mov %[_SYS_ioctl], %%rax;"
+        "mov %[raw_fd], %%edi;"
+        "xor %%rdx, %%rdx;"
+        "mov %[_PERF_EVENT_IOC_ENABLE], %%rsi;"
+        "syscall;"
+        "cmp $-4095, %%rax;"
+        "jae 2f;"
+        "mov %[_SYS_ioctl], %%rax;"
+        "mov %[_PERF_EVENT_IOC_RESET], %%rsi;"
+        "syscall;"
+        // From this point on all conditional branches count!
+        "cmp $-4095, %%rax;"
+        "jae 2f;"
+        // Reset the counter period to the desired value.
+        "mov %[_SYS_ioctl], %%rax;"
+        "mov %[_PERF_EVENT_IOC_PERIOD], %%rsi;"
+        "mov %[period], %%rdx;"
+        "syscall;"
+        "cmp $-4095, %%rax;"
+        "jae 2f;"
+        "mov %[_iterations], %%rax;"
+        "1: dec %%rax;"
+        // Multiply by 7.
+        "mov %[accumulator], %%edx;"
+        "shl $3, %[accumulator];"
+        "sub %%edx, %[accumulator];"
+        // Add 2.
+        "add $2, %[accumulator];"
+        // Mask off bits.
+        "and $0xffffff, %[accumulator];"
+        // And loop.
+        "test %%rax, %%rax;"
+        "jnz 1b;"
+        "mov %[_PERF_EVENT_IOC_DISABLE], %%rsi;"
+        "mov %[_SYS_ioctl], %%rax;"
+        "xor %%rdx, %%rdx;"
+        // We didn't touch rdi.
+        "syscall;"
+        "cmp $-4095, %%rax;"
+        "jae 2f;"
+        "movl $0, %[count];"
+        "2: nop;"
+#elif defined(__i386__)
+        "mov %[_SYS_ioctl], %%eax;"
+        "mov %[raw_fd], %%ebx;"
+        "xor %%edx, %%edx;"
+        "mov %[_PERF_EVENT_IOC_ENABLE], %%ecx;"
+        "int $0x80;"
+        "cmp $-4095, %%eax;"
+        "jae 2f;"
+        "mov %[_SYS_ioctl], %%eax;"
+        "mov %[_PERF_EVENT_IOC_RESET], %%ecx;"
+        "int $0x80;"
+        // From this point on all conditional branches count!
+        "cmp $-4095, %%eax;"
+        "jae 2f;"
+        // Reset the counter period to the desired value.
+        "mov %[_SYS_ioctl], %%eax;"
+        "mov %[_PERF_EVENT_IOC_PERIOD], %%ecx;"
+        "mov %[period], %%edx;"
+        "int $0x80;"
+        "cmp $-4095, %%eax;"
+        "jae 2f;"
+        "mov %[_iterations], %%eax;"
+        "1: dec %%eax;"
+        // Multiply by 7.
+        "mov %[accumulator], %%edx;"
+        "shll $3, %[accumulator];"
+        "sub %%edx, %[accumulator];"
+        // Add 2.
+        "add $2, %[accumulator];"
+        // Mask off bits.
+        "andl $0xffffff, %[accumulator];"
+        // And loop.
+        "test %%eax, %%eax;"
+        "jnz 1b;"
+        "mov %[_PERF_EVENT_IOC_DISABLE], %%ecx;"
+        "mov %[_SYS_ioctl], %%eax;"
+        "xor %%edx, %%edx;"
+        // We didn't touch rdi.
+        "int $0x80;"
+        "cmp $-4095, %%eax;"
+        "jae 2f;"
+        "movl $0, %[count];"
+        "2: nop;"
+#else
+#error unknown CPU architecture
+#endif
+        : [accumulator] "+rm"(accumulator), [count] "=rm"(count)
+        : [_SYS_ioctl] "i"(SYS_ioctl),
+          [_PERF_EVENT_IOC_DISABLE] "i"(PERF_EVENT_IOC_DISABLE),
+          [_PERF_EVENT_IOC_ENABLE] "i"(PERF_EVENT_IOC_ENABLE),
+          [_PERF_EVENT_IOC_PERIOD] "i"(PERF_EVENT_IOC_PERIOD),
+          [_PERF_EVENT_IOC_RESET] "i"(PERF_EVENT_IOC_RESET),
+          // The check for the failure of some of our ioctls is in
+          // the measured region, so account for that when looping.
+          [_iterations] "i"(NUM_BRANCHES - 2),
+          [period] "rm"(&attr.sample_period), [raw_fd] "rm"(raw_fd)
+        :
+#if defined(__x86_64__)
+        "rax", "rdx", "rdi", "rsi"
+        // `syscall` clobbers rcx and r11.
+        ,
+        "rcx", "r11"
+#elif defined(__i386__)
+        "eax", "ebx", "ecx", "edx"
+#else
+#error unknown CPU architecture
+#endif
+        );
+    // If things worked above, `count` should have been set to 0.
+    if (count == 0) {
+      count = read_counter(fd);
+    }
+    srand(accumulator);
+  }
+
+  has_xen_pmi_bug = count > NUM_BRANCHES || count == -1;
+  if (has_xen_pmi_bug) {
+    LOG(debug) << "has_xen_pmi_bug=" << has_xen_pmi_bug << " count=" << count;
+    if (!Flags::get().force_things) {
+      FATAL()
+          << "Overcount triggered by PMU interrupts detected due to Xen PMU "
+             "virtualization bug.\n"
+             "Aborting. Retry with -F to override, but it will probably\n"
+             "fail.";
+    }
+  }
 }
 
 static void check_working_counters() {
@@ -363,6 +515,7 @@ static void check_for_bugs() {
 
   check_for_ioc_period_bug();
   check_for_kvm_in_txcp_bug();
+  check_for_xen_pmi_bug();
   check_working_counters();
 }
 
@@ -380,7 +533,7 @@ static void init_attributes() {
       break;
     }
   }
-  assert(pmu);
+  DEBUG_ASSERT(pmu);
 
   if (!pmu->supported) {
     FATAL() << "Microarchitecture `" << pmu->name << "' currently unsupported.";
@@ -390,15 +543,11 @@ static void init_attributes() {
   init_perf_event_attr(&ticks_attr, PERF_TYPE_RAW, pmu->rcb_cntr_event);
   init_perf_event_attr(&cycles_attr, PERF_TYPE_HARDWARE,
                        PERF_COUNT_HW_CPU_CYCLES);
-  init_perf_event_attr(&instructions_retired_attr, PERF_TYPE_RAW,
-                       pmu->rinsn_cntr_event);
   init_perf_event_attr(&hw_interrupts_attr, PERF_TYPE_RAW,
                        pmu->hw_intr_cntr_event);
   // libpfm encodes the event with this bit set, so we'll do the
   // same thing.  Unclear if necessary.
   hw_interrupts_attr.exclude_hv = 1;
-  init_perf_event_attr(&page_faults_attr, PERF_TYPE_SOFTWARE,
-                       PERF_COUNT_SW_PAGE_FAULTS);
 
   check_for_bugs();
   /*
@@ -446,7 +595,7 @@ static bool always_recreate_counters() {
 }
 
 void PerfCounters::reset(Ticks ticks_period) {
-  assert(ticks_period >= 0);
+  DEBUG_ASSERT(ticks_period >= 0);
 
   if (ticks_period == 0 && !always_recreate_counters()) {
     // We can't switch a counter between sampling and non-sampling via
@@ -502,14 +651,6 @@ void PerfCounters::reset(Ticks ticks_period) {
       FATAL() << "Failed to SETOWN_EX ticks event fd";
     }
     make_counter_async(fd_ticks_interrupt, PerfCounters::TIME_SLICE_SIGNAL);
-
-    if (extra_perf_counters_enabled()) {
-      int group_leader = fd_ticks_interrupt;
-      fd_hw_interrupts = start_counter(tid, group_leader, &hw_interrupts_attr);
-      fd_instructions_retired =
-          start_counter(tid, group_leader, &instructions_retired_attr);
-      fd_page_faults = start_counter(tid, group_leader, &page_faults_attr);
-    }
   } else {
     LOG(debug) << "Resetting counters with period " << ticks_period;
 
@@ -559,14 +700,14 @@ void PerfCounters::stop() {
 
   fd_ticks_interrupt.close();
   fd_ticks_measure.close();
-  fd_page_faults.close();
-  fd_hw_interrupts.close();
-  fd_instructions_retired.close();
   fd_useless_counter.close();
   fd_ticks_in_transaction.close();
 }
 
 void PerfCounters::stop_counting() {
+  if (!counting) {
+    return;
+  }
   counting = false;
   if (always_recreate_counters()) {
     stop();
@@ -632,20 +773,6 @@ Ticks PerfCounters::read_ticks(Task* t) {
       << "Detected " << measure_val << " ticks, expected no more than "
       << adjusted_counting_period;
   return measure_val;
-}
-
-PerfCounters::Extra PerfCounters::read_extra() {
-  assert(extra_perf_counters_enabled());
-
-  Extra extra;
-  if (started) {
-    extra.page_faults = read_counter(fd_page_faults);
-    extra.hw_interrupts = read_counter(fd_hw_interrupts);
-    extra.instructions_retired = read_counter(fd_instructions_retired);
-  } else {
-    memset(&extra, 0, sizeof(extra));
-  }
-  return extra;
 }
 
 } // namespace rr

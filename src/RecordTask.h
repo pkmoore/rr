@@ -56,13 +56,15 @@ enum SignalDisposition { SIGNAL_DEFAULT, SIGNAL_IGNORE, SIGNAL_HANDLER };
  */
 class RecordTask : public Task {
 public:
+  bool strace_output = false;
   RecordTask(RecordSession& session, pid_t _tid, uint32_t serial,
              SupportedArch a);
 
-  virtual Task* clone(CloneReason reason, int flags, remote_ptr<void> stack,
-                      remote_ptr<void> tls, remote_ptr<int> cleartid_addr,
-                      pid_t new_tid, pid_t new_rec_tid, uint32_t new_serial,
-                      Session* other_session) override;
+  Task* clone(CloneReason reason, int flags, remote_ptr<void> stack,
+              remote_ptr<void> tls, remote_ptr<int> cleartid_addr,
+              pid_t new_tid, pid_t new_rec_tid, uint32_t new_serial,
+              Session* other_session = nullptr) override;
+  virtual void post_wait_clone(Task* cloned_from, int flags) override;
   virtual void on_syscall_exit(int syscallno, SupportedArch arch,
                                const Registers& regs) override;
   virtual void will_resume_execution(ResumeRequest, WaitRequest, TicksRequest,
@@ -202,16 +204,21 @@ public:
   const std::vector<uint8_t>& signal_action(int sig) const;
   /** Return true iff |sig| is blocked for this. */
   bool is_sig_blocked(int sig);
-
   /**
    * Return true iff |sig| is SIG_IGN, or it's SIG_DFL and the
    * default disposition is "ignore".
    */
   bool is_sig_ignored(int sig) const;
   /**
-   * Return the applications current dispositiong of |sig|.
+   * Return the applications current disposition of |sig|.
    */
   SignalDisposition sig_disposition(int sig) const;
+  /**
+   * Return the resolved disposition --- what this signal will actually do,
+   * taking into account the default behavior.
+   */
+  SignalResolvedDisposition sig_resolved_disposition(
+      int sig, SignalDeterministic deterministic);
   /**
    * Set the siginfo for the signal-stop of this.
    */
@@ -359,8 +366,6 @@ public:
     record_remote_even_if_null(addr, sizeof(T));
   }
 
-  SupportedArch detect_syscall_arch();
-
   /**
    * Manage pending events.  |push_event()| pushes the given
    * event onto the top of the event stack.  The |pop_*()|
@@ -421,7 +426,7 @@ public:
   void record_event(const Event& ev, FlushSyscallbuf flush = FLUSH_SYSCALLBUF,
                     const Registers* registers = nullptr);
 
-  bool is_fatal_signal(int sig, SignalDeterministic deterministic);
+  bool is_fatal_signal(int sig, SignalDeterministic deterministic) const;
 
   /**
    * Return the pid of the newborn thread created by this task.
@@ -489,9 +494,11 @@ public:
    */
   sig_set_t read_sigmask_from_process();
 
-private:
   ~RecordTask();
 
+  void maybe_restore_original_syscall_registers();
+
+private:
   /**
    * Wait for |futex| in this address space to have the value
    * |val|.
@@ -510,8 +517,6 @@ private:
    * May queue signals for specific tasks.
    */
   void send_synthetic_SIGCHLD_if_necessary();
-
-  void record_siginfo();
 
   /**
    * Call this when SYS_sigaction is finishing with |regs|.
@@ -536,10 +541,12 @@ private:
   void set_tid_addr(remote_ptr<int> tid_addr);
 
 public:
+  Ticks ticks_at_last_recorded_syscall_exit;
+
   // Scheduler state
 
   Registers registers_at_start_of_last_timeslice;
-  TraceFrame::Time time_at_start_of_last_timeslice;
+  FrameTime time_at_start_of_last_timeslice;
   /* Task 'nice' value set by setpriority(2).
      We use this to drive scheduling decisions. rr's scheduler is
      deliberately simple and unfair; a task never runs as long as there's
@@ -659,6 +666,12 @@ public:
   bool break_at_syscallbuf_traced_syscalls;
   bool break_at_syscallbuf_untraced_syscalls;
   bool break_at_syscallbuf_final_instruction;
+
+  // The pmc is programmed to interrupt at a value requested by the tracee, not
+  // by rr.
+  bool next_pmc_interrupt_is_for_user;
+
+  bool did_record_robust_futex_changes;
 };
 
 } // namespace rr

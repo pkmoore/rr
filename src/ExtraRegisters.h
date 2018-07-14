@@ -57,9 +57,8 @@ public:
 
   // Set values from raw data, with the given XSAVE layout. Returns false
   // if this could not be done.
-  bool set_to_raw_data(SupportedArch a, Format format,
-                       std::vector<uint8_t>& consume_data,
-                       const XSaveLayout& layout);
+  bool set_to_raw_data(SupportedArch a, Format format, const uint8_t* data,
+                       size_t data_size, const XSaveLayout& layout);
   Format format() const { return format_; }
   SupportedArch arch() const { return arch_; }
   const std::vector<uint8_t> data() const { return data_; }
@@ -86,7 +85,8 @@ public:
   /**
    * Update registers from a user_fpregs_struct.
    */
-  void set_user_fpregs_struct(SupportedArch arch, void* data, size_t size);
+  void set_user_fpregs_struct(Task* t, SupportedArch arch, void* data,
+                              size_t size);
 
   /**
    * Get a user_fpxregs_struct for from these ExtraRegisters.
@@ -96,7 +96,8 @@ public:
   /**
    * Update registers from a user_fpxregs_struct.
    */
-  void set_user_fpxregs_struct(const X86Arch::user_fpxregs_struct& regs);
+  void set_user_fpxregs_struct(Task* t,
+                               const X86Arch::user_fpxregs_struct& regs);
 
   void print_register_file_compact(FILE* f) const;
 

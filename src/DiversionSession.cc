@@ -4,8 +4,11 @@
 
 #include "AutoRemoteSyscalls.h"
 #include "ReplaySession.h"
+#include "core.h"
 #include "kernel_metadata.h"
 #include "log.h"
+#include <sys/types.h>
+#include <signal.h>
 
 using namespace std;
 
@@ -19,8 +22,8 @@ DiversionSession::~DiversionSession() {
   // destroyed many times, and we don't want to temporarily hog
   // resources.
   kill_all_tasks();
-  assert(tasks().size() == 0 && vms().size() == 0);
-  assert(emu_fs->size() == 0);
+  DEBUG_ASSERT(tasks().size() == 0 && vms().size() == 0);
+  DEBUG_ASSERT(emu_fs->size() == 0);
 }
 
 static void finish_emulated_syscall_with_ret(Task* t, long ret) {
@@ -48,7 +51,7 @@ static void execute_syscall(Task* t) {
 
 template <typename Arch>
 static void process_syscall_arch(Task* t, int syscallno) {
-  LOG(debug) << "Processing " << t->syscall_name(syscallno);
+  LOG(debug) << "Processing " << syscall_name(syscallno, Arch::arch());
 
   if (syscallno == Arch::ioctl && t->is_desched_event_syscall()) {
     // The arm/disarm-desched ioctls are emulated as no-ops.
@@ -94,7 +97,7 @@ static void process_syscall_arch(Task* t, int syscallno) {
   return execute_syscall(t);
 }
 
-static void process_syscall(Task* t, int syscallno) {
+static void process_syscall(Task* t, int syscallno){
   RR_ARCH_FUNCTION(process_syscall_arch, t->arch(), t, syscallno)
 }
 
@@ -104,7 +107,7 @@ static void process_syscall(Task* t, int syscallno) {
  */
 DiversionSession::DiversionResult DiversionSession::diversion_step(
     Task* t, RunCommand command, int signal_to_deliver) {
-  assert(command != RUN_SINGLESTEP_FAST_FORWARD);
+  DEBUG_ASSERT(command != RUN_SINGLESTEP_FAST_FORWARD);
   assert_fully_initialized();
 
   DiversionResult result;
@@ -121,6 +124,7 @@ DiversionSession::DiversionResult DiversionSession::diversion_step(
                  (unsigned char)1);
   }
   t->set_syscallbuf_locked(1);
+
 
   switch (command) {
     case RUN_CONTINUE:
@@ -150,12 +154,15 @@ DiversionSession::DiversionResult DiversionSession::diversion_step(
                << "; break=" << result.break_status.breakpoint_hit
                << ", watch=" << !result.break_status.watchpoints_hit.empty()
                << ", singlestep=" << result.break_status.singlestep_complete;
-    ASSERT(t, !result.break_status.singlestep_complete ||
-                  command == RUN_SINGLESTEP);
+    ASSERT(t,
+           !result.break_status.singlestep_complete ||
+               command == RUN_SINGLESTEP);
     return result;
   }
 
-  process_syscall(t, t->regs().original_syscallno());
+  if(!t->spun_off) {
+    process_syscall(t, t->regs().original_syscallno());
+  }
   check_for_watchpoint_changes(t, result.break_status);
   return result;
 }

@@ -436,7 +436,7 @@ sethostname = EmulatedSyscall(x86=74, x64=170)
 # by other means.
 setrlimit = EmulatedSyscall(x86=75, x64=160)
 
-getrlimit = EmulatedSyscall(x64=97, arg2="typename Arch::rlimit")
+getrlimit = EmulatedSyscall(x86=76, x64=97, arg2="typename Arch::rlimit")
 
 #  int getrusage(int who, struct rusage *usage)
 #
@@ -1478,7 +1478,7 @@ tee = UnsupportedSyscall(x86=315, x64=276)
 vmsplice = UnsupportedSyscall(x86=316, x64=278)
 move_pages = UnsupportedSyscall(x86=317, x64=279)
 getcpu = EmulatedSyscall(x86=318, x64=309, arg1="unsigned int", arg2="unsigned int")
-epoll_pwait = UnsupportedSyscall(x86=319, x64=281)
+epoll_pwait = IrregularEmulatedSyscall(x86=319, x64=281)
 
 #  int utimensat(int dirfd, const char *pathname, const struct timespec
 #times[2], int flags);
@@ -1638,7 +1638,7 @@ sched_getattr = UnsupportedSyscall(x86=352, x64=315)
 renameat2 = EmulatedSyscall(x86=353, x64=316)
 seccomp = IrregularEmulatedSyscall(x86=354, x64=317)
 getrandom = IrregularEmulatedSyscall(x86=355, x64=318)
-memfd_create = EmulatedSyscall(x86=356, x64=319)
+memfd_create = IrregularEmulatedSyscall(x86=356, x64=319)
 arch_prctl = IrregularEmulatedSyscall(x86=384, x64=158)
 
 bpf = UnsupportedSyscall(x86=357, x64=321)

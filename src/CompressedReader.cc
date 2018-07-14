@@ -4,16 +4,17 @@
 
 #include "CompressedReader.h"
 
-#include <assert.h>
+#include <brotli/decode.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include <zlib.h>
 
 #include "CompressedWriter.h"
+#include "core.h"
+#include "util.h"
 
 using namespace std;
 
@@ -41,51 +42,64 @@ CompressedReader::CompressedReader(const CompressedReader& other) {
   buffer_read_pos = other.buffer_read_pos;
   buffer = other.buffer;
   have_saved_state = false;
-  assert(!other.have_saved_state);
+  DEBUG_ASSERT(!other.have_saved_state);
 }
 
 CompressedReader::~CompressedReader() { close(); }
 
 static bool read_all(const ScopedFd& fd, size_t size, void* data,
                      uint64_t* offset) {
-  while (size > 0) {
-    ssize_t result = pread(fd, data, size, *offset);
-    if (result <= 0) {
-      return false;
-    }
-    size -= result;
-    data = static_cast<uint8_t*>(data) + result;
-    *offset += result;
+  ssize_t ret = read_to_end(fd, *offset, data, size);
+  if (ret == (ssize_t)size) {
+    *offset += size;
+    return true;
   }
-  return true;
+  return false;
 }
 
 static bool do_decompress(std::vector<uint8_t>& compressed,
                           std::vector<uint8_t>& uncompressed) {
-  z_stream stream;
-  memset(&stream, 0, sizeof(stream));
-  int result = inflateInit(&stream);
-  if (result != Z_OK) {
-    assert(0 && "inflateInit failed!");
+  size_t out_size = uncompressed.size();
+  return BrotliDecoderDecompress(compressed.size(), compressed.data(),
+                                 &out_size, uncompressed.data()) ==
+             BROTLI_DECODER_RESULT_SUCCESS &&
+         out_size == uncompressed.size();
+}
+
+bool CompressedReader::get_buffer(const uint8_t** data, size_t* size) {
+  if (error) {
     return false;
   }
 
-  stream.next_in = &compressed[0];
-  stream.avail_in = compressed.size();
-  stream.next_out = &uncompressed[0];
-  stream.avail_out = uncompressed.size();
-  result = inflate(&stream, Z_FINISH);
-  if (result != Z_STREAM_END) {
-    assert(0 && "inflate failed!");
-    return false;
+  if (buffer_read_pos >= buffer.size() && !eof) {
+    if (!refill_buffer()) {
+      return false;
+    }
+    DEBUG_ASSERT(buffer_read_pos < buffer.size());
   }
 
-  result = inflateEnd(&stream);
-  if (result != Z_OK) {
-    assert(0 && "inflateEnd failed!");
-    return false;
-  }
+  *data = &buffer[buffer_read_pos];
+  *size = buffer.size() - buffer_read_pos;
+  return true;
+}
 
+bool CompressedReader::skip(size_t size) {
+  while (size > 0) {
+    if (error) {
+      return false;
+    }
+
+    if (buffer_read_pos < buffer.size()) {
+      size_t amount = std::min(size, buffer.size() - buffer_read_pos);
+      size -= amount;
+      buffer_read_pos += amount;
+      continue;
+    }
+
+    if (!refill_buffer()) {
+      return false;
+    }
+  }
   return true;
 }
 
@@ -104,41 +118,49 @@ bool CompressedReader::read(void* data, size_t size) {
       continue;
     }
 
-    if (have_saved_state && !have_saved_buffer) {
-      std::swap(buffer, saved_buffer);
-      have_saved_buffer = true;
-    }
-
-    CompressedWriter::BlockHeader header;
-    if (!read_all(*fd, sizeof(header), &header, &fd_offset)) {
-      error = true;
-      return false;
-    }
-
-    std::vector<uint8_t> compressed_buf;
-    compressed_buf.resize(header.compressed_length);
-    if (!read_all(*fd, compressed_buf.size(), &compressed_buf[0], &fd_offset)) {
-      error = true;
-      return false;
-    }
-
-    char ch;
-    if (pread(*fd, &ch, 1, fd_offset) == 0) {
-      eof = true;
-    }
-
-    buffer.resize(header.uncompressed_length);
-    buffer_read_pos = 0;
-    if (!do_decompress(compressed_buf, buffer)) {
-      error = true;
+    if (!refill_buffer()) {
       return false;
     }
   }
   return true;
 }
 
+bool CompressedReader::refill_buffer() {
+  if (have_saved_state && !have_saved_buffer) {
+    std::swap(buffer, saved_buffer);
+    have_saved_buffer = true;
+  }
+
+  CompressedWriter::BlockHeader header;
+  if (!read_all(*fd, sizeof(header), &header, &fd_offset)) {
+    error = true;
+    return false;
+  }
+
+  std::vector<uint8_t> compressed_buf;
+  compressed_buf.resize(header.compressed_length);
+  if (!read_all(*fd, compressed_buf.size(), &compressed_buf[0], &fd_offset)) {
+    error = true;
+    return false;
+  }
+
+  char ch;
+  if (pread(*fd, &ch, 1, fd_offset) == 0) {
+    eof = true;
+  }
+
+  buffer.resize(header.uncompressed_length);
+  buffer_read_pos = 0;
+  if (!do_decompress(compressed_buf, buffer)) {
+    error = true;
+    return false;
+  }
+
+  return true;
+}
+
 void CompressedReader::rewind() {
-  assert(!have_saved_state);
+  DEBUG_ASSERT(!have_saved_state);
   fd_offset = 0;
   buffer_read_pos = 0;
   buffer.clear();
@@ -148,7 +170,7 @@ void CompressedReader::rewind() {
 void CompressedReader::close() { fd = nullptr; }
 
 void CompressedReader::save_state() {
-  assert(!have_saved_state);
+  DEBUG_ASSERT(!have_saved_state);
   have_saved_state = true;
   have_saved_buffer = false;
   saved_fd_offset = fd_offset;
@@ -156,7 +178,7 @@ void CompressedReader::save_state() {
 }
 
 void CompressedReader::restore_state() {
-  assert(have_saved_state);
+  DEBUG_ASSERT(have_saved_state);
   have_saved_state = false;
   if (saved_fd_offset < fd_offset) {
     eof = false;
@@ -167,6 +189,14 @@ void CompressedReader::restore_state() {
     saved_buffer.clear();
   }
   buffer_read_pos = saved_buffer_read_pos;
+}
+
+void CompressedReader::discard_state() {
+  DEBUG_ASSERT(have_saved_state);
+  have_saved_state = false;
+  if (have_saved_buffer) {
+    saved_buffer.clear();
+  }
 }
 
 uint64_t CompressedReader::uncompressed_bytes() const {

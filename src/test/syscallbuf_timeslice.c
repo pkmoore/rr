@@ -1,11 +1,15 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
+
+static void handler(__attribute__((unused)) int sig) {}
 
 int main(void) {
   int fd;
   char buf[10];
   int i;
+
+  signal(SIGTRAP, handler);
 
   fd = open("/dev/zero", O_RDONLY);
   for (i = 0; i < 1 << 12; ++i) {

@@ -7,7 +7,6 @@
 // Get all the kernel definitions so we can verify our alternative versions.
 #include <arpa/inet.h>
 #include <asm/ldt.h>
-#include <assert.h>
 #include <dirent.h>
 #include <elf.h>
 #include <fcntl.h>
@@ -67,7 +66,11 @@ namespace rr {
 
 #include <stdlib.h>
 
+#include "AddressSpace.h"
+#include "Session.h"
 #include "Task.h"
+
+#include "preload/preload_interface.h"
 
 using namespace std;
 
@@ -91,6 +94,23 @@ static const uint8_t syscall_insn[] = { 0x0f, 0x05 };
 
 bool get_syscall_instruction_arch(Task* t, remote_code_ptr ptr,
                                   SupportedArch* arch) {
+  // Lots of syscalls occur in the rr page and we know what it contains without
+  // looking at it.
+  // (Without this optimization we spend a few % of all CPU time in this
+  // function in a syscall-dominated trace.)
+  if (t->vm()->has_rr_page()) {
+    const AddressSpace::SyscallType* type =
+        AddressSpace::rr_page_syscall_from_entry_point(ptr);
+    if (type && (type->enabled == AddressSpace::RECORDING_AND_REPLAY ||
+                 type->enabled == (t->session().is_recording()
+                                       ? AddressSpace::RECORDING_ONLY
+                                       : AddressSpace::REPLAY_ONLY))) {
+      // rr-page syscalls are always the task's arch
+      *arch = t->arch();
+      return true;
+    }
+  }
+
   bool ok = true;
   vector<uint8_t> code = t->read_mem(ptr.to_data_ptr<uint8_t>(), 2, &ok);
   if (!ok) {
@@ -128,7 +148,7 @@ vector<uint8_t> syscall_instruction(SupportedArch arch) {
     case x86_64:
       return vector<uint8_t>(syscall_insn, syscall_insn + sizeof(syscall_insn));
     default:
-      assert(0 && "Need to define syscall instruction");
+      DEBUG_ASSERT(0 && "Need to define syscall instruction");
       return vector<uint8_t>();
   }
 }
@@ -139,7 +159,7 @@ ssize_t syscall_instruction_length(SupportedArch arch) {
     case x86_64:
       return 2;
     default:
-      assert(0 && "Need to define syscall instruction length");
+      DEBUG_ASSERT(0 && "Need to define syscall instruction length");
       return 0;
   }
 }
@@ -160,10 +180,10 @@ static void set_arch_siginfo_arch(const siginfo_t& src, void* dest,
                                   size_t dest_size) {
   // Copying this structure field-by-field instead of just memcpy'ing
   // siginfo into si serves two purposes: performs 64->32 conversion if
-  // necessary, and ensures garbage in any holes in signfo isn't copied to the
+  // necessary, and ensures garbage in any holes in siginfo isn't copied to the
   // tracee.
   auto si = static_cast<typename Arch::siginfo_t*>(dest);
-  assert(dest_size == sizeof(*si));
+  DEBUG_ASSERT(dest_size == sizeof(*si));
 
   union {
     NativeArch::siginfo_t native_api;

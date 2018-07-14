@@ -1,6 +1,6 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
 #include <ctype.h>
 
 #define RR_PAGE_ADDR 0x70000000
@@ -149,6 +149,6 @@ int main(void) {
   iterate_maps(child, remote_unmap_callback, maps_file);
   breakpoint();
 
-  atomic_printf("EXIT-SUCCESS");
+  atomic_puts("EXIT-SUCCESS");
   return 0;
 }

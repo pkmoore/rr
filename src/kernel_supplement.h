@@ -3,6 +3,7 @@
 #ifndef RR_KERNEL_SUPPLEMENT_H_
 #define RR_KERNEL_SUPPLEMENT_H_
 
+#include <linux/if_tun.h>
 #include <linux/mman.h>
 #include <linux/seccomp.h>
 #include <linux/usbdevice_fs.h>
@@ -141,6 +142,19 @@ struct usbdevfs_streams {
 #define USBDEVFS_FREE_STREAMS _IOR('U', 29, struct usbdevfs_streams)
 #endif
 
+#ifndef TUNSETVNETLE
+#define TUNSETVNETLE _IOW('T', 220, int)
+#endif
+#ifndef TUNGETVNETLE
+#define TUNGETVNETLE _IOR('T', 221, int)
+#endif
+#ifndef TUNSETVNETBE
+#define TUNSETVNETBE _IOW('T', 222, int)
+#endif
+#ifndef TUNGETVNETBE
+#define TUNGETVNETBE _IOR('T', 223, int)
+#endif
+
 #ifndef TIOCGPKT
 #define TIOCGPKT _IOR('T', 0x38, int)
 #endif
@@ -149,6 +163,16 @@ struct usbdevfs_streams {
 #endif
 #ifndef TIOCGEXCL
 #define TIOCGEXCL _IOR('T', 0x40, int)
+#endif
+
+struct rr_input_mask {
+  uint32_t type;
+  uint32_t codes_size;
+  uint64_t codes_ptr;
+};
+
+#ifndef EVIOCGMASK
+#define EVIOCGMASK _IOR('E', 0x92, struct rr_input_mask)
 #endif
 
 #ifndef MADV_FREE

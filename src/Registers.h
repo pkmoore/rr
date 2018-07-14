@@ -3,7 +3,6 @@
 #ifndef RR_REGISTERS_H_
 #define RR_REGISTERS_H_
 
-#include <assert.h>
 #include <errno.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -12,6 +11,7 @@
 #include <sys/user.h>
 
 #include "GdbRegister.h"
+#include "core.h"
 #include "kernel_abi.h"
 #include "kernel_supplement.h"
 #include "remote_code_ptr.h"
@@ -91,6 +91,14 @@ public:
    * to the rr build (e.g. ARM vs x86).
    */
   std::vector<uint8_t> get_ptrace_for_arch(SupportedArch arch) const;
+  struct InternalData {
+    const uint8_t* data;
+    size_t size;
+  };
+  /**
+   * Equivalent to get_ptrace_for_arch(arch()) but doesn't copy.
+   */
+  InternalData get_ptrace_for_self_arch() const;
   /**
    * Copy an arch-specific user_regs_struct into these Registers.
    * It's invalid to call this when 'arch' is 64-bit and the
@@ -102,14 +110,10 @@ public:
 
 #define RR_GET_REG(x86case, x64case)                                           \
   (arch() == x86 ? (uint32_t)u.x86regs.x86case                                 \
-                 : arch() == x86_64                                            \
-                       ? u.x64regs.x64case                                     \
-                       : (assert(0 && "unknown architecture"), uintptr_t(-1)))
+                 : arch() == x86_64 ? u.x64regs.x64case : -1)
 #define RR_GET_REG_SIGNED(x86case, x64case)                                    \
   (arch() == x86 ? u.x86regs.x86case                                           \
-                 : arch() == x86_64                                            \
-                       ? u.x64regs.x64case                                     \
-                       : (assert(0 && "unknown architecture"), uintptr_t(-1)))
+                 : arch() == x86_64 ? u.x64regs.x64case : -1)
 #define RR_SET_REG(x86case, x64case, value)                                    \
   switch (arch()) {                                                            \
     case x86:                                                                  \
@@ -119,7 +123,7 @@ public:
       u.x64regs.x64case = (value);                                             \
       break;                                                                   \
     default:                                                                   \
-      assert(0 && "unknown architecture");                                     \
+      DEBUG_ASSERT(0 && "unknown architecture");                               \
   }
 
   remote_code_ptr ip() const { return RR_GET_REG(eip, rip); }
@@ -224,7 +228,7 @@ public:
       case 6:
         return arg6();
       default:
-        assert(0 && "Argument index out of range");
+        DEBUG_ASSERT(0 && "Argument index out of range");
         return 0;
     }
   }
@@ -256,7 +260,7 @@ public:
       case 6:
         return set_arg6(value);
       default:
-        assert(0 && "Argument index out of range");
+        DEBUG_ASSERT(0 && "Argument index out of range");
     }
   }
 
@@ -279,22 +283,22 @@ public:
   }
 
   void set_r8(uintptr_t value) {
-    assert(arch() == x86_64);
+    DEBUG_ASSERT(arch() == x86_64);
     u.x64regs.r8 = value;
   }
 
   void set_r9(uintptr_t value) {
-    assert(arch() == x86_64);
+    DEBUG_ASSERT(arch() == x86_64);
     u.x64regs.r9 = value;
   }
 
   void set_r10(uintptr_t value) {
-    assert(arch() == x86_64);
+    DEBUG_ASSERT(arch() == x86_64);
     u.x64regs.r10 = value;
   }
 
   void set_r11(uintptr_t value) {
-    assert(arch() == x86_64);
+    DEBUG_ASSERT(arch() == x86_64);
     u.x64regs.r11 = value;
   }
 
@@ -317,24 +321,29 @@ public:
   bool df_flag() const { return flags() & X86_DF_FLAG; }
 
   uintptr_t fs_base() const {
-    assert(arch() == x86_64);
+    DEBUG_ASSERT(arch() == x86_64);
     return u.x64regs.fs_base;
   }
   uintptr_t gs_base() const {
-    assert(arch() == x86_64);
+    DEBUG_ASSERT(arch() == x86_64);
     return u.x64regs.gs_base;
   }
 
   void set_fs_base(uintptr_t fs_base) {
-    assert(arch() == x86_64);
+    DEBUG_ASSERT(arch() == x86_64);
     u.x64regs.fs_base = fs_base;
   }
   void set_gs_base(uintptr_t gs_base) {
-    assert(arch() == x86_64);
+    DEBUG_ASSERT(arch() == x86_64);
     u.x64regs.gs_base = gs_base;
   }
 
-  uint32_t cs() const { return RR_GET_REG(xcs, cs); }
+  uint64_t cs() const { return RR_GET_REG(xcs, cs); }
+  uint64_t ss() const { return RR_GET_REG(xss, ss); }
+  uint64_t ds() const { return RR_GET_REG(xds, ds); }
+  uint64_t es() const { return RR_GET_REG(xes, es); }
+  uint64_t fs() const { return RR_GET_REG(xfs, fs); }
+  uint64_t gs() const { return RR_GET_REG(xgs, gs); }
 
   // End of X86-specific stuff
 

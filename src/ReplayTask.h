@@ -33,7 +33,7 @@ public:
   /**
    * Call this method when the exec has completed.
    */
-  void post_exec_syscall(const std::string& replay_exe, TraceTaskEvent& tte);
+  void post_exec_syscall(const std::string& replay_exe);
 
   enum {
     /* The x86 linux 3.5.0-36 kernel packaged with Ubuntu
@@ -50,6 +50,7 @@ public:
    */
   void validate_regs(uint32_t flags = 0);
   const TraceFrame& current_trace_frame();
+  FrameTime current_frame_time();
   /** Restore the next chunk of saved data from the trace to this. */
   ssize_t set_data_from_trace();
   /** Restore all remaining chunks of saved data for the current trace frame. */

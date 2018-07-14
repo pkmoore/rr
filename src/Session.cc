@@ -17,7 +17,8 @@
 #include "EmuFs.h"
 #include "Flags.h"
 #include "Task.h"
-#include "TaskGroup.h"
+#include "ThreadGroup.h"
+#include "core.h"
 #include "kernel_metadata.h"
 #include "log.h"
 #include "util.h"
@@ -27,13 +28,13 @@ using namespace std;
 namespace rr {
 
 struct Session::CloneCompletion {
-  struct TaskGroup {
+  struct AddressSpaceClone {
     Task* clone_leader;
     Task::CapturedState clone_leader_state;
     vector<Task::CapturedState> member_states;
     vector<pair<remote_ptr<void>, vector<uint8_t>>> captured_memory;
   };
-  vector<TaskGroup> task_groups;
+  vector<AddressSpaceClone> address_spaces;
 };
 
 Session::Session()
@@ -50,7 +51,7 @@ Session::~Session() {
   kill_all_tasks();
   LOG(debug) << "Session " << this << " destroyed";
 
-  for (auto tg : task_group_map) {
+  for (auto tg : thread_group_map) {
     tg.second->forget_session();
   }
 }
@@ -63,8 +64,10 @@ Session::Session(const Session& other) {
   has_cpuid_faulting_ = other.has_cpuid_faulting_;
 }
 
-void Session::on_create(TaskGroup* tg) { task_group_map[tg->tguid()] = tg; }
-void Session::on_destroy(TaskGroup* tg) { task_group_map.erase(tg->tguid()); }
+void Session::on_create(ThreadGroup* tg) { thread_group_map[tg->tguid()] = tg; }
+void Session::on_destroy(ThreadGroup* tg) {
+  thread_group_map.erase(tg->tguid());
+}
 
 void Session::post_exec() {
   /* We just saw a successful exec(), so from now on we know
@@ -76,7 +79,7 @@ void Session::post_exec() {
     return;
   }
   done_initial_exec_ = true;
-  assert(tasks().size() == 1);
+  DEBUG_ASSERT(tasks().size() == 1);
   Task* t = tasks().begin()->second;
   t->flush_inconsistent_state();
   spawned_task_error_fd_.close();
@@ -108,25 +111,25 @@ AddressSpace::shr_ptr Session::clone(Task* t, AddressSpace::shr_ptr vm) {
   return as;
 }
 
-TaskGroup::shr_ptr Session::create_tg(Task* t) {
-  TaskGroup::shr_ptr tg(
-      new TaskGroup(this, nullptr, t->rec_tid, t->tid, t->tuid().serial()));
+ThreadGroup::shr_ptr Session::create_tg(Task* t) {
+  ThreadGroup::shr_ptr tg(
+      new ThreadGroup(this, nullptr, t->rec_tid, t->tid, t->tuid().serial()));
   tg->insert_task(t);
   return tg;
 }
 
-TaskGroup::shr_ptr Session::clone(Task* t, TaskGroup::shr_ptr tg) {
+ThreadGroup::shr_ptr Session::clone(Task* t, ThreadGroup::shr_ptr tg) {
   assert_fully_initialized();
   // If tg already belongs to our session this is a fork to create a new
   // taskgroup, otherwise it's a session-clone of an existing taskgroup
   if (this == tg->session()) {
-    return TaskGroup::shr_ptr(
-        new TaskGroup(this, tg.get(), t->rec_tid, t->tid, t->tuid().serial()));
+    return ThreadGroup::shr_ptr(new ThreadGroup(this, tg.get(), t->rec_tid,
+                                                t->tid, t->tuid().serial()));
   }
-  TaskGroup* parent =
-      tg->parent() ? find_task_group(tg->parent()->tguid()) : nullptr;
-  return TaskGroup::shr_ptr(
-      new TaskGroup(this, parent, tg->tgid, t->tid, tg->tguid().serial()));
+  ThreadGroup* parent =
+      tg->parent() ? find_thread_group(tg->parent()->tguid()) : nullptr;
+  return ThreadGroup::shr_ptr(
+      new ThreadGroup(this, parent, tg->tgid, t->tid, tg->tguid().serial()));
 }
 
 Task* Session::new_task(pid_t tid, pid_t rec_tid, uint32_t serial,
@@ -163,13 +166,23 @@ Task* Session::find_task(const TaskUid& tuid) const {
   return t && t->tuid() == tuid ? t : nullptr;
 }
 
-TaskGroup* Session::find_task_group(const TaskGroupUid& tguid) const {
+ThreadGroup* Session::find_thread_group(const ThreadGroupUid& tguid) const {
   finish_initializing();
-  auto it = task_group_map.find(tguid);
-  if (task_group_map.end() == it) {
+  auto it = thread_group_map.find(tguid);
+  if (thread_group_map.end() == it) {
     return nullptr;
   }
   return it->second;
+}
+
+ThreadGroup* Session::find_thread_group(pid_t pid) const {
+  finish_initializing();
+  for (auto& tg : thread_group_map) {
+    if (tg.first.tid() == pid) {
+      return tg.second;
+    }
+  }
+  return nullptr;
 }
 
 AddressSpace* Session::find_address_space(const AddressSpaceUid& vmuid) const {
@@ -184,6 +197,11 @@ AddressSpace* Session::find_address_space(const AddressSpaceUid& vmuid) const {
 void Session::kill_all_tasks() {
   for (auto& v : task_map) {
     Task* t = v.second;
+
+    if (t->spun_off) {
+      t->destroy();
+      continue;
+    }
 
     if (!t->is_stopped) {
       // During recording we might be aborting the recording, in which case
@@ -224,6 +242,7 @@ void Session::kill_all_tasks() {
     r.set_syscallno(syscall_number_for_exit(r.arch()));
     r.set_arg1(0);
     t->set_regs(r);
+    t->flush_regs();
     long result;
     do {
       // We have observed this failing with an ESRCH when the thread clearly
@@ -231,6 +250,10 @@ void Session::kill_all_tasks() {
       // work around it.
       result = t->fallible_ptrace(PTRACE_DETACH, nullptr, nullptr);
       ASSERT(t, result >= 0 || errno == ESRCH);
+      // But we it might get ESRCH because it really doesn't exist.
+      if (errno == ESRCH && is_zombie_process(t->tid)) {
+        break;
+      }
     } while (result < 0);
   }
 
@@ -245,7 +268,7 @@ void Session::kill_all_tasks() {
        */
       LOG(debug) << "sending SIGKILL to " << t->tid << " ...";
       // If we haven't already done a stable exit via syscall,
-      // kill the task and note that the entire task group is unstable.
+      // kill the task and note that the entire thread group is unstable.
       // The task may already have exited due to the preparation above,
       // so we might accidentally shoot down the wrong task :-(, but we
       // have to do this because the task might be in a state where it's not
@@ -253,7 +276,7 @@ void Session::kill_all_tasks() {
       // Linux doesn't seem to give us a reliable way to detach and kill
       // the tracee without races.
       syscall(SYS_tgkill, t->real_tgid(), t->tid, SIGKILL);
-      t->task_group()->destabilize();
+      t->thread_group()->destabilize();
     }
 
     t->destroy();
@@ -261,13 +284,13 @@ void Session::kill_all_tasks() {
 }
 
 void Session::on_destroy(AddressSpace* vm) {
-  assert(vm->task_set().size() == 0);
-  assert(vm_map.count(vm->uid()) == 1);
+  DEBUG_ASSERT(vm->task_set().size() == 0);
+  DEBUG_ASSERT(vm_map.count(vm->uid()) == 1);
   vm_map.erase(vm->uid());
 }
 
 void Session::on_destroy(Task* t) {
-  assert(task_map.count(t->rec_tid) == 1);
+  DEBUG_ASSERT(task_map.count(t->rec_tid) == 1);
   task_map.erase(t->rec_tid);
 }
 
@@ -367,7 +390,7 @@ void Session::check_for_watchpoint_changes(Task* t, BreakStatus& break_status) {
 }
 
 void Session::assert_fully_initialized() const {
-  assert(!clone_completion && "Session not fully initialized");
+  DEBUG_ASSERT(!clone_completion && "Session not fully initialized");
 }
 
 void Session::finish_initializing() const {
@@ -376,23 +399,24 @@ void Session::finish_initializing() const {
   }
 
   Session* self = const_cast<Session*>(this);
-  for (auto& tgleader : clone_completion->task_groups) {
-    AutoRemoteSyscalls remote(tgleader.clone_leader);
-    for (auto m : tgleader.clone_leader->vm()->maps()) {
-      // Creating this mapping was delayed in capture_state for performance
-      if (m.flags & AddressSpace::Mapping::IS_SYSCALLBUF) {
-        self->recreate_shared_mmap(remote, m);
+  for (auto& tgleader : clone_completion->address_spaces) {
+    {
+      AutoRemoteSyscalls remote(tgleader.clone_leader);
+      for (const auto& m : tgleader.clone_leader->vm()->maps()) {
+        // Creating this mapping was delayed in capture_state for performance
+        if (m.flags & AddressSpace::Mapping::IS_SYSCALLBUF) {
+          self->recreate_shared_mmap(remote, m);
+        }
       }
-    }
-    for (auto& mem : tgleader.captured_memory) {
-      tgleader.clone_leader->write_bytes_helper(mem.first, mem.second.size(),
-                                                mem.second.data());
-    }
-    for (auto& tgmember : tgleader.member_states) {
-      Task* t_clone =
-          Task::os_clone_into(tgmember, tgleader.clone_leader, remote);
-      self->on_create(t_clone);
-      t_clone->copy_state(tgmember);
+      for (auto& mem : tgleader.captured_memory) {
+        tgleader.clone_leader->write_bytes_helper(mem.first, mem.second.size(),
+                                                  mem.second.data());
+      }
+      for (auto& tgmember : tgleader.member_states) {
+        Task* t_clone = Task::os_clone_into(tgmember, remote);
+        self->on_create(t_clone);
+        t_clone->copy_state(tgmember);
+      }
     }
     tgleader.clone_leader->copy_state(tgleader.clone_leader_state);
   }
@@ -518,8 +542,9 @@ static char* extract_name(char* name_buffer, size_t buffer_size) {
   // Recover the name that was originally chosen by finding the part of the
   // name between rr_mapping_prefix and the -%d-%d at the end.
   char* path_start = strstr(name_buffer, Session::rr_mapping_prefix());
-  assert(path_start && "Passed something to create_shared_mmap that"
-                       " wasn't a mapping shared between rr and the tracee?");
+  DEBUG_ASSERT(path_start &&
+               "Passed something to create_shared_mmap that"
+               " wasn't a mapping shared between rr and the tracee?");
   size_t prefix_len = path_start - name_buffer;
   buffer_size -= prefix_len;
   name_buffer += prefix_len;
@@ -532,21 +557,19 @@ static char* extract_name(char* name_buffer, size_t buffer_size) {
     if (*name_end == '-') {
       ++hyphens_seen;
     } else if (*name_end == '/') {
-      assert(false && "Passed something to create_shared_mmap that"
-                      " wasn't a mapping shared between rr and the tracee?");
+      DEBUG_ASSERT(false &&
+                   "Passed something to create_shared_mmap that"
+                   " wasn't a mapping shared between rr and the tracee?");
     }
     if (hyphens_seen == 2) {
       break;
     }
   }
-  assert(hyphens_seen == 2);
+  DEBUG_ASSERT(hyphens_seen == 2);
   *name_end = '\0';
   return name_start;
 }
 
-// Recreate an mmap region that is shared between rr and the tracee. The caller
-// is responsible for recreating the data in the new mmap, if `preserve` is
-// DISCARD_CONTENTS.
 const AddressSpace::Mapping& Session::recreate_shared_mmap(
     AutoRemoteSyscalls& remote, const AddressSpace::Mapping& m,
     PreserveContents preserve, MonitoredSharedMemory::shr_ptr&& monitored) {
@@ -653,7 +676,7 @@ static vector<uint8_t> capture_syscallbuf(const AddressSpace::Mapping& m,
 
 void Session::copy_state_to(Session& dest, EmuFs& emu_fs, EmuFs& dest_emu_fs) {
   assert_fully_initialized();
-  assert(!dest.clone_completion);
+  DEBUG_ASSERT(!dest.clone_completion);
 
   auto completion = unique_ptr<CloneCompletion>(new CloneCompletion());
 
@@ -664,8 +687,8 @@ void Session::copy_state_to(Session& dest, EmuFs& emu_fs, EmuFs& dest_emu_fs) {
     LOG(debug) << "  forking tg " << group_leader->tgid()
                << " (real: " << group_leader->real_tgid() << ")";
 
-    completion->task_groups.push_back(CloneCompletion::TaskGroup());
-    auto& group = completion->task_groups.back();
+    completion->address_spaces.push_back(CloneCompletion::AddressSpaceClone());
+    auto& group = completion->address_spaces.back();
 
     group.clone_leader = group_leader->os_fork_into(&dest);
     dest.on_create(group.clone_leader);
@@ -673,7 +696,8 @@ void Session::copy_state_to(Session& dest, EmuFs& emu_fs, EmuFs& dest_emu_fs) {
 
     {
       AutoRemoteSyscalls remote(group.clone_leader);
-      for (auto m : group.clone_leader->vm()->maps()) {
+      vector<AddressSpace::Mapping> shared_maps_to_clone;
+      for (const auto& m : group.clone_leader->vm()->maps()) {
         // Special case the syscallbuf as a performance optimization. The amount
         // of data we need to capture is usually significantly smaller than the
         // size of the mapping, so allocating the whole mapping here would be
@@ -686,11 +710,15 @@ void Session::copy_state_to(Session& dest, EmuFs& emu_fs, EmuFs& dest_emu_fs) {
                  m.map.start() == AddressSpace::preload_thread_locals_start());
         } else if ((m.recorded_map.flags() & MAP_SHARED) &&
                    emu_fs.has_file_for(m.recorded_map)) {
-          remap_shared_mmap(remote, emu_fs, dest_emu_fs, m);
+          shared_maps_to_clone.push_back(m);
         }
       }
+      // Do this in a separate loop to avoid iteration invalidation issues
+      for (const auto& m : shared_maps_to_clone) {
+        remap_shared_mmap(remote, emu_fs, dest_emu_fs, m);
+      }
 
-      for (auto t : group_leader->task_group()->task_set()) {
+      for (auto t : vm.second->task_set()) {
         if (group_leader == t) {
           continue;
         }
@@ -704,7 +732,7 @@ void Session::copy_state_to(Session& dest, EmuFs& emu_fs, EmuFs& dest_emu_fs) {
   }
   dest.clone_completion = move(completion);
 
-  assert(dest.vms().size() > 0);
+  DEBUG_ASSERT(dest.vms().size() > 0);
 }
 
 } // namespace rr

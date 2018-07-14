@@ -2,9 +2,9 @@
 
 #include "ExtraRegisters.h"
 
-#include <assert.h>
 #include <string.h>
 
+#include "core.h"
 #include "log.h"
 #include "util.h"
 
@@ -99,7 +99,7 @@ static RegData xsave_register_data(SupportedArch arch, GdbRegister regno) {
     case x86_64:
       break;
     default:
-      assert(0 && "Unknown arch");
+      DEBUG_ASSERT(0 && "Unknown arch");
       return RegData();
   }
 
@@ -125,7 +125,7 @@ static RegData xsave_register_data(SupportedArch arch, GdbRegister regno) {
   if (regno == DREG_64_MXCSR) {
     return RegData(24, 4);
   }
-  assert(regno >= DREG_64_FCTRL && regno <= DREG_64_FOP);
+  DEBUG_ASSERT(regno >= DREG_64_FCTRL && regno <= DREG_64_FOP);
   // NB: most of these registers only occupy 2 bytes of space in
   // the (f)xsave region, but gdb's default x86 target
   // config expects us to send back 4 bytes of data for
@@ -155,7 +155,7 @@ size_t ExtraRegisters::read_register(uint8_t* buf, GdbRegister regno,
     return reg_data.size;
   }
 
-  assert(reg_data.size > 0);
+  DEBUG_ASSERT(reg_data.size > 0);
 
   *defined = true;
 
@@ -165,7 +165,7 @@ size_t ExtraRegisters::read_register(uint8_t* buf, GdbRegister regno,
       !(xsave_features(data_) & (1 << reg_data.xsave_feature_bit))) {
     memset(buf, 0, reg_data.size);
   } else {
-    assert(size_t(reg_data.offset + reg_data.size) <= data_.size());
+    DEBUG_ASSERT(size_t(reg_data.offset + reg_data.size) <= data_.size());
     memcpy(buf, data_.data() + reg_data.offset, reg_data.size);
   }
   return reg_data.size;
@@ -206,11 +206,11 @@ static void print_reg(const ExtraRegisters& r, GdbRegister low, GdbRegister hi,
   uint8_t buf[128];
   bool defined = false;
   size_t len = r.read_register(buf, low, &defined);
-  assert(defined && len <= 64);
+  DEBUG_ASSERT(defined && len <= 64);
   if (hi != GdbRegister(0)) {
     size_t len2 = r.read_register(buf + len, hi, &defined);
     if (defined) {
-      assert(len == len2);
+      DEBUG_ASSERT(len == len2);
       len += len2;
     }
   }
@@ -244,14 +244,16 @@ void ExtraRegisters::print_register_file_compact(FILE* f) const {
   switch (arch_) {
     case x86:
       print_regs(*this, DREG_ST0, GdbRegister(0), 8, "st", f);
+      fputc(' ', f);
       print_regs(*this, DREG_XMM0, DREG_YMM0H, 8, "ymm", f);
       break;
     case x86_64:
       print_regs(*this, DREG_64_ST0, GdbRegister(0), 8, "st", f);
+      fputc(' ', f);
       print_regs(*this, DREG_64_XMM0, DREG_64_YMM0H, 16, "ymm", f);
       break;
     default:
-      assert(0 && "Unknown arch");
+      DEBUG_ASSERT(0 && "Unknown arch");
       break;
   }
 }
@@ -303,7 +305,7 @@ template <typename T> static vector<uint8_t> to_vector(const T& v) {
 }
 
 bool ExtraRegisters::set_to_raw_data(SupportedArch a, Format format,
-                                     std::vector<uint8_t>& consume_data,
+                                     const uint8_t* data, size_t data_size,
                                      const XSaveLayout& layout) {
   arch_ = a;
   format_ = NONE;
@@ -321,26 +323,25 @@ bool ExtraRegisters::set_to_raw_data(SupportedArch a, Format format,
   // native XSAVE format. Be careful to handle possibly-corrupt input data.
 
   const XSaveLayout& native_layout = xsave_native_layout();
-  if (consume_data.size() != layout.full_size) {
-    LOG(error) << "Invalid XSAVE data length: " << consume_data.size()
-               << ", expected " << layout.full_size;
+  if (data_size != layout.full_size) {
+    LOG(error) << "Invalid XSAVE data length: " << data_size << ", expected "
+               << layout.full_size;
     return false;
   }
   data_.resize(native_layout.full_size);
-  assert(data_.size() >= xsave_header_offset);
+  DEBUG_ASSERT(data_.size() >= xsave_header_offset);
   if (layout.full_size < xsave_header_offset) {
     LOG(error) << "Invalid XSAVE layout size: " << layout.full_size;
     return false;
   }
-  memcpy(data_.data(), consume_data.data(), xsave_header_offset);
+  memcpy(data_.data(), data, xsave_header_offset);
   memset(data_.data() + xsave_header_offset, 0,
          data_.size() - xsave_header_offset);
 
   // Check for unsupported features being used
   if (layout.full_size >= xsave_header_end) {
     uint64_t features_used;
-    memcpy(&features_used, consume_data.data() + xsave_header_offset,
-           sizeof(features_used));
+    memcpy(&features_used, data + xsave_header_offset, sizeof(features_used));
     if (features_used & ~native_layout.supported_feature_bits) {
       LOG(error) << "Unsupported CPU features found: got " << HEX(features_used)
                  << ", supported: "
@@ -364,12 +365,12 @@ bool ExtraRegisters::set_to_raw_data(SupportedArch a, Format format,
 
   // OK, now both our native layout and the input layout are using the full
   // XSAVE header. Copy the header.
-  memcpy(data_.data() + xsave_header_offset,
-         consume_data.data() + xsave_header_offset, xsave_header_size);
+  memcpy(data_.data() + xsave_header_offset, data + xsave_header_offset,
+         xsave_header_size);
 
   // Now copy each optional and present area into the right place in our struct
   uint64_t features_present;
-  memcpy(&features_present, consume_data.data() + xsave_header_offset,
+  memcpy(&features_present, data + xsave_header_offset,
          sizeof(features_present));
   for (size_t i = 2; i < 64; ++i) {
     if (features_present & (uint64_t(1) << i)) {
@@ -387,11 +388,11 @@ bool ExtraRegisters::set_to_raw_data(SupportedArch a, Format format,
         return false;
       }
       // The CPU should guarantee these
-      assert(native_feature.offset > 0);
-      assert(native_feature.offset + native_feature.size <=
-             native_layout.full_size);
-      memcpy(data_.data() + native_feature.offset,
-             consume_data.data() + feature.offset, feature.size);
+      DEBUG_ASSERT(native_feature.offset > 0);
+      DEBUG_ASSERT(native_feature.offset + native_feature.size <=
+                   native_layout.full_size);
+      memcpy(data_.data() + native_feature.offset, data + feature.offset,
+             feature.size);
     }
   }
 
@@ -400,70 +401,70 @@ bool ExtraRegisters::set_to_raw_data(SupportedArch a, Format format,
 
 vector<uint8_t> ExtraRegisters::get_user_fpregs_struct(
     SupportedArch arch) const {
-  assert(format_ == XSAVE);
+  DEBUG_ASSERT(format_ == XSAVE);
   switch (arch) {
     case x86:
-      assert(data_.size() >= sizeof(X86Arch::user_fpxregs_struct));
+      DEBUG_ASSERT(data_.size() >= sizeof(X86Arch::user_fpxregs_struct));
       return to_vector(convert_fxsave_to_x86_fpregs(
           *reinterpret_cast<const X86Arch::user_fpxregs_struct*>(
               data_.data())));
     case x86_64:
-      assert(data_.size() >= sizeof(X64Arch::user_fpregs_struct));
+      DEBUG_ASSERT(data_.size() >= sizeof(X64Arch::user_fpregs_struct));
       return to_vector(
           *reinterpret_cast<const X64Arch::user_fpregs_struct*>(data_.data()));
     default:
-      assert(0 && "Unknown arch");
+      DEBUG_ASSERT(0 && "Unknown arch");
       return vector<uint8_t>();
   }
 }
 
-void ExtraRegisters::set_user_fpregs_struct(SupportedArch arch, void* data,
-                                            size_t size) {
-  assert(format_ == XSAVE);
+void ExtraRegisters::set_user_fpregs_struct(Task* t, SupportedArch arch,
+                                            void* data, size_t size) {
+  DEBUG_ASSERT(format_ == XSAVE);
   switch (arch) {
     case x86:
-      assert(size >= sizeof(X86Arch::user_fpregs_struct));
-      assert(data_.size() >= sizeof(X86Arch::user_fpxregs_struct));
+      ASSERT(t, size >= sizeof(X86Arch::user_fpregs_struct));
+      ASSERT(t, data_.size() >= sizeof(X86Arch::user_fpxregs_struct));
       convert_x86_fpregs_to_fxsave(
           *static_cast<X86Arch::user_fpregs_struct*>(data),
           reinterpret_cast<X86Arch::user_fpxregs_struct*>(data_.data()));
       return;
     case x86_64:
-      assert(data_.size() >= sizeof(X64Arch::user_fpregs_struct));
-      assert(size >= sizeof(X64Arch::user_fpregs_struct));
+      ASSERT(t, data_.size() >= sizeof(X64Arch::user_fpregs_struct));
+      ASSERT(t, size >= sizeof(X64Arch::user_fpregs_struct));
       memcpy(data_.data(), data, sizeof(X64Arch::user_fpregs_struct));
       return;
     default:
-      assert(0 && "Unknown arch");
+      DEBUG_ASSERT(0 && "Unknown arch");
   }
 }
 
 X86Arch::user_fpxregs_struct ExtraRegisters::get_user_fpxregs_struct() const {
-  assert(format_ == XSAVE);
-  assert(arch_ == x86);
-  assert(data_.size() >= sizeof(X86Arch::user_fpxregs_struct));
+  DEBUG_ASSERT(format_ == XSAVE);
+  DEBUG_ASSERT(arch_ == x86);
+  DEBUG_ASSERT(data_.size() >= sizeof(X86Arch::user_fpxregs_struct));
   return *reinterpret_cast<const X86Arch::user_fpxregs_struct*>(data_.data());
 }
 
 void ExtraRegisters::set_user_fpxregs_struct(
-    const X86Arch::user_fpxregs_struct& regs) {
-  assert(format_ == XSAVE);
-  assert(arch_ == x86);
-  assert(data_.size() >= sizeof(X86Arch::user_fpxregs_struct));
+    Task* t, const X86Arch::user_fpxregs_struct& regs) {
+  ASSERT(t, format_ == XSAVE);
+  ASSERT(t, arch_ == x86);
+  ASSERT(t, data_.size() >= sizeof(X86Arch::user_fpxregs_struct));
   memcpy(data_.data(), &regs, sizeof(regs));
 }
 
 static void set_word(SupportedArch arch, vector<uint8_t>& v, GdbRegister r,
                      int word) {
   RegData d = xsave_register_data(arch, r);
-  assert(d.size == 4);
-  assert(d.offset + d.size <= (int)v.size());
-  assert(-1 == d.xsave_feature_bit);
+  DEBUG_ASSERT(d.size == 4);
+  DEBUG_ASSERT(d.offset + d.size <= (int)v.size());
+  DEBUG_ASSERT(-1 == d.xsave_feature_bit);
   *reinterpret_cast<int*>(v.data() + d.offset) = word;
 }
 
 void ExtraRegisters::reset() {
-  assert(format_ == XSAVE);
+  DEBUG_ASSERT(format_ == XSAVE);
   memset(data_.data(), 0, data_.size());
   switch (arch()) {
     case x86_64: {
@@ -477,7 +478,7 @@ void ExtraRegisters::reset() {
       break;
     }
     default:
-      assert(0 && "Unknown arch");
+      DEBUG_ASSERT(0 && "Unknown arch");
       break;
   }
   uint64_t xinuse;

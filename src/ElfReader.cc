@@ -5,6 +5,7 @@
 #include <elf.h>
 
 #include "log.h"
+#include "util.h"
 
 using namespace std;
 
@@ -16,6 +17,8 @@ public:
   virtual ~ElfReaderImplBase() {}
   virtual SymbolTable read_symbols(const char* symtab, const char* strtab) = 0;
   virtual DynamicSection read_dynamic() = 0;
+  virtual Debuglink read_debuglink() = 0;
+  virtual bool addr_to_offset(uintptr_t addr, uintptr_t& offset) = 0;
   bool ok() { return ok_; }
 
 protected:
@@ -29,6 +32,8 @@ public:
   virtual SymbolTable read_symbols(const char* symtab,
                                    const char* strtab) override;
   virtual DynamicSection read_dynamic() override;
+  virtual Debuglink read_debuglink() override;
+  virtual bool addr_to_offset(uintptr_t addr, uintptr_t& offset) override;
 
 private:
   const typename Arch::ElfShdr* find_section(const char* n);
@@ -151,14 +156,7 @@ SymbolTable ElfReaderImpl<Arch>::read_symbols(const char* symtab,
   result.symbols.resize(symbol_list.size());
   for (size_t i = 0; i < symbol_list.size(); ++i) {
     auto& s = symbol_list[i];
-    if (s.st_shndx >= sections.size()) {
-      // Don't leave this entry uninitialized
-      result.symbols[i] = SymbolTable::Symbol(0, 0);
-      continue;
-    }
-    auto& section = sections[s.st_shndx];
-    result.symbols[i] = SymbolTable::Symbol(
-        s.st_value - section.sh_addr + section.sh_offset, s.st_name);
+    result.symbols[i] = SymbolTable::Symbol(s.st_value, s.st_name);
   }
   return result;
 }
@@ -215,6 +213,56 @@ template <typename Arch> DynamicSection ElfReaderImpl<Arch>::read_dynamic() {
   return result;
 }
 
+template <typename Arch> Debuglink ElfReaderImpl<Arch>::read_debuglink() {
+  Debuglink result;
+  if (!ok()) {
+    return result;
+  }
+
+  const typename Arch::ElfShdr* debuglink = find_section(".gnu_debuglink");
+  if (!debuglink) {
+    return result;
+  }
+  if (debuglink->sh_size < 8) {
+    LOG(debug) << "Invalid ELF file: unexpected .gnu_debuglink length";
+    return result;
+  }
+
+  size_t crc_offset = debuglink->sh_size - 4;
+  if (!r.read(debuglink->sh_offset + crc_offset, result.crc)) {
+    LOG(debug) << "Invalid ELF file: can't read .gnu_debuglink crc checksum";
+    return result;
+  }
+
+  std::vector<char> filename = r.read<char>(debuglink->sh_offset, crc_offset);
+  if (result.filename.empty()) {
+    LOG(debug) << "Invalid ELF file: can't read .gnu_debuglink filename";
+    return result;
+  }
+
+  filename[result.filename.size() - 1] = 0;
+  result.filename = std::string(filename.data());
+  return result;
+}
+
+template <typename Arch>
+bool ElfReaderImpl<Arch>::addr_to_offset(uintptr_t addr, uintptr_t& offset) {
+  for (size_t i = 0; i < sections.size(); ++i) {
+    const auto& section = sections[i];
+    // Skip the section if it either "occupies no space in the file" or
+    // doesn't have a valid address because it does not "occupy memory
+    // during process execution".
+    if (section.sh_type == SHT_NOBITS || !(section.sh_flags & SHF_ALLOC)) {
+      continue;
+    }
+    if (addr >= section.sh_addr && addr - section.sh_addr < section.sh_size) {
+      offset = addr - section.sh_addr + section.sh_offset;
+      return true;
+    }
+  }
+  return false;
+}
+
 ElfReader::ElfReader(SupportedArch arch) : arch(arch) {}
 
 ElfReader::~ElfReader() {}
@@ -232,23 +280,59 @@ SymbolTable ElfReader::read_symbols(const char* symtab, const char* strtab) {
 
 DynamicSection ElfReader::read_dynamic() { return impl().read_dynamic(); }
 
-bool ElfReader::ok() { return impl().ok(); }
+Debuglink ElfReader::read_debuglink() { return impl().read_debuglink(); }
 
-static bool read_all(ScopedFd& fd, size_t offset, size_t size, void* buf) {
-  while (size) {
-    ssize_t ret = pread(fd.get(), buf, size, offset);
-    if (ret <= 0) {
-      return false;
-    }
-    offset += ret;
-    size -= ret;
-    buf = static_cast<uint8_t*>(buf) + ret;
-  }
-  return true;
+bool ElfReader::addr_to_offset(uintptr_t addr, uintptr_t& offset) {
+  return impl().addr_to_offset(addr, offset);
 }
 
+bool ElfReader::ok() { return impl().ok(); }
+
 bool ElfFileReader::read(size_t offset, size_t size, void* buf) {
-  return read_all(fd, offset, size, buf);
+  ssize_t ret = read_to_end(fd, offset, buf, size);
+  return ret == (ssize_t)size;
+}
+
+ScopedFd ElfFileReader::open_debug_file(const std::string& elf_file_name) {
+  if (elf_file_name.empty() || elf_file_name[0] != '/') {
+    return ScopedFd();
+  }
+
+  Debuglink debuglink = read_debuglink();
+  if (debuglink.filename.empty()) {
+    return ScopedFd();
+  }
+
+  size_t last_slash = elf_file_name.find_last_of('/');
+  string debug_path = "/usr/lib/debug/";
+  debug_path += elf_file_name.substr(0, last_slash) + '/' + debuglink.filename;
+  ScopedFd debug_fd(debug_path.c_str(), O_RDONLY);
+  if (!debug_fd.is_open()) {
+    return ScopedFd();
+  }
+
+  // Verify that the CRC checksum matches, in case the debuginfo and text file
+  // are in separate packages that are out of sync.
+  uint32_t crc = 0xffffffff;
+  while (true) {
+    unsigned char buf[4096];
+    ssize_t ret = ::read(debug_fd.get(), buf, sizeof(buf));
+    if (ret < 0) {
+      if (errno != EINTR) {
+        LOG(debug) << "Error reading " << debug_path;
+        return ScopedFd();
+      }
+    } else if (ret == 0) {
+      break;
+    } else {
+      crc = crc32(crc, buf, ret);
+    }
+  }
+
+  if ((crc ^ 0xffffffff) == debuglink.crc) {
+    return debug_fd;
+  }
+  return ScopedFd();
 }
 
 SupportedArch ElfFileReader::identify_arch(ScopedFd& fd) {
@@ -259,7 +343,8 @@ SupportedArch ElfFileReader::identify_arch(ScopedFd& fd) {
    */
   static const int header_prefix_size = 20;
   char buf[header_prefix_size];
-  if (!read_all(fd, 0, sizeof(buf), buf) || buf[5] != 1) {
+  ssize_t ret = read_to_end(fd, 0, buf, sizeof(buf));
+  if (ret != (ssize_t)sizeof(buf) || buf[5] != 1) {
     return NativeArch::arch();
   }
   switch (buf[18] | (buf[19] << 8)) {

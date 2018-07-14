@@ -9,9 +9,11 @@
 
 #include "rr/rr.h"
 
+#include "RecordTask.h"
 #include "ReplaySession.h"
 #include "Session.h"
 #include "Task.h"
+#include "core.h"
 #include "kernel_metadata.h"
 #include "log.h"
 #include "util.h"
@@ -50,7 +52,7 @@ void AutoRestoreMem::init(const void* mem, ssize_t num_bytes) {
 }
 
 AutoRestoreMem::~AutoRestoreMem() {
-  assert(saved_sp == remote.regs().sp() + len);
+  DEBUG_ASSERT(saved_sp == remote.regs().sp() + len);
 
   remote.task()->write_bytes_helper(addr, len, data.data());
 
@@ -58,24 +60,62 @@ AutoRestoreMem::~AutoRestoreMem() {
   remote.task()->set_regs(remote.regs());
 }
 
+static bool is_SIGTRAP_default_and_unblocked(Task* t) {
+  if (!t->session().is_recording()) {
+    return true;
+  }
+  RecordTask* rt = static_cast<RecordTask*>(t);
+  return rt->sig_disposition(SIGTRAP) == SIGNAL_DEFAULT &&
+         !rt->is_sig_blocked(SIGTRAP);
+}
+
 AutoRemoteSyscalls::AutoRemoteSyscalls(Task* t,
                                        MemParamsEnabled enable_mem_params)
     : t(t),
       initial_regs(t->regs()),
-      initial_wait_status(t->status()),
       initial_ip(t->ip()),
       initial_sp(t->regs().sp()),
-      pending_syscallno(-1),
+      restore_wait_status(t->status()),
+      new_tid_(-1),
       scratch_mem_was_mapped(false),
+      use_singlestep_path(false),
       enable_mem_params_(enable_mem_params) {
-  // We could use privilged_traced_syscall_ip() here, but we don't actually
-  // need privileges because tracee seccomp filters are modified to only
-  // produce PTRACE_SECCOMP_EVENTs that we ignore. And before the rr page is
-  // loaded, the privileged_traced_syscall_ip is not available.
-  initial_regs.set_ip(t->vm()->traced_syscall_ip());
+  // We support two paths for syscalls:
+  // -- a fast path using a privileged untraced syscall and PTRACE_SINGLESTEP.
+  // This only requires a single task-wait.
+  // -- a slower path using a privileged traced syscall and PTRACE_SYSCALL/
+  // PTRACE_CONT via Task::enter_syscall(). This requires 2 or 3 task-waits
+  // depending on whether the seccomp event fires before the syscall-entry
+  // event.
+  // Use the slow path when running under rr, because the rr recording us
+  // needs to see and trace these tracee syscalls, and if they're untraced by
+  // us they're also untraced by the outer rr.
+  // Use the slow path if SIGTRAP is blocked or ignored because otherwise
+  // the PTRACE_SINGLESTEP will cause the kernel to unblock it.
+  setup_path(t->vm()->has_rr_page() && !running_under_rr() &&
+             is_SIGTRAP_default_and_unblocked(t));
   if (enable_mem_params == ENABLE_MEMORY_PARAMS) {
     maybe_fix_stack_pointer();
   }
+}
+
+void AutoRemoteSyscalls::setup_path(bool enable_singlestep_path) {
+  if (!replaced_bytes.empty()) {
+    t->write_mem(remote_ptr<uint8_t>(initial_regs.ip().to_data_ptr<uint8_t>()),
+                 replaced_bytes.data(), replaced_bytes.size());
+  }
+
+  remote_code_ptr syscall_ip;
+  use_singlestep_path = enable_singlestep_path;
+  if (enable_singlestep_path) {
+    syscall_ip = AddressSpace::rr_page_syscall_entry_point(
+        AddressSpace::UNTRACED, AddressSpace::PRIVILEGED,
+        AddressSpace::RECORDING_AND_REPLAY, t->arch());
+    use_singlestep_path = true;
+  } else {
+    syscall_ip = t->vm()->traced_syscall_ip();
+  }
+  initial_regs.set_ip(syscall_ip);
 
   // We need to make sure to clear any breakpoints or other alterations of
   // the syscall instruction we're using. Note that the tracee may have set its
@@ -113,7 +153,7 @@ void AutoRemoteSyscalls::maybe_fix_stack_pointer() {
   }
 
   MemoryRange found_stack;
-  for (auto m : t->vm()->maps()) {
+  for (const auto& m : t->vm()->maps()) {
     if (is_usable_area(m.map)) {
       found_stack = m.map;
       break;
@@ -131,7 +171,7 @@ void AutoRemoteSyscalls::maybe_fix_stack_pointer() {
   }
 
   fixed_sp = found_stack.end();
-  assert(!fixed_sp.is_null());
+  DEBUG_ASSERT(!fixed_sp.is_null());
   initial_regs.set_sp(fixed_sp);
 }
 
@@ -145,62 +185,114 @@ void AutoRemoteSyscalls::restore_state_to(Task* t) {
                               4096);
   }
   if (!replaced_bytes.empty()) {
-    t->write_mem(remote_ptr<uint8_t>(
-                     t->vm()->traced_syscall_ip().to_data_ptr<uint8_t>()),
+    t->write_mem(remote_ptr<uint8_t>(initial_regs.ip().to_data_ptr<uint8_t>()),
                  replaced_bytes.data(), replaced_bytes.size());
   }
-  initial_regs.set_ip(initial_ip);
-  initial_regs.set_sp(initial_sp);
+  auto regs = initial_regs;
+  regs.set_ip(initial_ip);
+  regs.set_sp(initial_sp);
   // Restore stomped registers.
-  t->set_regs(initial_regs);
-
-  // If the task's current status is ours, discard it. But if the syscall
-  // triggered side effects (e.g. an exit_group), leave it.
-  if (t->status().is_syscall()) {
-    t->set_status(initial_wait_status);
-  }
+  t->set_regs(regs);
+  t->set_status(restore_wait_status);
 }
 
-void AutoRemoteSyscalls::syscall_helper(SyscallWaiting wait, int syscallno,
-                                        Registers& callregs) {
+static bool ignore_signal(Task* t) {
+  int sig = t->stop_sig();
+  if (!sig) {
+    return false;
+  }
+  if (t->session().is_replaying()) {
+    if (ReplaySession::is_ignored_signal(sig)) {
+      return true;
+    }
+  } else if (t->session().is_recording()) {
+    if (sig != SYSCALLBUF_DESCHED_SIGNAL) {
+      static_cast<RecordTask*>(t)->stash_sig();
+    }
+    return true;
+  }
+  ASSERT(t, false) << "Unexpected signal " << signal_name(sig);
+  return false;
+}
+
+long AutoRemoteSyscalls::syscall_base(int syscallno, Registers& callregs) {
   LOG(debug) << "syscall " << syscall_name(syscallno, t->arch());
+
+  if ((int)callregs.arg1() == SIGTRAP && use_singlestep_path &&
+      (is_sigaction_syscall(syscallno, t->arch()) ||
+       is_rt_sigaction_syscall(syscallno, t->arch()) ||
+       is_signal_syscall(syscallno, t->arch()))) {
+    // Don't use the fast path if we're about to set up a signal handler
+    // for SIGTRAP!
+    LOG(debug) << "Disabling singlestep path due to SIGTRAP sigaction";
+    setup_path(false);
+    callregs.set_ip(initial_regs.ip());
+  }
 
   callregs.set_syscallno(syscallno);
   t->set_regs(callregs);
 
-  t->enter_syscall();
-
-  ASSERT(t, t->regs().ip() - callregs.ip() ==
-                syscall_instruction_length(t->arch()))
-      << "Should have advanced ip by one syscall_insn";
-
-  ASSERT(t, t->regs().original_syscallno() == syscallno)
-      << "Should be entering " << t->syscall_name(syscallno)
-      << ", but instead at " << t->syscall_name(t->regs().original_syscallno());
-
-  // Start running the syscall.
-  pending_syscallno = syscallno;
-  t->resume_execution(RESUME_SYSCALL, RESUME_NONBLOCKING, RESUME_NO_TICKS);
-  if (WAIT == wait) {
-    wait_syscall(syscallno);
+  if (use_singlestep_path) {
+    while (true) {
+      t->resume_execution(RESUME_SINGLESTEP, RESUME_WAIT, RESUME_NO_TICKS);
+      LOG(debug) << "Used singlestep path; status=" << t->status();
+      // When a PTRACE_EVENT_EXIT is returned we don't update registers
+      if (t->ip() != callregs.ip()) {
+        // We entered the syscall, so stop now
+        break;
+      }
+      if (ignore_signal(t)) {
+        // We were interrupted by a signal before we even entered the syscall
+        continue;
+      }
+      ASSERT(t, false) << "Unexpected status " << t->status();
+    }
+  } else {
+    t->enter_syscall();
+    LOG(debug) << "Used enter_syscall; status=" << t->status();
+    // proceed to syscall exit
+    t->resume_execution(RESUME_SYSCALL, RESUME_WAIT, RESUME_NO_TICKS);
+    LOG(debug) << "syscall exit status=" << t->status();
   }
-}
-
-void AutoRemoteSyscalls::wait_syscall(int syscallno) {
-  ASSERT(t, pending_syscallno == syscallno || syscallno < 0);
-
-  // Wait for syscall-exit trap (or PTRACE_EVENT_* trap).
-  // XXX we should handle stray signals here!
-  t->wait();
-  pending_syscallno = -1;
+  while (true) {
+    // If the syscall caused the task to exit, just stop now with that status.
+    if (t->ptrace_event() == PTRACE_EVENT_EXIT) {
+      restore_wait_status = t->status();
+      break;
+    }
+    if (t->status().is_syscall() ||
+        (t->stop_sig() == SIGTRAP &&
+         is_kernel_trap(t->get_siginfo().si_code))) {
+      // If we got a SIGTRAP then we assume that's our singlestep and we're
+      // done.
+      break;
+    }
+    if (is_clone_syscall(syscallno, t->arch()) &&
+        t->clone_syscall_is_complete(&new_tid_, t->arch())) {
+      t->resume_execution(RESUME_SYSCALL, RESUME_WAIT, RESUME_NO_TICKS);
+      LOG(debug) << "got clone event; new status=" << t->status();
+      continue;
+    }
+    if (ignore_signal(t)) {
+      if (t->regs().syscall_may_restart()) {
+        t->enter_syscall();
+        LOG(debug) << "signal ignored; restarting syscall, status="
+                   << t->status();
+        t->resume_execution(RESUME_SYSCALL, RESUME_WAIT, RESUME_NO_TICKS);
+        LOG(debug) << "syscall exit status=" << t->status();
+        continue;
+      }
+      LOG(debug) << "signal ignored";
+      // We have been notified of a signal after a non-interruptible syscall
+      // completed. Don't continue, we're done here.
+      break;
+    }
+    ASSERT(t, false) << "Unexpected status " << t->status();
+    break;
+  }
 
   LOG(debug) << "done, result=" << t->regs().syscall_result();
-
-  ASSERT(t, t->regs().original_syscallno() == syscallno || syscallno < 0)
-      << "Should be entering " << t->syscall_name(syscallno)
-      << ", but instead at " << t->syscall_name(t->regs().original_syscallno());
-
-  t->canonicalize_and_set_regs(t->regs(), t->arch());
+  return t->regs().syscall_result();
 }
 
 SupportedArch AutoRemoteSyscalls::arch() const { return t->arch(); }
@@ -224,7 +316,9 @@ static remote_ptr<void> allocate(remote_ptr<void>* buf_end,
                                  size_t size) {
   remote_ptr<void> r = *buf_end;
   *buf_end += align_size(size);
-  assert(size_t(*buf_end - remote_buf.get()) <= remote_buf.size());
+  if (size_t(*buf_end - remote_buf.get()) > remote_buf.size()) {
+    FATAL() << "overflow";
+  }
   return r;
 }
 
@@ -276,17 +370,17 @@ static int child_create_socket(AutoRemoteSyscalls& remote,
 }
 
 template <typename Arch>
-static void child_connect_socket(AutoRemoteSyscalls& remote,
-                                 AutoRestoreMem& remote_buf,
-                                 remote_ptr<socketcall_args<Arch>> sc_args,
-                                 remote_ptr<void> buf_end, int child_sock,
-                                 const char* path, int* cwd_fd) {
+static int child_connect_socket(AutoRemoteSyscalls& remote,
+                                AutoRestoreMem& remote_buf,
+                                remote_ptr<socketcall_args<Arch>> sc_args,
+                                remote_ptr<void> buf_end, int child_sock,
+                                const char* path, int* cwd_fd) {
   typename Arch::sockaddr_un addr;
   memset(&addr, 0, sizeof(addr)); // Make valgrind happy.
   addr.sun_family = AF_UNIX;
-  assert(strlen(path) < sizeof(addr.sun_path));
+  DEBUG_ASSERT(strlen(path) < sizeof(addr.sun_path));
   // Skip leading '/' since we're going to access this relative to the root
-  assert(path[0] == '/');
+  DEBUG_ASSERT(path[0] == '/');
   strcpy(addr.sun_path, path + 1);
 
   auto tmp_buf_end = buf_end;
@@ -305,22 +399,13 @@ static void child_connect_socket(AutoRemoteSyscalls& remote,
 
   auto remote_addr = allocate<typename Arch::sockaddr_un>(&buf_end, remote_buf);
   remote.task()->write_mem(remote_addr, addr);
-  Registers callregs = remote.regs();
-  int remote_syscall;
   if (sc_args.is_null()) {
-    callregs.set_arg1(child_sock);
-    callregs.set_arg2(remote_addr);
-    callregs.set_arg3(sizeof(addr));
-    remote_syscall = Arch::connect;
+    return remote.syscall(Arch::connect, child_sock, remote_addr, sizeof(addr));
   } else {
     write_socketcall_args<Arch>(remote.task(), sc_args, child_sock,
                                 remote_addr.as_int(), sizeof(addr));
-    callregs.set_arg1(SYS_CONNECT);
-    callregs.set_arg2(sc_args);
-    remote_syscall = Arch::socketcall;
+    return remote.syscall(Arch::socketcall, SYS_CONNECT, sc_args);
   }
-  remote.syscall_helper(AutoRemoteSyscalls::DONT_WAIT, remote_syscall,
-                        callregs);
 }
 
 // Restore tracee CWD. Its CWD is currently rr's root.
@@ -351,7 +436,7 @@ static void restore_cwd(AutoRemoteSyscalls& remote, int cwd_fd) {
 }
 
 template <typename Arch>
-static void child_sendmsg(AutoRemoteSyscalls& remote,
+static long child_sendmsg(AutoRemoteSyscalls& remote,
                           AutoRestoreMem& remote_buf,
                           remote_ptr<socketcall_args<Arch>> sc_args,
                           remote_ptr<void> buf_end, int child_sock, int fd) {
@@ -390,22 +475,13 @@ static void child_sendmsg(AutoRemoteSyscalls& remote,
   *static_cast<int*>(Arch::cmsg_data(cmsg)) = fd;
   remote.task()->write_bytes_helper(remote_cmsgbuf, sizeof(cmsgbuf), &cmsgbuf);
 
-  Registers callregs = remote.regs();
-  int remote_syscall;
   if (sc_args.is_null()) {
-    callregs.set_arg1(child_sock);
-    callregs.set_arg2(remote_msg);
-    callregs.set_arg3(0);
-    remote_syscall = Arch::sendmsg;
+    return remote.syscall(Arch::sendmsg, child_sock, remote_msg, 0);
   } else {
     write_socketcall_args<Arch>(remote.task(), sc_args, child_sock,
                                 remote_msg.as_int(), 0);
-    callregs.set_arg1(SYS_SENDMSG);
-    callregs.set_arg2(sc_args);
-    remote_syscall = Arch::socketcall;
+    return remote.syscall(Arch::socketcall, SYS_SENDMSG, sc_args);
   }
-  remote.syscall_helper(AutoRemoteSyscalls::DONT_WAIT, remote_syscall,
-                        callregs);
 }
 
 static int recvmsg_socket(int sock) {
@@ -427,14 +503,20 @@ static int recvmsg_socket(int sock) {
   }
 
   struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
-  assert(cmsg && cmsg->cmsg_level == SOL_SOCKET &&
-         cmsg->cmsg_type == SCM_RIGHTS);
+  DEBUG_ASSERT(cmsg && cmsg->cmsg_level == SOL_SOCKET &&
+               cmsg->cmsg_type == SCM_RIGHTS);
   int our_fd = *(int*)CMSG_DATA(cmsg);
-  assert(our_fd >= 0);
+  DEBUG_ASSERT(our_fd >= 0);
   return our_fd;
 }
 
 template <typename T> static size_t reserve() { return align_size(sizeof(T)); }
+
+static void* do_accept(void* p) {
+  int fd = intptr_t(p);
+  int sock = accept(fd, nullptr, nullptr);
+  return (void*)intptr_t(sock);
+}
 
 template <typename Arch> ScopedFd AutoRemoteSyscalls::retrieve_fd_arch(int fd) {
   size_t data_length = std::max(reserve<typename Arch::sockaddr_un>(),
@@ -459,17 +541,40 @@ template <typename Arch> ScopedFd AutoRemoteSyscalls::retrieve_fd_arch(int fd) {
 
   int listen_sock = create_bind_and_listen_socket(path);
   int child_sock = child_create_socket(*this, sc_args);
-  int cwd_fd;
+
+  // There's a tricky potential deadlock here. We need to puppet the tracee's
+  // connect() syscall and at the same time accept() it from our process; the
+  // tracee's connect() cannot complete until our accept() has happened.
+  // We could launch the tracee connect() syscall and then do a blocking
+  // accept() here before waiting for the connect() to complete, but then there
+  // is a risk that a rogue signal could interrupt the tracee's connect(),
+  // putting it in a ptrace-stop which we never detect because our accept()
+  // never finishes.
+  // A simple safe way to avoid the deadlock is to create our own temporary
+  // thread to do the accept(). That lets us treat the connect() call like
+  // any other blocking tracee AutoRemoteSyscall. If this were to become a
+  // performance problem, the best solution would probably to be to keep a
+  // dedicated accept-thread around.
+
+  pthread_t accept_thread;
+  int ret = pthread_create(&accept_thread, nullptr, do_accept,
+                           (void*)intptr_t(listen_sock));
+  ASSERT(t, ret >= 0) << "Cannot create helper thread";
+
   // This changes the CWD of the tracee to rr's root (via RR_RESERVED_ROOT_FD).
   // The old cwd is available in cwd_fd except in bizarre situations where the
   // child cannot open its own CWD, in which case cwd_fd is -1.
-  child_connect_socket(*this, remote_buf, sc_args, sc_args_end, child_sock,
-                       path, &cwd_fd);
-  // Now the child is waiting for us to accept it.
-  int sock = accept(listen_sock, nullptr, nullptr);
-  if (sock < 0) {
-    FATAL() << "Failed to create parent socket";
-  }
+  int cwd_fd;
+  int child_connect = child_connect_socket(
+      *this, remote_buf, sc_args, sc_args_end, child_sock, path, &cwd_fd);
+  ASSERT(t, child_connect == 0)
+      << "Failed to connect child socket, err=" << errno_name(-child_connect);
+
+  void* thread_ret;
+  ret = pthread_join(accept_thread, &thread_ret);
+  ASSERT(t, ret == 0) << "Cannot join helper thread";
+  int sock = intptr_t(thread_ret);
+  ASSERT(t, sock >= 0) << "Failed to create parent socket";
 
   // Verify that the child's PID is correct. This is a world-writeable socket
   // so anyone could connect, and this check is vital.
@@ -477,40 +582,29 @@ template <typename Arch> ScopedFd AutoRemoteSyscalls::retrieve_fd_arch(int fd) {
   cred.pid = -1;
   socklen_t credlen = sizeof(cred);
   if (getsockopt(sock, SOL_SOCKET, SO_PEERCRED, &cred, &credlen) < 0) {
-    FATAL() << "Failed SO_PEERCRED";
+    ASSERT(t, false) << "Failed SO_PEERCRED";
   }
   ASSERT(t, credlen == sizeof(cred));
-  if (cred.pid != task()->real_tgid()) {
+  if (cred.pid != t->real_tgid()) {
     FATAL() << "Some other process connected to our socket!!!";
   }
 
-  // Complete child's connect() syscall
-  wait_syscall();
-  int child_syscall_result = t->regs().syscall_result_signed();
-  if (child_syscall_result) {
-    FATAL() << "Failed to connect() in tracee; err="
-            << errno_name(-child_syscall_result);
-  }
   // Restore the child's CWD to what it used to be.
   restore_cwd<Arch>(*this, cwd_fd);
 
   // Listening socket not needed anymore
   close(listen_sock);
   unlink(path);
-  child_sendmsg(*this, remote_buf, sc_args, sc_args_end, child_sock, fd);
-  wait_syscall();
-  child_syscall_result = t->regs().syscall_result_signed();
-  if (0 >= child_syscall_result) {
-    FATAL() << "Failed to sendmsg() in tracee; err="
-            << errno_name(-child_syscall_result);
-  }
+  long child_syscall_result =
+      child_sendmsg(*this, remote_buf, sc_args, sc_args_end, child_sock, fd);
+  ASSERT(t, child_syscall_result > 0) << "Failed to sendmsg() in tracee; err="
+                                      << errno_name(-child_syscall_result);
   // Child may be waiting on our recvmsg().
   int our_fd = recvmsg_socket(sock);
 
   child_syscall_result = infallible_syscall(Arch::close, child_sock);
-  if (0 > close(sock)) {
-    FATAL() << "Failed to close parent socket";
-  }
+  ret = close(sock);
+  ASSERT(t, ret == 0) << "Failed to close parent socket";
 
   return ScopedFd(our_fd);
 }
@@ -552,13 +646,12 @@ int64_t AutoRemoteSyscalls::infallible_lseek_syscall(int fd, int64_t offset,
       return infallible_syscall(syscall_number_for_lseek(arch()), fd, offset,
                                 whence);
     default:
-      ASSERT(task(), false) << "Unknown arch";
+      ASSERT(t, false) << "Unknown arch";
       return -1;
   }
 }
 
-void AutoRemoteSyscalls::check_syscall_result(int syscallno) {
-  long ret = t->regs().syscall_result_signed();
+void AutoRemoteSyscalls::check_syscall_result(long ret, int syscallno) {
   if (-4096 < ret && ret < 0) {
     string extra_msg;
     if (is_open_syscall(syscallno, arch())) {

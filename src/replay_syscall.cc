@@ -3,7 +3,6 @@
 #include "replay_syscall.h"
 
 #include <asm/prctl.h>
-#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/futex.h>
@@ -16,7 +15,11 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
+#include <sys/wait.h>
 #include <syscall.h>
+#include <cstdint>
+
+#include <Python.h>
 
 #include <array>
 #include <initializer_list>
@@ -38,13 +41,16 @@
 #include "ReplayTask.h"
 #include "SeccompFilterRewriter.h"
 #include "StdioMonitor.h"
-#include "TaskGroup.h"
+#include "ThreadGroup.h"
 #include "TraceStream.h"
 #include "VirtualPerfCounterMonitor.h"
+#include "core.h"
 #include "kernel_abi.h"
 #include "kernel_metadata.h"
 #include "log.h"
 #include "util.h"
+
+extern PyObject* process_brk_func;
 
 /* Uncomment this to check syscall names and numbers defined in syscalls.py
    against the definitions in unistd.h. This may cause the build to fail
@@ -81,30 +87,49 @@ static string maybe_dump_written_string(ReplayTask* t) {
  * Proceeds until the next system call, which is being executed.
  */
 static void __ptrace_cont(ReplayTask* t, ResumeRequest resume_how,
-                          int expect_syscallno, int expect_syscallno2 = -1,
-                          pid_t new_tid = -1) {
-  do {
-    t->resume_execution(resume_how, RESUME_NONBLOCKING, RESUME_NO_TICKS);
-    if (new_tid > 0) {
-      // Set new tid before we wait, so we wait for the right task.
-      // XXX maybe a signal could arrive and be delivered to the task before
-      // its tid changes, so we hang? Hope not!
+                          SupportedArch syscall_arch, int expect_syscallno,
+                          int expect_syscallno2 = -1, pid_t new_tid = -1) {
+  t->resume_execution(resume_how, RESUME_NONBLOCKING, RESUME_NO_TICKS);
+  while (true) {
+    if (t->wait_unexpected_exit()) {
+      break;
+    }
+    int raw_status;
+    // Do our own waitpid instead of calling Task::wait() so we can detect and
+    // handle tid changes due to off-main-thread execve.
+    // When we're expecting a tid change, we can't pass a tid here because we
+    // don't know which tid to wait for.
+    // Passing the original tid seems to cause a hang in some kernels
+    // (e.g. 4.10.0-19-generic) if the tid change races with our waitpid
+    int ret = waitpid(new_tid >= 0 ? -1 : t->tid, &raw_status, __WALL);
+    ASSERT(t, ret >= 0);
+    if (ret == new_tid) {
+      // Check that we only do this once
+      ASSERT(t, t->tid != new_tid);
       // Update the serial as if this task was really created by cloning the old
       // task.
       t->set_real_tid_and_update_serial(new_tid);
     }
-    t->wait();
-  } while (ReplaySession::is_ignored_signal(t->status().stop_sig()));
+    ASSERT(t, ret == t->tid);
+    t->did_waitpid(WaitStatus(raw_status));
 
-  ASSERT(t, !t->stop_sig()) << "Expected no pending signal, but got "
-                            << t->stop_sig();
+    if (ReplaySession::is_ignored_signal(t->status().stop_sig())) {
+      t->resume_execution(resume_how, RESUME_NONBLOCKING, RESUME_NO_TICKS);
+    } else {
+      break;
+    }
+  }
+
+  ASSERT(t, !t->stop_sig())
+      << "Expected no pending signal, but got " << t->stop_sig();
 
   /* check if we are synchronized with the trace -- should never fail */
   int current_syscall = t->regs().original_syscallno();
-  ASSERT(t, current_syscall == expect_syscallno ||
-                current_syscall == expect_syscallno2)
-      << "Should be at " << t->syscall_name(expect_syscallno)
-      << ", but instead at " << t->syscall_name(current_syscall)
+  ASSERT(t,
+         current_syscall == expect_syscallno ||
+             current_syscall == expect_syscallno2)
+      << "Should be at " << syscall_name(expect_syscallno, syscall_arch)
+      << ", but instead at " << syscall_name(current_syscall, syscall_arch)
       << maybe_dump_written_string(t);
 }
 
@@ -118,8 +143,9 @@ static void init_scratch_memory(ReplayTask* t, const KernelMapping& km,
   // Make the scratch buffer read/write during replay so that
   // preload's sys_read can use it to buffer cloned data.
   ASSERT(t, (km.prot() & (PROT_READ | PROT_WRITE)) == (PROT_READ | PROT_WRITE));
-  ASSERT(t, (km.flags() & (MAP_PRIVATE | MAP_ANONYMOUS)) ==
-                (MAP_PRIVATE | MAP_ANONYMOUS));
+  ASSERT(t,
+         (km.flags() & (MAP_PRIVATE | MAP_ANONYMOUS)) ==
+             (MAP_PRIVATE | MAP_ANONYMOUS));
 
   {
     AutoRemoteSyscalls remote(t);
@@ -147,8 +173,9 @@ static void init_scratch_memory(ReplayTask* t, const KernelMapping& km,
  */
 static void maybe_noop_restore_syscallbuf_scratch(ReplayTask* t) {
   if (t->is_in_untraced_syscall()) {
+    // Untraced syscalls always have t's arch
     LOG(debug) << "  noop-restoring scratch for write-only desched'd "
-               << t->syscall_name(t->regs().original_syscallno());
+               << syscall_name(t->regs().original_syscallno(), t->arch());
     t->set_data_from_trace();
   }
 }
@@ -156,15 +183,15 @@ static void maybe_noop_restore_syscallbuf_scratch(ReplayTask* t) {
 static TraceTaskEvent read_task_trace_event(ReplayTask* t,
                                             TraceTaskEvent::Type type) {
   TraceTaskEvent tte;
-  while (true) {
-    ASSERT(t, t->trace_reader().good()) << "Unable to find TraceTaskEvent; "
-                                           "trace is corrupt (did you kill -9 "
-                                           "rr?)";
-    tte = t->trace_reader().read_task_event();
-    if (tte.type() == type) {
-      break;
-    }
-  }
+  FrameTime time;
+  do {
+    tte = t->trace_reader().read_task_event(&time);
+    ASSERT(t, tte.type() != TraceTaskEvent::NONE)
+        << "Unable to find TraceTaskEvent; "
+           "trace is corrupt (did you kill -9 "
+           "rr?)";
+  } while (tte.type() != type || time < t->current_frame_time());
+  ASSERT(t, time == t->current_frame_time());
   return tte;
 }
 
@@ -213,19 +240,20 @@ template <typename Arch> static void prepare_clone(ReplayTask* t) {
   Registers entry_regs = r;
 
   // Run; we will be interrupted by PTRACE_EVENT_CLONE/FORK/VFORK.
-  __ptrace_cont(t, RESUME_CONT, sys);
+  __ptrace_cont(t, RESUME_CONT, Arch::arch(), sys);
 
-  while (!t->clone_syscall_is_complete()) {
+  pid_t new_tid;
+  while (!t->clone_syscall_is_complete(&new_tid, Arch::arch())) {
     // clone() calls sometimes fail with -EAGAIN due to load issues or
     // whatever. We need to retry the system call until it succeeds. Reset
     // state to try the syscall again.
     ASSERT(t, t->regs().syscall_result_signed() == -EAGAIN);
     t->set_regs(entry_regs);
-    __ptrace_cont(t, RESUME_CONT, sys);
+    __ptrace_cont(t, RESUME_CONT, Arch::arch(), sys);
   }
 
   // Get out of the syscall
-  __ptrace_cont(t, RESUME_SYSCALL, sys);
+  __ptrace_cont(t, RESUME_SYSCALL, Arch::arch(), sys);
 
   ASSERT(t, !t->ptrace_event())
       << "Unexpected ptrace event while waiting for syscall exit; got "
@@ -240,15 +268,16 @@ template <typename Arch> static void prepare_clone(ReplayTask* t) {
   // Pretend we're still in the system call
   r.set_syscall_result(-ENOSYS);
   r.set_original_syscallno(trace_frame.regs().original_syscallno());
-  t->canonicalize_and_set_regs(r, trace_frame.event().Syscall().arch());
+  t->set_regs(r);
+  t->canonicalize_regs(trace_frame.event().Syscall().arch());
 
   // Dig the recorded tid out out of the trace. The tid value returned in
   // the recorded registers could be in a different pid namespace from rr's,
   // so we can't use it directly.
   TraceTaskEvent tte = read_task_trace_event(t, TraceTaskEvent::CLONE);
-  ASSERT(t, tte.parent_tid() == t->rec_tid);
+  ASSERT(t, tte.parent_tid() == t->rec_tid)
+      << "Expected tid " << t->rec_tid << ", got " << tte.parent_tid();
   long rec_tid = tte.tid();
-  pid_t new_tid = t->get_ptrace_eventmsg<pid_t>();
 
   CloneParameters params;
   if (Arch::clone == t->regs().original_syscallno()) {
@@ -267,7 +296,7 @@ template <typename Arch> static void prepare_clone(ReplayTask* t) {
       t->set_data_from_trace();
       new_task->set_data_from_trace();
     } else {
-      assert(Arch::clone_tls_type == Arch::PthreadStructurePointer);
+      DEBUG_ASSERT(Arch::clone_tls_type == Arch::PthreadStructurePointer);
     }
     new_task->set_data_from_trace();
     new_task->set_data_from_trace();
@@ -278,7 +307,8 @@ template <typename Arch> static void prepare_clone(ReplayTask* t) {
   new_r.set_original_syscallno(trace_frame.regs().original_syscallno());
   new_r.set_arg1(trace_frame.regs().arg1());
   new_r.set_arg2(trace_frame.regs().arg2());
-  new_task->canonicalize_and_set_regs(new_r, new_task->arch());
+  new_task->set_regs(new_r);
+  new_task->canonicalize_regs(new_task->arch());
 
   if (Arch::clone != t->regs().original_syscallno() || !(CLONE_VM & r.arg1())) {
     // It's hard to imagine a scenario in which it would
@@ -289,7 +319,7 @@ template <typename Arch> static void prepare_clone(ReplayTask* t) {
     new_task->vm()->remove_all_watchpoints();
 
     AutoRemoteSyscalls remote(new_task);
-    for (auto m : t->vm()->maps()) {
+    for (const auto& m : t->vm()->maps()) {
       // Recreate any tracee-shared mappings
       if (m.local_addr &&
           !(m.flags & (AddressSpace::Mapping::IS_THREAD_LOCALS |
@@ -446,6 +476,7 @@ static void process_execve(ReplayTask* t, const TraceFrame& trace_frame,
   /* The original_syscallno is execve in the old architecture. The kernel does
    * not update the original_syscallno when the architecture changes across
    * an exec.
+   * We're using the dedicated traced-syscall IP so its arch is t's arch.
    */
   int expect_syscallno = syscall_number_for_execve(t->arch());
   regs.set_syscallno(expect_syscallno);
@@ -453,13 +484,13 @@ static void process_execve(ReplayTask* t, const TraceFrame& trace_frame,
 
   LOG(debug) << "Beginning execve";
   /* Enter our execve syscall. */
-  __ptrace_cont(t, RESUME_SYSCALL, expect_syscallno);
+  __ptrace_cont(t, RESUME_SYSCALL, t->arch(), expect_syscallno);
   ASSERT(t, !t->stop_sig()) << "Stub exec failed on entry";
   /* Complete the syscall. The tid of the task will be the thread-group-leader
    * tid, no matter what tid it was before.
    */
-  pid_t tgid = t->task_group()->real_tgid;
-  __ptrace_cont(t, RESUME_SYSCALL, expect_syscallno,
+  pid_t tgid = t->thread_group()->real_tgid;
+  __ptrace_cont(t, RESUME_SYSCALL, t->arch(), expect_syscallno,
                 syscall_number_for_execve(trace_frame.regs().arch()),
                 tgid == t->tid ? -1 : tgid);
   if (t->regs().syscall_result()) {
@@ -484,15 +515,11 @@ static void process_execve(ReplayTask* t, const TraceFrame& trace_frame,
   vector<KernelMapping> kms;
   vector<TraceReader::MappedData> datas;
 
+  TraceTaskEvent tte = read_task_trace_event(t, TraceTaskEvent::EXEC);
+
   // Find the text mapping of the main executable. This is complicated by the
   // fact that the kernel also loads the dynamic linker (if the main
-  // executable specifies an interpreter). To disambiguate, we use the
-  // following criterion: The dynamic linker (if it exists) is a different file
-  // (identified via fsname) that has an executable segment that contains the
-  // ip. To compute this, we find (up to) two kms that have different fsnames
-  // but do each have an executable segment, as well as the km that contains
-  // the ip. This is slightly complicated, but should handle the case where
-  // either file has more than one exectuable segment.
+  // executable specifies an interpreter).
   ssize_t exe_km_option1 = -1, exe_km_option2 = -1, rip_km = -1;
   while (true) {
     TraceReader::MappedData data;
@@ -506,28 +533,43 @@ static void process_execve(ReplayTask* t, const TraceFrame& trace_frame,
       // Skip rr-page mapping record, that gets mapped automatically
       continue;
     }
-    const string& file_name = km.fsname();
-    if ((km.prot() & PROT_EXEC) && file_name.size() > 0 &&
-        // Make sure to exclude [vdso] (and similar) and executable stacks.
-        file_name[0] != '[') {
-      if (exe_km_option1 == -1) {
+
+    if (tte.exe_base()) {
+      // We recorded the executable's start address so we can just use that
+      if (tte.exe_base() == km.start()) {
         exe_km_option1 = kms.size();
-      } else if (exe_km_option2 == -1 &&
-                 kms[exe_km_option1].fsname() != file_name) {
-        exe_km_option2 = kms.size();
-      } else {
-        ASSERT(t, kms[exe_km_option1].fsname() == file_name ||
-                      kms[exe_km_option2].fsname() == file_name);
       }
-    }
-    if (km.contains(trace_frame.regs().ip().to_data_ptr<void>())) {
-      rip_km = kms.size();
+    } else {
+      // To disambiguate, we use the following criterion: The dynamic linker
+      // (if it exists) is a different file (identified via fsname) that has
+      // an executable segment that contains the ip. To compute this, we find
+      // (up to) two kms that have different fsnames but do each have an
+      // executable segment, as well as the km that contains the ip. This is
+      // slightly complicated, but should handle the case where either file has
+      // more than one exectuable segment.
+      const string& file_name = km.fsname();
+      if ((km.prot() & PROT_EXEC) && file_name.size() > 0 &&
+          // Make sure to exclude [vdso] (and similar) and executable stacks.
+          file_name[0] != '[') {
+        if (exe_km_option1 == -1) {
+          exe_km_option1 = kms.size();
+        } else if (exe_km_option2 == -1 &&
+                   kms[exe_km_option1].fsname() != file_name) {
+          exe_km_option2 = kms.size();
+        } else {
+          ASSERT(t,
+                 kms[exe_km_option1].fsname() == file_name ||
+                     kms[exe_km_option2].fsname() == file_name);
+        }
+      }
+      if (km.contains(trace_frame.regs().ip().to_data_ptr<void>())) {
+        rip_km = kms.size();
+      }
     }
     kms.push_back(km);
     datas.push_back(data);
   }
 
-  ASSERT(t, rip_km >= 0) << "No mapping contains the ip?";
   ASSERT(t, exe_km_option1 >= 0) << "No executable mapping?";
 
   ssize_t exe_km = exe_km_option1;
@@ -541,7 +583,6 @@ static void process_execve(ReplayTask* t, const TraceFrame& trace_frame,
 
   ASSERT(t, kms[0].is_stack()) << "Can't find stack";
 
-  TraceTaskEvent tte = read_task_trace_event(t, TraceTaskEvent::EXEC);
   // The exe name we pass in here will be passed to gdb. Pass the backing file
   // name if there is one, otherwise pass the original file name (which means
   // we declined to copy it to the trace file during recording for whatever
@@ -549,7 +590,10 @@ static void process_execve(ReplayTask* t, const TraceFrame& trace_frame,
   const string& exe_name = datas[exe_km].file_name.empty()
                                ? kms[exe_km].fsname()
                                : datas[exe_km].file_name;
-  t->post_exec_syscall(exe_name, tte);
+  t->post_exec_syscall(exe_name);
+
+  t->fd_table()->close_after_exec(
+      t, t->current_trace_frame().event().Syscall().exec_fds_to_close);
 
   {
     // Tell AutoRemoteSyscalls that we don't need memory parameters. This will
@@ -560,7 +604,7 @@ static void process_execve(ReplayTask* t, const TraceFrame& trace_frame,
     // Now fix up the address space. First unmap all the mappings other than
     // our rr page.
     vector<MemoryRange> unmaps;
-    for (auto m : t->vm()->maps()) {
+    for (const auto& m : t->vm()->maps()) {
       // Do not attempt to unmap [vsyscall] --- it doesn't work.
       if (m.map.start() != AddressSpace::rr_page_start() &&
           m.map.start() != AddressSpace::preload_thread_locals_start() &&
@@ -619,6 +663,7 @@ static void process_brk(ReplayTask* t) {
   TraceReader::MappedData data;
   KernelMapping km = t->trace_reader().read_mapped_region(&data);
   // Zero flags means it's an an unmap, or no change.
+  rrdump_process_brk(km);
   if (km.flags()) {
     AutoRemoteSyscalls remote(t);
     ASSERT(t, data.source == TraceReader::SOURCE_ZERO);
@@ -635,6 +680,39 @@ static void process_brk(ReplayTask* t) {
                               km.size());
     t->vm()->unmap(t, km.start(), km.size());
   }
+}
+
+void rrdump_process_brk(KernelMapping km) {
+    PyObject* flags_obj;
+    PyObject* start_obj;
+    PyObject* size_obj;
+    PyObject* prot_obj;
+
+    if((flags_obj = PyInt_FromLong((long)km.flags())) == NULL) {
+        std::cerr << "failed to parse flags into PyInt" << std::endl;
+    }
+    if((start_obj = PyInt_FromLong((long)km.start().as_int())) == NULL) {
+        std::cerr << "failed to parse start into PyInt" << std::endl;
+    }
+    if((size_obj = PyInt_FromLong((long)km.size())) == NULL) {
+        std::cerr << "failed to parse size into PyInt" << std::endl;
+    }
+    if((prot_obj = PyInt_FromLong((long)km.prot())) == NULL) {
+        std::cerr << "failed to parse prot into PyInt" << std::endl;
+    }
+    if(PyObject_CallFunctionObjArgs(process_brk_func,
+                                    flags_obj,
+                                    start_obj,
+                                    size_obj,
+                                    prot_obj,
+                                    NULL) == NULL) {
+        std::cerr << "Calling process brk failed" << std::endl;
+        PyErr_Print();
+    }
+    Py_DECREF(flags_obj);
+    Py_DECREF(start_obj);
+    Py_DECREF(size_obj);
+    Py_DECREF(prot_obj);
 }
 
 /**
@@ -794,8 +872,9 @@ static void finish_shared_mmap(ReplayTask* t, AutoRemoteSyscalls& remote,
 
   if (fd >= 0) {
     if (t->fd_table()->is_monitoring(fd)) {
-      ASSERT(t, t->fd_table()->get_monitor(fd)->type() ==
-                    FileMonitor::Type::Mmapped);
+      ASSERT(t,
+             t->fd_table()->get_monitor(fd)->type() ==
+                 FileMonitor::Type::Mmapped);
       ((MmappedFileMonitor*)t->fd_table()->get_monitor(fd))->revive();
     } else {
       t->fd_table()->add_monitor(fd, new MmappedFileMonitor(t, emufile));
@@ -911,7 +990,7 @@ static void process_mremap(ReplayTask* t, const TraceFrame& trace_frame,
   // is still the case.)
   if (found && data.source == TraceReader::SOURCE_TRACE) {
     TraceReader::RawData buf;
-    if (t->trace_reader().read_raw_data_for_frame(trace_frame, buf)) {
+    if (t->trace_reader().read_raw_data_for_frame(buf)) {
       auto& mapping = t->vm()->mapping_of(new_addr);
       auto f = mapping.emu_file;
       if (f) {
@@ -944,6 +1023,7 @@ static void process_shmat(ReplayTask* t, const TraceFrame& trace_frame,
     int prot = shm_flags_to_mmap_prot(shm_flags);
     int flags = MAP_SHARED;
     finish_shared_mmap(t, remote, prot, flags, -1, 0, data.file_size_bytes, km);
+    t->vm()->set_shm_size(km.start(), km.size());
 
     // Finally, we finish by emulating the return value.
     remote.regs().set_syscall_result(trace_frame.regs().syscall_result());
@@ -960,10 +1040,8 @@ static void process_shmdt(ReplayTask* t, const TraceFrame& trace_frame,
 
   {
     AutoRemoteSyscalls remote(t);
-    auto mapping = t->vm()->mapping_of(addr);
-    ASSERT(t, mapping.map.start() == addr);
-    remote.infallible_syscall(syscall_number_for_munmap(t->arch()), addr,
-                              mapping.map.end() - addr);
+    size_t size = t->vm()->get_shm_size(addr);
+    remote.infallible_syscall(syscall_number_for_munmap(t->arch()), addr, size);
     remote.regs().set_syscall_result(trace_frame.regs().syscall_result());
   }
   t->validate_regs();
@@ -992,15 +1070,6 @@ static int non_negative_syscall(int sys) { return sys < 0 ? INT32_MAX : sys; }
 template <typename Arch>
 static void rep_after_enter_syscall_arch(ReplayTask* t) {
   switch (non_negative_syscall(t->regs().original_syscallno())) {
-    case Arch::exit:
-    case Arch::exit_group:
-      // We don't really need to destroy buffers in exit_group since they'll
-      // go away anyway. Also, we have a fallback destroy_buffers in
-      // prepare_exit. However, doing it here makes memory consistent with
-      // recording for checksumming.
-      t->destroy_buffers();
-      break;
-
     case Arch::write:
     case Arch::writev: {
       int fd = (int)t->regs().arg1_signed();
@@ -1058,11 +1127,12 @@ void rep_after_enter_syscall(ReplayTask* t) {
 }
 
 void rep_prepare_run_to_syscall(ReplayTask* t, ReplayTraceStep* step) {
-  int sys = t->current_trace_frame().event().Syscall().number;
+  const SyscallEvent& sys_ev = t->current_trace_frame().event().Syscall();
+  int sys = sys_ev.number;
 
-  LOG(debug) << "processing " << t->syscall_name(sys) << " (entry)";
+  LOG(debug) << "processing " << sys_ev.syscall_name() << " (entry)";
 
-  if (is_restart_syscall_syscall(sys, t->arch())) {
+  if (is_restart_syscall_syscall(sys, sys_ev.arch())) {
     ASSERT(t, t->tick_count() == t->current_trace_frame().ticks());
     t->set_regs(t->current_trace_frame().regs());
     t->apply_all_data_records_from_trace();
@@ -1077,7 +1147,7 @@ void rep_prepare_run_to_syscall(ReplayTask* t, ReplayTraceStep* step) {
    * system call that we assigned a negative number because it doesn't
    * exist in this architecture.
    */
-  if (is_rrcall_notify_syscall_hook_exit_syscall(sys, t->arch())) {
+  if (is_rrcall_notify_syscall_hook_exit_syscall(sys, sys_ev.arch())) {
     ASSERT(t, t->syscallbuf_child != nullptr);
     t->write_mem(
         REMOTE_PTR_FIELD(t->syscallbuf_child, notify_on_syscall_hook_exit),
@@ -1085,22 +1155,19 @@ void rep_prepare_run_to_syscall(ReplayTask* t, ReplayTraceStep* step) {
   }
 }
 
+
 static void handle_opened_files(ReplayTask* t) {
-  vector<uint8_t> buf;
-  while (
-      t->trace_reader().read_generic_for_frame(t->current_trace_frame(), buf)) {
-    int fd = *reinterpret_cast<int*>(buf.data());
-    t->trace_reader().read_generic(buf);
-    string pathname(reinterpret_cast<const char*>(buf.data()), buf.size());
+  const auto& opened = t->current_trace_frame().event().Syscall().opened;
+  for (const auto& o : opened) {
     // This must be kept in sync with replay_syscall's handle_opened_file.
-    if (pathname == "terminal") {
-      t->fd_table()->add_monitor(fd, new StdioMonitor(STDERR_FILENO));
-    } else if (is_proc_mem_file(pathname.c_str())) {
-      t->fd_table()->add_monitor(fd, new ProcMemMonitor(t, pathname));
-    } else if (is_proc_fd_dir(pathname.c_str())) {
-      t->fd_table()->add_monitor(fd, new ProcFdDirMonitor(t, pathname));
+    if (o.path == "terminal") {
+      t->fd_table()->add_monitor(o.fd, new StdioMonitor(STDERR_FILENO));
+    } else if (is_proc_mem_file(o.path.c_str())) {
+      t->fd_table()->add_monitor(o.fd, new ProcMemMonitor(t, o.path));
+    } else if (is_proc_fd_dir(o.path.c_str())) {
+      t->fd_table()->add_monitor(o.fd, new ProcFdDirMonitor(t, o.path));
     } else {
-      ASSERT(t, false) << "Why did we write filename " << pathname;
+      ASSERT(t, false) << "Why did we write filename " << o.path;
     }
   }
 }
@@ -1111,12 +1178,12 @@ static void rep_process_syscall_arch(ReplayTask* t, ReplayTraceStep* step,
   int sys = t->current_trace_frame().event().Syscall().number;
   const TraceFrame& trace_frame = t->session().current_trace_frame();
 
-  LOG(debug) << "processing " << t->syscall_name(sys) << " (exit)";
+  LOG(debug) << "processing " << syscall_name(sys, Arch::arch()) << " (exit)";
 
   // sigreturns are never restartable, and the value of the
   // syscall-result register after a sigreturn is not actually the
   // syscall result.
-  if (trace_regs.syscall_may_restart() && !is_sigreturn(sys, t->arch())) {
+  if (trace_regs.syscall_may_restart() && !is_sigreturn(sys, Arch::arch())) {
     // During recording, when a sys exits with a
     // restart "error", the kernel sometimes restarts the
     // tracee by resetting its $ip to the syscall entry
@@ -1125,7 +1192,7 @@ static void rep_process_syscall_arch(ReplayTask* t, ReplayTraceStep* step,
     t->apply_all_data_records_from_trace();
     t->set_return_value_from_trace();
     step->action = TSTEP_RETIRE;
-    LOG(debug) << "  " << t->syscall_name(sys) << " interrupted by "
+    LOG(debug) << "  " << syscall_name(sys, Arch::arch()) << " interrupted by "
                << trace_regs.syscall_result() << " at " << trace_regs.ip()
                << ", may restart";
     return;
@@ -1140,7 +1207,9 @@ static void rep_process_syscall_arch(ReplayTask* t, ReplayTraceStep* step,
 
   if (trace_regs.original_syscallno() ==
       SECCOMP_MAGIC_SKIP_ORIGINAL_SYSCALLNO) {
-    // rr vetoed this syscall. Don't do any post-processing.
+    // rr vetoed this syscall. Don't do any post-processing. Do set registers
+    // to match any registers rr modified to fool the signal handler.
+    t->set_regs(trace_regs);
     return;
   }
 
@@ -1229,8 +1298,8 @@ static void rep_process_syscall_arch(ReplayTask* t, ReplayTraceStep* step,
       if (sys == Arch::mprotect) {
         t->vm()->fixup_mprotect_growsdown_parameters(t);
       }
-      __ptrace_cont(t, RESUME_SYSCALL, sys);
-      __ptrace_cont(t, RESUME_SYSCALL, sys);
+      __ptrace_cont(t, RESUME_SYSCALL, Arch::arch(), sys);
+      __ptrace_cont(t, RESUME_SYSCALL, Arch::arch(), sys);
       ASSERT(t, t->regs().syscall_result() == trace_regs.syscall_result());
       if (sys == Arch::mprotect) {
         Registers r2 = t->regs();
@@ -1240,7 +1309,7 @@ static void rep_process_syscall_arch(ReplayTask* t, ReplayTraceStep* step,
         t->set_regs(r2);
       }
       // The syscall modified registers. Re-emulate the syscall entry.
-      t->canonicalize_and_set_regs(t->regs(), step->syscall.arch);
+      t->canonicalize_regs(step->syscall.arch);
       return;
     }
 
@@ -1346,8 +1415,8 @@ static void rep_process_syscall_arch(ReplayTask* t, ReplayTraceStep* step,
 }
 
 void rep_process_syscall(ReplayTask* t, ReplayTraceStep* step) {
-  step->syscall.arch = t->current_trace_frame().event().arch();
   const TraceFrame& trace_frame = t->current_trace_frame();
+  step->syscall.arch = trace_frame.event().Syscall().arch();
   const Registers& trace_regs = trace_frame.regs();
   with_converted_registers<void>(
       trace_regs, step->syscall.arch, [&](const Registers& trace_regs) {

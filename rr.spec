@@ -9,10 +9,8 @@ Vendor:         @CPACK_PACKAGE_VENDOR@
 Prefix:         @CPACK_PACKAGING_INSTALL_PREFIX@
 @CPACK_RPM_PACKAGE_REQUIRES@
 
-%define _rpmdir @CPACK_BINARY_DIR@/_CPack_Packages/@CPACK_SYSTEM_NAME@/RPM
 %define _rpmfilename @CPACK_PACKAGE_FILE_NAME@.rpm
 %define _unpackaged_files_terminate_build 0
-%define _topdir @CPACK_BINARY_DIR@/_CPack_Packages/@CPACK_SYSTEM_NAME@/RPM
  
 %description
 rr is a lightweight tool for recording and replaying execution of applications (trees of processes and threads).  For more information, please visit
@@ -23,15 +21,6 @@ http://rr-project.org
 # we skip _install step because CPack does that for us.
 # We do only save CPack installed tree in _prepr
 # and then restore it in build.
-%prep
-mv $RPM_BUILD_ROOT @CPACK_BINARY_DIR@/_CPack_Packages/@CPACK_SYSTEM_NAME@/RPM/tmpBBroot
- 
-%install
-if [ -e $RPM_BUILD_ROOT ];
-then
-  rm -Rf $RPM_BUILD_ROOT
-fi
-mv "@CPACK_BINARY_DIR@/_CPack_Packages/@CPACK_SYSTEM_NAME@/RPM/tmpBBroot" $RPM_BUILD_ROOT
  
 %files
 %defattr(-,root,root,-)

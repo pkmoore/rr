@@ -9,7 +9,7 @@
 #include "Scheduler.h"
 #include "SeccompFilterRewriter.h"
 #include "Session.h"
-#include "TaskGroup.h"
+#include "ThreadGroup.h"
 #include "TraceFrame.h"
 #include "WaitStatus.h"
 
@@ -20,6 +20,7 @@ class RecordTask;
 /** Encapsulates additional session state related to recording. */
 class RecordSession : public Session {
 public:
+  bool strace_output = false;
   typedef std::shared_ptr<RecordSession> shr_ptr;
 
   /**
@@ -30,7 +31,8 @@ public:
       const std::vector<std::string>& argv,
       const std::vector<std::string>& extra_env = std::vector<std::string>(),
       SyscallBuffering syscallbuf = ENABLE_SYSCALL_BUF,
-      BindCPU bind_cpu = BIND_CPU);
+      BindCPU bind_cpu = BIND_CPU,
+      bool strace_output = false);
 
   bool use_syscall_buffer() const { return use_syscall_buffer_; }
   size_t syscall_buffer_size() const { return syscall_buffer_size_; }
@@ -138,10 +140,12 @@ private:
                                      RecordSession::StepState* step_state,
                                      RecordResult* result,
                                      bool* did_enter_syscall);
-  void process_syscall_entry(RecordTask* t, StepState* step_state,
-                             RecordResult* step_result);
+  // Returns false if the task exits during processing
+  bool process_syscall_entry(RecordTask* t, StepState* step_state,
+                             RecordResult* step_result,
+                             SupportedArch syscall_arch);
   void check_initial_task_syscalls(RecordTask* t, RecordResult* step_result);
-  bool handle_ptrace_event(RecordTask* t, StepState* step_state,
+  bool handle_ptrace_event(RecordTask** t_ptr, StepState* step_state,
                            RecordResult* result, bool* did_enter_syscall);
   bool handle_signal_event(RecordTask* t, StepState* step_state);
   void runnable_state_changed(RecordTask* t, StepState* step_state,
@@ -156,7 +160,7 @@ private:
 
   TraceWriter trace_out;
   Scheduler scheduler_;
-  TaskGroup::shr_ptr initial_task_group;
+  ThreadGroup::shr_ptr initial_thread_group;
   SeccompFilterRewriter seccomp_filter_rewriter_;
 
   int ignore_sig;

@@ -1,6 +1,6 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
 #include <linux/netfilter_ipv4/ip_tables.h>
 
 #include "nsutils.h"
@@ -111,5 +111,5 @@ int main(void) {
   }
 
   test_assert(any_changed);
-  atomic_printf("EXIT-SUCCESS");
+  atomic_puts("EXIT-SUCCESS");
 }

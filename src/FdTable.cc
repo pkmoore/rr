@@ -8,9 +8,11 @@
 
 #include "rr/rr.h"
 
+#include "AddressSpace.h"
 #include "RecordTask.h"
+#include "ReplayTask.h"
 #include "Session.h"
-#include "Task.h"
+#include "core.h"
 #include "log.h"
 
 using namespace std;
@@ -20,7 +22,7 @@ namespace rr {
 void FdTable::add_monitor(int fd, FileMonitor* monitor) {
   // In the future we could support multiple monitors on an fd, but we don't
   // need to yet.
-  assert(!is_monitoring(fd));
+  DEBUG_ASSERT(!is_monitoring(fd));
   fds[fd] = FileMonitor::shr_ptr(monitor);
   update_syscallbuf_fds_disabled(fd);
 }
@@ -117,8 +119,8 @@ static bool is_fd_monitored_in_any_task(AddressSpace* vm, int fd) {
 }
 
 void FdTable::update_syscallbuf_fds_disabled(int fd) {
-  assert(fd >= 0);
-  assert(task_set().size() > 0);
+  DEBUG_ASSERT(fd >= 0);
+  DEBUG_ASSERT(task_set().size() > 0);
 
   unordered_set<AddressSpace*> vms_updated;
   // It's possible for tasks with different VMs to share this fd table.
@@ -166,7 +168,7 @@ void FdTable::init_syscallbuf_fds_disabled(Task* t) {
   for (Task* vm_t : rt->vm()->task_set()) {
     for (auto& it : vm_t->fd_table()->fds) {
       int fd = it.first;
-      assert(fd >= 0);
+      DEBUG_ASSERT(fd >= 0);
       if (fd < SYSCALLBUF_FDS_DISABLED_SIZE) {
         disabled[fd] = 1;
       }
@@ -178,6 +180,14 @@ void FdTable::init_syscallbuf_fds_disabled(Task* t) {
   rt->record_local(addr, disabled, SYSCALLBUF_FDS_DISABLED_SIZE);
 }
 
+void FdTable::close_after_exec(ReplayTask* t, const vector<int>& fds_to_close) {
+  ASSERT(t, has_task(t));
+
+  for (auto fd : fds_to_close) {
+    did_close(fd);
+  }
+}
+
 static bool is_fd_open(Task* t, int fd) {
   char path[PATH_MAX];
   sprintf(path, "/proc/%d/fd/%d", t->tid, fd);
@@ -185,25 +195,19 @@ static bool is_fd_open(Task* t, int fd) {
   return 0 == lstat(path, &st);
 }
 
-void FdTable::update_for_cloexec(Task* t, TraceTaskEvent& event) {
+vector<int> FdTable::fds_to_close_after_exec(RecordTask* t) {
   ASSERT(t, has_task(t));
 
   vector<int> fds_to_close;
-
-  if (t->session().is_recording()) {
-    for (auto& it : fds) {
-      if (!is_fd_open(t, it.first)) {
-        fds_to_close.push_back(it.first);
-      }
+  for (auto& it : fds) {
+    if (!is_fd_open(t, it.first)) {
+      fds_to_close.push_back(it.first);
     }
-    event.set_fds_to_close(fds_to_close);
-  } else {
-    fds_to_close = event.fds_to_close();
   }
-
   for (auto fd : fds_to_close) {
     did_close(fd);
   }
+  return fds_to_close;
 }
 
 } // namespace rr

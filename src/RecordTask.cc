@@ -12,6 +12,7 @@
 #include "AutoRemoteSyscalls.h"
 #include "PreserveFileMonitor.h"
 #include "RecordSession.h"
+#include "core.h"
 #include "kernel_abi.h"
 #include "kernel_metadata.h"
 #include "log.h"
@@ -43,13 +44,13 @@ struct Sighandler {
   template <typename Arch> void reset_arch() {
     typename Arch::kernel_sigaction ksa;
     memset(&ksa, 0, sizeof(ksa));
-    assert(uintptr_t(SIG_DFL) == 0);
+    DEBUG_ASSERT(uintptr_t(SIG_DFL) == 0);
     init_arch<Arch>(ksa);
   }
 
   SignalDisposition disposition() const {
-    assert(uintptr_t(SIG_DFL) == 0);
-    assert(uintptr_t(SIG_IGN) == 1);
+    DEBUG_ASSERT(uintptr_t(SIG_DFL) == 0);
+    DEBUG_ASSERT(uintptr_t(SIG_IGN) == 1);
     switch (k_sa_handler.as_int()) {
       case 0:
         return SIGNAL_DEFAULT;
@@ -108,7 +109,7 @@ struct Sighandlers {
       if (::syscall(SYS_rt_sigaction, i, nullptr, &sa, sizeof(uint64_t))) {
         /* EINVAL means we're querying an
          * unused signal number. */
-        assert(EINVAL == errno);
+        DEBUG_ASSERT(EINVAL == errno);
         continue;
       }
       msan_unpoison(&sa, sizeof(NativeArch::kernel_sigaction));
@@ -140,7 +141,7 @@ struct Sighandlers {
   }
 
   void assert_valid(int sig) const {
-    assert(0 < sig && sig < ssize_t(array_length(handlers)));
+    DEBUG_ASSERT(0 < sig && sig < ssize_t(array_length(handlers)));
   }
 
   static shr_ptr create() { return shr_ptr(new Sighandlers()); }
@@ -156,6 +157,7 @@ private:
 RecordTask::RecordTask(RecordSession& session, pid_t _tid, uint32_t serial,
                        SupportedArch a)
     : Task(session, _tid, _tid, serial, a),
+      ticks_at_last_recorded_syscall_exit(0),
       time_at_start_of_last_timeslice(0),
       priority(0),
       in_round_robin_queue(false),
@@ -187,8 +189,10 @@ RecordTask::RecordTask(RecordSession& session, pid_t _tid, uint32_t serial,
       stashed_signals_blocking_more_signals(false),
       break_at_syscallbuf_traced_syscalls(false),
       break_at_syscallbuf_untraced_syscalls(false),
-      break_at_syscallbuf_final_instruction(false) {
-  push_event(Event(EV_SENTINEL, NO_EXEC_INFO, RR_NATIVE_ARCH));
+      break_at_syscallbuf_final_instruction(false),
+      next_pmc_interrupt_is_for_user(false),
+      did_record_robust_futex_changes(false) {
+  push_event(Event::sentinel());
   if (session.tasks().empty()) {
     // Initial tracee. It inherited its state from this process, so set it up.
     // The very first task we fork inherits the signal
@@ -245,7 +249,6 @@ RecordTask::~RecordTask() {
   }
 
   // Write the exit event here so that the value recorded above is captured.
-  EventType e = unstable ? EV_UNSTABLE_EXIT : EV_EXIT;
   // Don't flush syscallbuf. Whatever triggered the exit (syscall, signal)
   // should already have flushed it, if it was running. If it was blocked,
   // then the syscallbuf would already have been flushed too. The exception
@@ -253,7 +256,7 @@ RecordTask::~RecordTask() {
   // execution. Trying to flush syscallbuf for an exiting task could be bad,
   // e.g. it could be in the middle of syscallbuf code that's supposed to be
   // atomic.
-  record_event(Event(e, NO_EXEC_INFO, arch()), DONT_FLUSH_SYSCALLBUF);
+  record_event(Event::exit(), DONT_FLUSH_SYSCALLBUF);
 
   // We expect tasks to usually exit by a call to exit() or
   // exit_group(), so it's not helpful to warn about that.
@@ -303,18 +306,6 @@ Task* RecordTask::clone(CloneReason reason, int flags, remote_ptr<void> stack,
                         new_rec_tid, new_serial, other_session);
   if (t->session().is_recording()) {
     RecordTask* rt = static_cast<RecordTask*>(t);
-    rt->priority = priority;
-    rt->syscallbuf_code_layout = syscallbuf_code_layout;
-    rt->prctl_seccomp_status = prctl_seccomp_status;
-    rt->robust_futex_list = robust_futex_list;
-    rt->robust_futex_list_len = robust_futex_list_len;
-    rt->tsc_mode = tsc_mode;
-    if (CLONE_SHARE_SIGHANDLERS & flags) {
-      rt->sighandlers = sighandlers;
-    } else {
-      auto sh = sighandlers->clone();
-      rt->sighandlers.swap(sh);
-    }
     if (CLONE_CLEARTID & flags) {
       LOG(debug) << "cleartid futex is " << cleartid_addr;
       ASSERT(this, !cleartid_addr.is_null());
@@ -324,6 +315,26 @@ Task* RecordTask::clone(CloneReason reason, int flags, remote_ptr<void> stack,
     }
   }
   return t;
+}
+
+void RecordTask::post_wait_clone(Task* cloned_from, int flags) {
+  ASSERT(cloned_from, cloned_from->session().is_recording());
+  Task::post_wait_clone(cloned_from, flags);
+
+  RecordTask* rt = static_cast<RecordTask*>(cloned_from);
+  priority = rt->priority;
+  syscallbuf_code_layout = rt->syscallbuf_code_layout;
+  prctl_seccomp_status = rt->prctl_seccomp_status;
+  robust_futex_list = rt->robust_futex_list;
+  robust_futex_list_len = rt->robust_futex_list_len;
+  tsc_mode = rt->tsc_mode;
+  cpuid_mode = rt->cpuid_mode;
+  if (CLONE_SHARE_SIGHANDLERS & flags) {
+    sighandlers = rt->sighandlers;
+  } else {
+    auto sh = rt->sighandlers->clone();
+    sighandlers.swap(sh);
+  }
 }
 
 static string exe_path(RecordTask* t) {
@@ -337,17 +348,23 @@ static string exe_path(RecordTask* t) {
 }
 
 void RecordTask::post_exec() {
-  // The signal mask is inherited across execve so we don't need to invalidate.
+  // Change syscall number to execve *for the new arch*. If we don't do this,
+  // and the arch changes, then the syscall number for execve in the old arch/
+  // is treated as the syscall we're executing in the new arch, with hilarious
+  // results.
+  int syscallno = syscall_number_for_execve(arch());
+  registers.set_original_syscallno(syscallno);
+  // Fix event architecture and syscall number
+  ev().Syscall().number = syscallno;
+  ev().Syscall().set_arch(arch());
 
+  // The signal mask is inherited across execve so we don't need to invalidate.
   string exe_file = exe_path(this);
   Task::post_exec(exe_file);
   if (emulated_ptracer) {
     ASSERT(this, !(emulated_ptracer->arch() == x86 && arch() == x86_64))
         << "We don't support a 32-bit process tracing a 64-bit process";
   }
-
-  ev().set_arch(arch());
-  ev().Syscall().number = registers.original_syscallno();
 
   // Clear robust_list state to match kernel state. If this task is cloned
   // soon after exec, we must not do a bogus set_robust_list syscall for
@@ -379,15 +396,6 @@ template <typename Arch> static void do_preload_init_arch(RecordTask* t) {
   auto cores_ptr = REMOTE_PTR_FIELD(params.globals.rptr(), pretend_num_cores);
   t->write_mem(cores_ptr, cores);
   t->record_local(cores_ptr, &cores);
-}
-
-SupportedArch RecordTask::detect_syscall_arch() {
-  SupportedArch syscall_arch;
-  bool ok = get_syscall_instruction_arch(
-      this, regs().ip().decrement_by_syscall_insn_length(arch()),
-      &syscall_arch);
-  ASSERT(this, ok);
-  return syscall_arch;
 }
 
 void RecordTask::push_syscall_event(int syscallno) {
@@ -573,8 +581,8 @@ void RecordTask::will_resume_execution(ResumeRequest, WaitRequest,
     // because blocking it seems to cause problems for some hardware/kernel
     // configurations (see https://github.com/mozilla/rr/issues/1979),
     // causing them to stop counting events.
-    uint64_t sigset = ~(signal_bit(SYSCALLBUF_DESCHED_SIGNAL) |
-                        signal_bit(PerfCounters::TIME_SLICE_SIGNAL));
+    sig_set_t sigset = ~(signal_bit(SYSCALLBUF_DESCHED_SIGNAL) |
+                         signal_bit(PerfCounters::TIME_SLICE_SIGNAL));
     if (sig) {
       // We're injecting a signal, so make sure that signal is unblocked.
       sigset &= ~signal_bit(sig);
@@ -656,18 +664,20 @@ void RecordTask::did_wait() {
     ASSERT(this, !blocked_sigs_dirty);
     xptrace(PTRACE_SETSIGMASK, remote_ptr<void>(8), &blocked_sigs);
   } else if (syscallbuf_child) {
-    if (read_mem(REMOTE_PTR_FIELD(syscallbuf_child,
-                                  in_sigprocmask_critical_section))) {
+    // The syscallbuf struct is only 32 bytes currently so read the whole thing
+    // at once to avoid multiple calls to read_mem. Even though this shouldn't
+    // need a syscall because we use a local-mapping, apparently that lookup
+    // is still noticeably expensive.
+    auto syscallbuf = read_mem(syscallbuf_child);
+    if (syscallbuf.in_sigprocmask_critical_section) {
       // |blocked_sigs| may have been updated but the syscall not yet issued.
       // Use the kernel's value.
       invalidate_sigmask();
     } else {
-      uint32_t syscallbuf_generation =
-          read_mem(REMOTE_PTR_FIELD(syscallbuf_child, blocked_sigs_generation));
+      uint32_t syscallbuf_generation = syscallbuf.blocked_sigs_generation;
       if (syscallbuf_generation > syscallbuf_blocked_sigs_generation) {
         syscallbuf_blocked_sigs_generation = syscallbuf_generation;
-        blocked_sigs =
-            read_mem(REMOTE_PTR_FIELD(syscallbuf_child, blocked_sigs));
+        blocked_sigs = syscallbuf.blocked_sigs;
       }
     }
   }
@@ -680,8 +690,9 @@ void RecordTask::set_emulated_ptracer(RecordTask* tracer) {
     emulated_ptracer->emulated_ptrace_tracees.insert(this);
   } else {
     ASSERT(this, emulated_ptracer);
-    ASSERT(this, emulated_stop_type == NOT_STOPPED ||
-                     emulated_stop_type == GROUP_STOP);
+    ASSERT(this,
+           emulated_stop_type == NOT_STOPPED ||
+               emulated_stop_type == GROUP_STOP);
     emulated_ptracer->emulated_ptrace_tracees.erase(this);
     emulated_ptracer = nullptr;
   }
@@ -737,7 +748,7 @@ void RecordTask::send_synthetic_SIGCHLD_if_necessary() {
       // check to see if any thread in the ptracer process is in a waitpid that
       // could read the status of 'tracee'. If it is, we should wake up that
       // thread. Otherwise we send SIGCHLD to the ptracer thread.
-      for (Task* t : task_group()->task_set()) {
+      for (Task* t : thread_group()->task_set()) {
         auto rt = static_cast<RecordTask*>(t);
         if (rt->is_waiting_for_ptrace(tracee)) {
           wake_task = rt;
@@ -750,7 +761,7 @@ void RecordTask::send_synthetic_SIGCHLD_if_necessary() {
     }
   }
   if (!need_signal) {
-    for (TaskGroup* child_tg : task_group()->children()) {
+    for (ThreadGroup* child_tg : thread_group()->children()) {
       for (Task* child : child_tg->task_set()) {
         RecordTask* rchild = static_cast<RecordTask*>(child);
         if (rchild->emulated_SIGCHLD_pending) {
@@ -759,7 +770,7 @@ void RecordTask::send_synthetic_SIGCHLD_if_necessary() {
           // that
           // could read the status of 'tracee'. If it is, we should wake up that
           // thread. Otherwise we send SIGCHLD to the ptracer thread.
-          for (Task* t : task_group()->task_set()) {
+          for (Task* t : thread_group()->task_set()) {
             auto rt = static_cast<RecordTask*>(t);
             if (rt->is_waiting_for(rchild)) {
               wake_task = rt;
@@ -843,7 +854,7 @@ bool RecordTask::set_siginfo_for_synthetic_SIGCHLD(siginfo_t* si) {
     }
   }
 
-  for (TaskGroup* child_tg : task_group()->children()) {
+  for (ThreadGroup* child_tg : thread_group()->children()) {
     for (Task* child : child_tg->task_set()) {
       auto rchild = static_cast<RecordTask*>(child);
       if (rchild->emulated_SIGCHLD_pending) {
@@ -862,7 +873,7 @@ bool RecordTask::set_siginfo_for_synthetic_SIGCHLD(siginfo_t* si) {
 bool RecordTask::is_waiting_for_ptrace(RecordTask* t) {
   // This task's process must be a ptracer of t.
   if (!t->emulated_ptracer ||
-      t->emulated_ptracer->task_group() != task_group()) {
+      t->emulated_ptracer->thread_group() != thread_group()) {
     return false;
   }
   // XXX need to check |options| to make sure this task is eligible!!
@@ -887,7 +898,7 @@ bool RecordTask::is_waiting_for_ptrace(RecordTask* t) {
 
 bool RecordTask::is_waiting_for(RecordTask* t) {
   // t must be a child of this task.
-  if (t->task_group()->parent() != task_group().get()) {
+  if (t->thread_group()->parent() != thread_group().get()) {
     return false;
   }
   switch (in_wait_type) {
@@ -981,9 +992,9 @@ bool RecordTask::is_signal_pending(int sig) {
     return false;
   }
   char* end1;
-  uint64_t mask1 = strtoull(pending_strs[0].c_str(), &end1, 16);
+  sig_set_t mask1 = strtoull(pending_strs[0].c_str(), &end1, 16);
   char* end2;
-  uint64_t mask2 = strtoull(pending_strs[1].c_str(), &end2, 16);
+  sig_set_t mask2 = strtoull(pending_strs[1].c_str(), &end2, 16);
   return !*end1 && !*end2 && ((mask1 | mask2) & signal_bit(sig));
 }
 
@@ -1004,7 +1015,7 @@ bool RecordTask::has_any_actionable_signal() {
 
 void RecordTask::emulate_SIGCONT() {
   // All threads in the process are resumed.
-  for (Task* t : task_group()->task_set()) {
+  for (Task* t : thread_group()->task_set()) {
     auto rt = static_cast<RecordTask*>(t);
     LOG(debug) << "setting " << tid << " to NOT_STOPPED due to SIGCONT";
     rt->emulated_stop_pending = false;
@@ -1029,7 +1040,7 @@ void RecordTask::signal_delivered(int sig) {
       // Fall through...
       case SIGSTOP:
         // All threads in the process are stopped.
-        for (Task* t : task_group()->task_set()) {
+        for (Task* t : thread_group()->task_set()) {
           auto rt = static_cast<RecordTask*>(t);
           rt->apply_group_stop(sig);
         }
@@ -1089,6 +1100,17 @@ bool RecordTask::is_sig_ignored(int sig) const {
 
 SignalDisposition RecordTask::sig_disposition(int sig) const {
   return sighandlers->get(sig).disposition();
+}
+
+SignalResolvedDisposition RecordTask::sig_resolved_disposition(
+    int sig, SignalDeterministic deterministic) {
+  if (is_fatal_signal(sig, deterministic)) {
+    return DISPOSITION_FATAL;
+  }
+  if (signal_has_user_handler(sig) && !is_sig_blocked(sig)) {
+    return DISPOSITION_USER_HANDLER;
+  }
+  return DISPOSITION_IGNORED;
 }
 
 void RecordTask::set_siginfo(const siginfo_t& si) {
@@ -1155,18 +1177,18 @@ void RecordTask::verify_signal_states() {
   }
   auto results = read_proc_status_fields(tid, "SigBlk", "SigIgn", "SigCgt");
   ASSERT(this, results.size() == 3);
-  uint64_t blocked = strtoull(results[0].c_str(), NULL, 16);
-  uint64_t ignored = strtoull(results[1].c_str(), NULL, 16);
-  uint64_t caught = strtoull(results[2].c_str(), NULL, 16);
+  sig_set_t blocked = strtoull(results[0].c_str(), NULL, 16);
+  sig_set_t ignored = strtoull(results[1].c_str(), NULL, 16);
+  sig_set_t caught = strtoull(results[2].c_str(), NULL, 16);
   for (int sig = 1; sig < _NSIG; ++sig) {
-    uint64_t mask = signal_bit(sig);
+    sig_set_t mask = signal_bit(sig);
     if (is_unstoppable_signal(sig)) {
-      ASSERT(this, !(blocked & mask)) << "Expected " << signal_name(sig)
-                                      << " to not be blocked, but it is";
-      ASSERT(this, !(ignored & mask)) << "Expected " << signal_name(sig)
-                                      << " to not be ignored, but it is";
-      ASSERT(this, !(caught & mask)) << "Expected " << signal_name(sig)
-                                     << " to not be caught, but it is";
+      ASSERT(this, !(blocked & mask))
+          << "Expected " << signal_name(sig) << " to not be blocked, but it is";
+      ASSERT(this, !(ignored & mask))
+          << "Expected " << signal_name(sig) << " to not be ignored, but it is";
+      ASSERT(this, !(caught & mask))
+          << "Expected " << signal_name(sig) << " to not be caught, but it is";
     } else {
       ASSERT(this, !!(blocked & mask) == is_sig_blocked(sig))
           << signal_name(sig)
@@ -1200,7 +1222,6 @@ void RecordTask::stash_sig() {
 
   const siginfo_t& si = get_siginfo();
   stashed_signals.push_back(StashedSignal(si, is_deterministic_signal(this)));
-  wait_status = WaitStatus();
   // Once we've stashed a signal, stop at the next traced/untraced syscall to
   // check whether we need to process the signal before it runs.
   stashed_signals_blocking_more_signals =
@@ -1212,9 +1233,9 @@ void RecordTask::stash_sig() {
 void RecordTask::stash_synthetic_sig(const siginfo_t& si,
                                      SignalDeterministic deterministic) {
   int sig = si.si_signo;
-  assert(sig);
+  DEBUG_ASSERT(sig);
   // Callers should avoid passing SYSCALLBUF_DESCHED_SIGNAL in here.
-  assert(sig != SYSCALLBUF_DESCHED_SIGNAL);
+  DEBUG_ASSERT(sig != SYSCALLBUF_DESCHED_SIGNAL);
   // multiple non-RT signals coalesce
   if (sig < SIGRTMIN) {
     for (auto it = stashed_signals.begin(); it != stashed_signals.end(); ++it) {
@@ -1284,15 +1305,16 @@ const RecordTask::StashedSignal* RecordTask::peek_stashed_sig_to_deliver()
 }
 
 bool RecordTask::is_syscall_restart() {
-  int syscallno = regs().original_syscallno();
-  bool is_restart = false;
-
-  LOG(debug) << "  is syscall interruption of recorded " << ev() << "? (now "
-             << syscall_name(syscallno) << ")";
-
   if (EV_SYSCALL_INTERRUPTION != ev().type()) {
-    goto done;
+    return false;
   }
+
+  int syscallno = regs().original_syscallno();
+  SupportedArch syscall_arch = ev().Syscall().arch();
+  string call_name = syscall_name(syscallno, syscall_arch);
+  bool is_restart = false;
+  LOG(debug) << "  is syscall interruption of recorded " << ev() << "? (now "
+             << call_name << ")";
 
   /* It's possible for the tracee to resume after a sighandler
    * with a fresh syscall that happens to be the same as the one
@@ -1309,13 +1331,13 @@ bool RecordTask::is_syscall_restart() {
    * TODO: it's possible for arg structures to be mutated
    * between the original call and restarted call in such a way
    * that it might change the scratch allocation decisions. */
-  if (is_restart_syscall_syscall(syscallno, arch())) {
+  if (is_restart_syscall_syscall(syscallno, syscall_arch)) {
     is_restart = true;
     syscallno = ev().Syscall().number;
     LOG(debug) << "  (SYS_restart_syscall)";
   }
   if (ev().Syscall().number != syscallno) {
-    LOG(debug) << "  interrupted " << ev() << " != " << syscall_name(syscallno);
+    LOG(debug) << "  interrupted " << ev() << " != " << call_name;
     goto done;
   }
 
@@ -1327,9 +1349,8 @@ bool RecordTask::is_syscall_restart() {
           old_regs.arg4() == regs().arg4() &&
           old_regs.arg5() == regs().arg5() &&
           old_regs.arg6() == regs().arg6())) {
-      LOG(debug) << "  regs different at interrupted "
-                 << syscall_name(syscallno) << ": " << old_regs << " vs "
-                 << regs();
+      LOG(debug) << "  regs different at interrupted " << call_name << ": "
+                 << old_regs << " vs " << regs();
       goto done;
     }
   }
@@ -1338,7 +1359,7 @@ bool RecordTask::is_syscall_restart() {
 
 done:
   if (is_restart) {
-    LOG(debug) << "  restart of " << syscall_name(syscallno);
+    LOG(debug) << "  restart of " << call_name;
   }
   return is_restart;
 }
@@ -1441,7 +1462,7 @@ void RecordTask::record_local(remote_ptr<void> addr, ssize_t num_bytes,
 
 bool RecordTask::record_remote_by_local_map(remote_ptr<void> addr,
                                             size_t num_bytes) {
-  if (uint8_t* local_addr = local_mapping(addr, num_bytes)) {
+  if (uint8_t* local_addr = as->local_mapping(addr, num_bytes)) {
     record_local(addr, num_bytes, local_addr);
     return true;
   }
@@ -1488,7 +1509,7 @@ void RecordTask::record_remote_even_if_null(remote_ptr<void> addr,
                                             ssize_t num_bytes) {
   maybe_flush_syscallbuf();
 
-  assert(num_bytes >= 0);
+  DEBUG_ASSERT(num_bytes >= 0);
 
   if (!addr) {
     trace_writer().write_raw(rec_tid, nullptr, 0, addr);
@@ -1511,7 +1532,7 @@ void RecordTask::pop_event(EventType expected_type) {
 void RecordTask::log_pending_events() const {
   ssize_t depth = pending_events.size();
 
-  assert(depth > 0);
+  DEBUG_ASSERT(depth > 0);
   if (1 == depth) {
     LOG(info) << "(no pending events)";
     return;
@@ -1548,23 +1569,20 @@ void RecordTask::maybe_flush_syscallbuf() {
     return;
   }
 
+  push_event(Event(SyscallbufFlushEvent()));
+
   // Apply buffered mprotect operations and flush the buffer in the tracee.
   if (hdr.mprotect_record_count) {
-    auto records =
-        read_mem(REMOTE_PTR_FIELD(preload_globals, mprotect_records[0]),
-                 hdr.mprotect_record_count);
+    auto& records = ev().SyscallbufFlush().mprotect_records;
+    records = read_mem(REMOTE_PTR_FIELD(preload_globals, mprotect_records[0]),
+                       hdr.mprotect_record_count);
     for (auto& r : records) {
       as->protect(this, r.start, r.size, r.prot);
     }
-    // We write these out because some tools might benefit from them, and
-    // this is cheap.
-    trace_writer().write_generic(records.data(),
-                                 records.size() * sizeof(records[0]));
   }
 
   // Write the entire buffer in one shot without parsing it,
   // because replay will take care of that.
-  push_event(Event(EV_SYSCALLBUF_FLUSH, NO_EXEC_INFO, arch()));
   if (is_running()) {
     vector<uint8_t> buf;
     buf.resize(sizeof(hdr) + hdr.num_rec_bytes);
@@ -1597,23 +1615,7 @@ void RecordTask::maybe_reset_syscallbuf() {
     LOG(debug) << "Syscallbuf reset";
     reset_syscallbuf();
     syscallbuf_blocked_sigs_generation = 0;
-    record_event(Event(EV_SYSCALLBUF_RESET, NO_EXEC_INFO, arch()));
-  }
-}
-
-static bool record_extra_regs(const Event& ev) {
-  switch (ev.type()) {
-    case EV_SYSCALL:
-      // sigreturn/rt_sigreturn restores register state
-      return ev.Syscall().state == EXITING_SYSCALL &&
-             (is_sigreturn(ev.Syscall().number, ev.arch()) ||
-              is_execve_syscall(ev.Syscall().number, ev.arch()));
-    case EV_SIGNAL_HANDLER:
-      // entering a signal handler seems to clear FP/SSE regs,
-      // so record these effects.
-      return true;
-    default:
-      return false;
+    record_event(Event::syscallbuf_reset());
   }
 }
 
@@ -1623,35 +1625,32 @@ void RecordTask::record_event(const Event& ev, FlushSyscallbuf flush,
     maybe_flush_syscallbuf();
   }
 
-  if (ev.type() == EV_SIGNAL) {
-    record_siginfo();
+  FrameTime current_time = trace_writer().time();
+  if (should_dump_memory(ev, current_time)) {
+    dump_process_memory(this, current_time, "rec");
+  }
+  if (should_checksum(ev, current_time)) {
+    checksum_process_memory(this, current_time);
   }
 
-  TraceFrame frame(trace_writer().time(), tid, ev, tick_count());
-  if (ev.record_exec_info() == HAS_EXEC_INFO) {
-    PerfCounters::Extra extra_perf_values;
-    if (PerfCounters::extra_perf_counters_enabled()) {
-      extra_perf_values = hpc.read_extra();
+  const ExtraRegisters* extra_registers = nullptr;
+  if (ev.record_regs()) {
+    if (!registers) {
+      registers = &regs();
     }
-    frame.set_exec_info(registers ? *registers : regs(),
-                        PerfCounters::extra_perf_counters_enabled()
-                            ? &extra_perf_values
-                            : nullptr,
-                        record_extra_regs(ev) ? &extra_regs() : nullptr);
+    if (ev.record_extra_regs()) {
+      extra_registers = &extra_regs();
+    }
   }
 
-  if (should_dump_memory(frame)) {
-    dump_process_memory(this, frame.time(), "rec");
-  }
-  if (should_checksum(frame)) {
-    checksum_process_memory(this, frame.time());
+  if (ev.is_syscall_event() && ev.Syscall().state == EXITING_SYSCALL) {
+    ticks_at_last_recorded_syscall_exit = tick_count();
   }
 
-  trace_writer().write_frame(frame);
-  LOG(debug) << "Wrote event " << ev << " for time " << frame.time();
+  trace_writer().write_frame(this, ev, registers, extra_registers);
+  LOG(debug) << "Wrote event " << ev << " for time " << current_time;
 
-  if (!ev.has_ticks_slop() && ev.type() != EV_UNSTABLE_EXIT &&
-      ev.type() != EV_EXIT) {
+  if (!ev.has_ticks_slop() && ev.type() != EV_EXIT) {
     ASSERT(this, flush == FLUSH_SYSCALLBUF);
     // After we've output an event, it's safe to reset the syscallbuf (if not
     // explicitly delayed) since we will have exited the syscallbuf code that
@@ -1662,8 +1661,9 @@ void RecordTask::record_event(const Event& ev, FlushSyscallbuf flush,
   }
 }
 
-bool RecordTask::is_fatal_signal(int sig, SignalDeterministic deterministic) {
-  if (task_group()->received_sigframe_SIGSEGV) {
+bool RecordTask::is_fatal_signal(int sig,
+                                 SignalDeterministic deterministic) const {
+  if (thread_group()->received_sigframe_SIGSEGV) {
     // Can't be blocked, caught or ignored
     return true;
   }
@@ -1680,26 +1680,6 @@ bool RecordTask::is_fatal_signal(int sig, SignalDeterministic deterministic) {
   }
   // If there's a signal handler, the signal won't be fatal.
   return !signal_has_user_handler(sig);
-}
-
-void RecordTask::record_siginfo() {
-  int sig = ev().Signal().siginfo.si_signo;
-  bool is_fatal = is_fatal_signal(sig, ev().Signal().deterministic);
-  bool blocked = is_sig_blocked(sig);
-  bool has_handler = signal_has_user_handler(sig) && !blocked;
-  uint8_t buf[sizeof(siginfo_t) + 1];
-  if (is_fatal) {
-    buf[0] = DISPOSITION_FATAL;
-  } else if (has_handler) {
-    buf[0] = DISPOSITION_USER_HANDLER;
-  } else {
-    buf[0] = DISPOSITION_IGNORED;
-  }
-  // We don't currently use the disposition byte during replay or debugging but
-  // it might be useful to other trace consumers.
-  memcpy(buf + 1, &ev().Signal().siginfo, sizeof(siginfo_t));
-
-  trace_writer().write_generic(buf, sizeof(buf));
 }
 
 void RecordTask::record_current_event() { record_event(ev()); }
@@ -1735,9 +1715,10 @@ pid_t RecordTask::find_newborn_thread() {
 
 pid_t RecordTask::find_newborn_process(pid_t child_parent) {
   ASSERT(this, session().is_recording());
-  ASSERT(this, ptrace_event() == PTRACE_EVENT_CLONE ||
-                   ptrace_event() == PTRACE_EVENT_VFORK ||
-                   ptrace_event() == PTRACE_EVENT_FORK);
+  ASSERT(this,
+         ptrace_event() == PTRACE_EVENT_CLONE ||
+             ptrace_event() == PTRACE_EVENT_VFORK ||
+             ptrace_event() == PTRACE_EVENT_FORK);
 
   pid_t hint = get_ptrace_eventmsg<pid_t>();
   // This should always succeed, but may fail in old kernels due to
@@ -1789,6 +1770,38 @@ void RecordTask::set_tid_and_update_serial(pid_t tid) {
   hpc.set_tid(tid);
   this->tid = rec_tid = tid;
   serial = session().next_task_serial();
+}
+
+template <typename Arch>
+static void maybe_restore_original_syscall_registers_arch(RecordTask* t,
+                                                          void* local_addr) {
+  if (!local_addr) {
+    return;
+  }
+  auto locals = reinterpret_cast<preload_thread_locals<Arch>*>(local_addr);
+  static_assert(sizeof(*locals) <= PRELOAD_THREAD_LOCALS_SIZE,
+                "bad PRELOAD_THREAD_LOCALS_SIZE");
+  if (!locals->original_syscall_parameters) {
+    return;
+  }
+  auto args = t->read_mem(locals->original_syscall_parameters.rptr());
+  Registers r = t->regs();
+  if (args.no != r.syscallno()) {
+    // Maybe a preparatory syscall before the real syscall (e.g. sys_read)
+    return;
+  }
+  r.set_arg1(args.args[0]);
+  r.set_arg2(args.args[1]);
+  r.set_arg3(args.args[2]);
+  r.set_arg4(args.args[3]);
+  r.set_arg5(args.args[4]);
+  r.set_arg6(args.args[5]);
+  t->set_regs(r);
+}
+
+void RecordTask::maybe_restore_original_syscall_registers() {
+  RR_ARCH_FUNCTION(maybe_restore_original_syscall_registers_arch, arch(), this,
+                   preload_thread_locals());
 }
 
 } // namespace rr

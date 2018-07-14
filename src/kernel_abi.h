@@ -3,11 +3,11 @@
 #ifndef RR_KERNEL_ABI_H
 #define RR_KERNEL_ABI_H
 
-#include <assert.h>
 #include <signal.h>
 
 #include <vector>
 
+#include "core.h"
 #include "remote_ptr.h"
 
 namespace rr {
@@ -322,7 +322,7 @@ struct BaseArch : public wordsize,
     template <typename U> ptr<T>& operator=(remote_ptr<U> p) {
       remote_ptr<T> pt = p;
       val = pt.as_int();
-      assert(val == pt.as_int());
+      DEBUG_ASSERT(val == pt.as_int());
       return *this;
     }
     operator bool() const { return val; }
@@ -1043,7 +1043,7 @@ struct BaseArch : public wordsize,
     ptr<size_t> oldlenp;
     ptr<void> newval;
     ptr<size_t> newlen;
-    unsigned_long __unused[4];
+    unsigned_long __rr_unused[4];
   };
   RR_VERIFY_TYPE(__sysctl_args);
 
@@ -1571,7 +1571,7 @@ struct X86Arch : public BaseArch<SupportedArch::x86, WordSize32Defs> {
   };
   RR_VERIFY_TYPE_ARCH(SupportedArch::x86, ::sigcontext, sigcontext);
 
-  struct ucontext {
+  struct ucontext_t {
     uint32_t uc_flags;
     uint32_t uc_link;
     stack_t uc_stack;
@@ -1585,7 +1585,7 @@ struct X86Arch : public BaseArch<SupportedArch::x86, WordSize32Defs> {
     uint32_t pinfo;
     uint32_t puc;
     siginfo_t info;
-    struct ucontext uc;
+    struct ucontext_t uc;
   };
 
   struct _fpstate_32 {
@@ -1684,12 +1684,6 @@ struct X64Arch : public BaseArch<SupportedArch::x86_64, WordSize64Defs> {
 
 #include "SyscallEnumsX64.generated"
 
-  // The kernel defines the segment registers and eflags as 64-bit quantities,
-  // even though the segment registers are really 16-bit and eflags is
-  // architecturally defined as 32-bit.  GDB wants the segment registers and
-  // eflags to appear as 32-bit quantities.  From the perspective of providing
-  // registers to GDB, it's easier if we define these registers as uint32_t
-  // with extra padding.
   struct user_regs_struct {
     uint64_t r15;
     uint64_t r14;
@@ -1710,25 +1704,18 @@ struct X64Arch : public BaseArch<SupportedArch::x86_64, WordSize64Defs> {
     // signed in practice.
     uint64_t orig_rax;
     uint64_t rip;
-    uint32_t cs;
-    uint32_t cs_upper;
-    uint32_t eflags;
-    uint32_t eflags_upper;
+    uint64_t cs;
+    uint64_t eflags;
     uint64_t rsp;
-    uint32_t ss;
-    uint32_t ss_upper;
+    uint64_t ss;
     // These _base registers are architecturally defined MSRs and really do
     // need to be 64-bit.
     uint64_t fs_base;
     uint64_t gs_base;
-    uint32_t ds;
-    uint32_t ds_upper;
-    uint32_t es;
-    uint32_t es_upper;
-    uint32_t fs;
-    uint32_t fs_upper;
-    uint32_t gs;
-    uint32_t gs_upper;
+    uint64_t ds;
+    uint64_t es;
+    uint64_t fs;
+    uint64_t gs;
   };
   RR_VERIFY_TYPE_ARCH(SupportedArch::x86_64, ::user_regs_struct,
                       user_regs_struct);
@@ -1781,19 +1768,19 @@ struct X64Arch : public BaseArch<SupportedArch::x86_64, WordSize64Defs> {
   RR_VERIFY_TYPE_ARCH(SupportedArch::x86_64, ::user_fpregs_struct,
                       user_fpregs_struct);
 
-  struct ucontext {
+  struct ucontext_t {
     uint64_t ucflags;
-    ptr<struct ucontext> uc_link;
+    ptr<struct ucontext_t> uc_link;
     stack_t uc_stack;
     struct sigcontext uc_mcontext;
     sigset_t uc_sigmask;
     user_fpregs_struct uc_fpregs;
   };
-  RR_VERIFY_TYPE_ARCH(SupportedArch::x86_64, ::ucontext, ucontext);
+  RR_VERIFY_TYPE_ARCH(SupportedArch::x86_64, ::ucontext_t, ucontext_t);
 
   struct rt_sigframe {
     ptr<char> pretcode;
-    struct ucontext uc;
+    struct ucontext_t uc;
     siginfo_t info;
   };
 
@@ -1837,7 +1824,7 @@ struct X64Arch : public BaseArch<SupportedArch::x86_64, WordSize64Defs> {
     struct timespec st_atim;
     struct timespec st_mtim;
     struct timespec st_ctim;
-    syscall_slong_t __unused[3];
+    syscall_slong_t __rr_unused[3];
   };
   RR_VERIFY_TYPE_ARCH(SupportedArch::x86_64, struct ::stat, struct stat);
 
@@ -1856,7 +1843,7 @@ struct X64Arch : public BaseArch<SupportedArch::x86_64, WordSize64Defs> {
     struct timespec st_atim;
     struct timespec st_mtim;
     struct timespec st_ctim;
-    syscall_slong_t __unused[3];
+    syscall_slong_t __rr_unused[3];
   };
   RR_VERIFY_TYPE_ARCH(SupportedArch::x86_64, struct ::stat64, struct stat64);
 };
@@ -1864,7 +1851,8 @@ struct X64Arch : public BaseArch<SupportedArch::x86_64, WordSize64Defs> {
 #define RR_ARCH_FUNCTION(f, arch, args...)                                     \
   switch (arch) {                                                              \
     default:                                                                   \
-      assert(0 && "Unknown architecture");                                     \
+      DEBUG_ASSERT(0 && "Unknown architecture");                               \
+      RR_FALLTHROUGH;                                                          \
     case x86:                                                                  \
       return f<rr::X86Arch>(args);                                             \
     case x86_64:                                                               \

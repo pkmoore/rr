@@ -6,7 +6,6 @@
 #include "util.h"
 
 #include <arpa/inet.h>
-#include <assert.h>
 #include <elf.h>
 #include <execinfo.h>
 #include <fcntl.h>
@@ -18,8 +17,10 @@
 #include <netinet/in.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
+#include <sys/time.h>
 #include <sys/vfs.h>
 #include <unistd.h>
 
@@ -36,10 +37,12 @@
 #include "ReplaySession.h"
 #include "ReplayTask.h"
 #include "TraceStream.h"
+#include "core.h"
 #include "kernel_abi.h"
 #include "kernel_metadata.h"
 #include "log.h"
 #include "seccomp-bpf.h"
+
 void good_random(uint8_t* out, size_t out_len);
 
 using namespace std;
@@ -73,13 +76,17 @@ int clone_flags_to_task_flags(int flags_arg) {
   flags |= (CLONE_CHILD_CLEARTID & flags_arg) ? CLONE_CLEARTID : 0;
   flags |= (CLONE_SETTLS & flags_arg) ? CLONE_SET_TLS : 0;
   flags |= (CLONE_SIGHAND & flags_arg) ? CLONE_SHARE_SIGHANDLERS : 0;
-  flags |= (CLONE_THREAD & flags_arg) ? CLONE_SHARE_TASK_GROUP : 0;
+  flags |= (CLONE_THREAD & flags_arg) ? CLONE_SHARE_THREAD_GROUP : 0;
   flags |= (CLONE_VM & flags_arg) ? CLONE_SHARE_VM : 0;
   flags |= (CLONE_FILES & flags_arg) ? CLONE_SHARE_FILES : 0;
   return flags;
 }
 
-size_t page_size() { return sysconf(_SC_PAGE_SIZE); }
+size_t page_size() {
+  /* This sometimes appears in profiles */
+  static size_t size = sysconf(_SC_PAGE_SIZE);
+  return size;
+}
 
 size_t ceil_page_size(size_t sz) {
   size_t page_mask = ~(page_size() - 1);
@@ -127,39 +134,26 @@ void dump_binary_data(const char* filename, const char* label,
   fclose(out);
 }
 
-void format_dump_filename(Task* t, TraceFrame::Time global_time,
-                          const char* tag, char* filename,
-                          size_t filename_size) {
-  snprintf(filename, filename_size - 1, "%s/%d_%d_%s", t->trace_dir().c_str(),
-           t->rec_tid, global_time, tag);
+void format_dump_filename(Task* t, FrameTime global_time, const char* tag,
+                          char* filename, size_t filename_size) {
+  snprintf(filename, filename_size - 1, "%s/%d_%lld_%s", t->trace_dir().c_str(),
+           t->rec_tid, (long long)global_time, tag);
 }
 
-bool should_dump_memory(const TraceFrame& f) {
+bool should_dump_memory(const Event& event, FrameTime time) {
   const Flags* flags = &Flags::get();
 
-#if defined(FIRST_INTERESTING_EVENT)
-  int is_syscall_exit = event >= 0 && state == STATE_SYSCALL_EXIT;
-  if (is_syscall_exit && RECORD == Flags->option &&
-      FIRST_INTERESTING_EVENT <= global_time &&
-      global_time <= LAST_INTERESTING_EVENT) {
-    return true;
-  }
-  if (global_time > LAST_INTERESTING_EVENT) {
-    return false;
-  }
-#endif
   return flags->dump_on == Flags::DUMP_ON_ALL ||
-         (f.event().is_syscall_event() &&
-          f.event().Syscall().number == flags->dump_on) ||
-         (f.event().is_signal_event() &&
-          f.event().Signal().siginfo.si_signo == -flags->dump_on) ||
+         (event.is_syscall_event() &&
+          event.Syscall().number == flags->dump_on) ||
+         (event.is_signal_event() &&
+          event.Signal().siginfo.si_signo == -flags->dump_on) ||
          (flags->dump_on == Flags::DUMP_ON_RDTSC &&
-          f.event().type() == EV_SEGV_DISABLED_INSN) ||
-         flags->dump_at == int(f.time());
+          event.type() == EV_INSTRUCTION_TRAP) ||
+         flags->dump_at == time;
 }
 
-void dump_process_memory(Task* t, TraceFrame::Time global_time,
-                         const char* tag) {
+void dump_process_memory(Task* t, FrameTime global_time, const char* tag) {
   char filename[PATH_MAX];
   FILE* dump_file;
 
@@ -167,7 +161,7 @@ void dump_process_memory(Task* t, TraceFrame::Time global_time,
   dump_file = fopen64(filename, "w");
 
   const AddressSpace& as = *(t->vm());
-  for (auto m : as.maps()) {
+  for (const auto& m : as.maps()) {
     vector<uint8_t> mem;
     mem.resize(m.map.size());
 
@@ -184,7 +178,7 @@ void dump_process_memory(Task* t, TraceFrame::Time global_time,
   fclose(dump_file);
 }
 
-static void notify_checksum_error(ReplayTask* t, TraceFrame::Time global_time,
+static void notify_checksum_error(ReplayTask* t, FrameTime global_time,
                                   unsigned checksum, unsigned rec_checksum,
                                   const string& raw_map_line) {
   char cur_dump[PATH_MAX];
@@ -231,7 +225,7 @@ enum ChecksumMode { STORE_CHECKSUMS, VALIDATE_CHECKSUMS };
 struct checksum_iterator_data {
   ChecksumMode mode;
   FILE* checksums_file;
-  TraceFrame::Time global_time;
+  FrameTime global_time;
 };
 
 static bool checksum_segment_filter(const AddressSpace::Mapping& m) {
@@ -274,21 +268,36 @@ static uint32_t compute_checksum(void* data, size_t len) {
 static const uint32_t ignored_checksum = 0x98765432;
 static const uint32_t sigbus_checksum = 0x23456789;
 
+static bool is_task_buffer(const AddressSpace& as,
+                           const AddressSpace::Mapping& m) {
+  for (Task* t : as.task_set()) {
+    if (t->syscallbuf_child.cast<void>() == m.map.start() &&
+        t->syscallbuf_size == m.map.size()) {
+      return true;
+    }
+    if (t->scratch_ptr == m.map.start() &&
+        t->scratch_size == (ssize_t)m.map.size()) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
  * Either create and store checksums for each segment mapped in |t|'s
  * address space, or validate an existing computed checksum.  Behavior
  * is selected by |mode|.
  */
 static void iterate_checksums(Task* t, ChecksumMode mode,
-                              TraceFrame::Time global_time) {
+                              FrameTime global_time) {
   struct checksum_iterator_data c;
   memset(&c, 0, sizeof(c));
   char filename[PATH_MAX];
   const char* fmode = (STORE_CHECKSUMS == mode) ? "w" : "r";
 
   c.mode = mode;
-  snprintf(filename, sizeof(filename) - 1, "%s/%d_%d", t->trace_dir().c_str(),
-           global_time, t->rec_tid);
+  snprintf(filename, sizeof(filename) - 1, "%s/%lld_%d", t->trace_dir().c_str(),
+           (long long)global_time, t->rec_tid);
   c.checksums_file = fopen64(filename, fmode);
   c.global_time = global_time;
   if (!c.checksums_file) {
@@ -311,7 +320,9 @@ static void iterate_checksums(Task* t, ChecksumMode mode,
 
     if (VALIDATE_CHECKSUMS == mode) {
       char line[1024];
-      fgets(line, sizeof(line), c.checksums_file);
+      if (!fgets(line, sizeof(line), c.checksums_file)) {
+        FATAL() << "Can't read checksum file";
+      }
       unsigned long rec_start;
       unsigned long rec_end;
       unsigned tmp_checksum;
@@ -321,22 +332,26 @@ static void iterate_checksums(Task* t, ChecksumMode mode,
       remote_ptr<void> rec_start_addr = rec_start;
       remote_ptr<void> rec_end_addr = rec_end;
       ASSERT(t, 3 == nparsed) << "Parsed " << nparsed << " items";
-      // If we have artifical SIGBUS regions, those may (if the entire region
-      // was SIGBUS), but need not have existed during recording, so fast
-      // forward to the next real region.
-      while (m.map.start() != rec_start_addr) {
-        ASSERT(t, m.flags & AddressSpace::Mapping::IS_SIGBUS_REGION)
-            << "Segment " << rec_start_addr << "-" << rec_end_addr
-            << " changed to " << m.map << "??";
-        ASSERT(t, it != as.maps().end());
-        m = *(++it);
-        continue;
+      for (; m.map.start() != rec_start_addr; m = *(++it)) {
+        if (is_task_buffer(as, m)) {
+          // This region corresponds to a task scratch or syscall buffer. We
+          // tear these down a little later during replay so just skip it for
+          // now.
+          continue;
+        }
+        if (m.flags & AddressSpace::Mapping::IS_SIGBUS_REGION) {
+          // If we have artifical SIGBUS regions, those may (if the entire
+          // region was SIGBUS), but need not, have existed during recording.
+          continue;
+        }
+        FATAL() << "Segment " << rec_start_addr << "-" << rec_end_addr
+                << " changed to " << m.map << "??";
       }
       // If the backing file is too short, we cut mappings short, to make sure
       // have the same behavior as during recording. Tolerate this.
-      ASSERT(t, m.map.end() <= rec_end_addr) << "Segment " << rec_start_addr
-                                             << "-" << rec_end_addr
-                                             << " changed to " << m.map << "??";
+      ASSERT(t, m.map.end() <= rec_end_addr)
+          << "Segment " << rec_start_addr << "-" << rec_end_addr
+          << " changed to " << m.map << "??";
       if (is_start_of_scratch_region(t, rec_start_addr)) {
         /* Replay doesn't touch scratch regions, so
          * their contents are allowed to diverge.
@@ -429,30 +444,21 @@ static void iterate_checksums(Task* t, ChecksumMode mode,
   fclose(c.checksums_file);
 }
 
-bool should_checksum(const TraceFrame& f) {
-  if (f.event().type() == EV_EXIT || f.event().type() == EV_UNSTABLE_EXIT) {
+bool should_checksum(const Event& event, FrameTime time) {
+  if (event.type() == EV_EXIT) {
     // Task is dead, or at least detached, and we can't read its memory safely.
     return false;
   }
-  if (f.event().has_ticks_slop()) {
+  if (event.has_ticks_slop()) {
     // We may not be at the same point during recording and replay, so don't
     // compute checksums.
     return false;
   }
 
-  int checksum = Flags::get().checksum;
-  bool is_syscall_exit = EV_SYSCALL == f.event().type() &&
-                         EXITING_SYSCALL == f.event().Syscall().state;
+  FrameTime checksum = Flags::get().checksum;
+  bool is_syscall_exit =
+      EV_SYSCALL == event.type() && EXITING_SYSCALL == event.Syscall().state;
 
-#if defined(FIRST_INTERESTING_EVENT)
-  if (is_syscall_exit && FIRST_INTERESTING_EVENT <= global_time &&
-      global_time <= LAST_INTERESTING_EVENT) {
-    return true;
-  }
-  if (global_time > LAST_INTERESTING_EVENT) {
-    return false;
-  }
-#endif
   if (Flags::CHECKSUM_NONE == checksum) {
     return false;
   }
@@ -463,14 +469,14 @@ bool should_checksum(const TraceFrame& f) {
     return is_syscall_exit;
   }
   /* |checksum| is a global time point. */
-  return checksum <= int(f.time());
+  return checksum <= time;
 }
 
-void checksum_process_memory(Task* t, TraceFrame::Time global_time) {
+void checksum_process_memory(Task* t, FrameTime global_time) {
   iterate_checksums(t, STORE_CHECKSUMS, global_time);
 }
 
-void validate_process_memory(Task* t, TraceFrame::Time global_time) {
+void validate_process_memory(Task* t, FrameTime global_time) {
   iterate_checksums(t, VALIDATE_CHECKSUMS, global_time);
 }
 
@@ -588,9 +594,15 @@ bool should_copy_mmap_region(const KernelMapping& mapping,
   bool private_mapping = (flags & MAP_PRIVATE);
 
   // TODO: handle mmap'd files that are unlinked during
-  // recording.
+  // recording or otherwise not available.
   if (!has_fs_name(file_name)) {
-    LOG(debug) << "  copying unlinked file";
+    // This includes files inaccessible because the tracee is using a different
+    // mount namespace with its own mounts
+    LOG(debug) << "  copying unlinked/inaccessible file";
+    return true;
+  }
+  if (!S_ISREG(stat.st_mode)) {
+    LOG(debug) << "  copying non-regular-file";
     return true;
   }
   if (is_tmp_file(file_name)) {
@@ -633,10 +645,10 @@ bool should_copy_mmap_region(const KernelMapping& mapping,
 
   // Inside a user namespace, the real root user may be mapped to UID 65534.
   if (!can_write_file && (0 == stat.st_uid || 65534 == stat.st_uid)) {
-    // We would like to assert this, but on Ubuntu 13.10,
+    // We would like to DEBUG_ASSERT this, but on Ubuntu 13.10,
     // the file /lib/i386-linux-gnu/libdl-2.17.so is
     // writeable by root for unknown reasons.
-    // assert(!(prot & PROT_WRITE));
+    // DEBUG_ASSERT(!(prot & PROT_WRITE));
     /* Mapping a file owned by root: we don't care if this
      * was a PRIVATE or SHARED mapping, because unless the
      * program is disastrously buggy or unlucky, the
@@ -674,9 +686,9 @@ bool should_copy_mmap_region(const KernelMapping& mapping,
   if (!can_write_file) {
     /* mmap'ing another user's (non-system) files?  Highly
      * irregular ... */
-    FATAL() << "Unhandled mmap " << file_name << "(prot:" << HEX(prot)
-            << ((flags & MAP_SHARED) ? ";SHARED" : "")
-            << "); uid:" << stat.st_uid << " mode:" << stat.st_mode;
+    LOG(warn) << "Scary mmap " << file_name << "(prot:" << HEX(prot)
+              << ((flags & MAP_SHARED) ? ";SHARED" : "")
+              << "); uid:" << stat.st_uid << " mode:" << stat.st_mode;
   }
   return true;
 }
@@ -704,7 +716,7 @@ static void cpuid_segv_handler(__attribute__((unused)) int sig,
   ucontext_t* ctx = (ucontext_t*)user;
 #if defined(__i386__)
   ctx->uc_mcontext.gregs[REG_EIP] += 2;
-  ctx->uc_mcontext.gregs(REG_EAX] = SEGV_HANDLER_MAGIC;
+  ctx->uc_mcontext.gregs[REG_EAX] = SEGV_HANDLER_MAGIC;
 #elif defined(__x86_64__)
   ctx->uc_mcontext.gregs[REG_RIP] += 2;
   ctx->uc_mcontext.gregs[REG_RAX] = SEGV_HANDLER_MAGIC;
@@ -855,6 +867,12 @@ vector<CPUIDRecord> all_cpuid_records() {
   return gather_cpuid_records(UINT32_MAX);
 }
 
+#ifdef SYS_arch_prctl
+#define RR_ARCH_PRCTL(a, b) syscall(SYS_arch_prctl, a, b)
+#else
+#define RR_ARCH_PRCTL(a, b) -1
+#endif
+
 bool cpuid_faulting_works() {
   static bool did_check_cpuid_faulting = false;
   static bool cpuid_faulting_ok = false;
@@ -865,7 +883,7 @@ bool cpuid_faulting_works() {
   did_check_cpuid_faulting = true;
 
   // Test to see if CPUID faulting works.
-  if (syscall(SYS_arch_prctl, ARCH_SET_CPUID, 0) != 0) {
+  if (RR_ARCH_PRCTL(ARCH_SET_CPUID, 0) != 0) {
     LOG(debug) << "CPUID faulting not supported by kernel/hardware";
     return false;
   }
@@ -892,10 +910,35 @@ bool cpuid_faulting_works() {
   if (sigaction(SIGSEGV, &old_sa, NULL) < 0) {
     FATAL() << "Can't restore sighandler";
   }
-  if (syscall(SYS_arch_prctl, ARCH_SET_CPUID, 1) < 0) {
+  if (RR_ARCH_PRCTL(ARCH_SET_CPUID, 1) < 0) {
     FATAL() << "Can't restore ARCH_SET_CPUID";
   }
   return cpuid_faulting_ok;
+}
+
+const CPUIDRecord* find_cpuid_record(const vector<CPUIDRecord>& records,
+                                     uint32_t eax, uint32_t ecx) {
+  for (const auto& rec : records) {
+    if (rec.eax_in == eax && (rec.ecx_in == ecx || rec.ecx_in == UINT32_MAX)) {
+      return &rec;
+    }
+  }
+  return nullptr;
+}
+
+bool cpuid_compatible(const vector<CPUIDRecord>& trace_records) {
+  // We could compare all CPUID records but that might be fragile (it's hard to
+  // be sure the values don't change in ways applications don't care about).
+  // Let's just check the microarch for now.
+  auto cpuid_data = cpuid(CPUID_GETFEATURES, 0);
+  unsigned int cpu_type = cpuid_data.eax & 0xF0FF0;
+  auto trace_cpuid_data =
+      find_cpuid_record(trace_records, CPUID_GETFEATURES, 0);
+  if (!trace_cpuid_data) {
+    FATAL() << "GETFEATURES missing???";
+  }
+  unsigned int trace_cpu_type = trace_cpuid_data->out.eax & 0xF0FF0;
+  return cpu_type == trace_cpu_type;
 }
 
 template <typename Arch>
@@ -949,10 +992,10 @@ int read_elf_class(const string& filename) {
 // Setting these causes us to trace instructions after
 // instruction_trace_at_event_start up to and including
 // instruction_trace_at_event_last
-static TraceFrame::Time instruction_trace_at_event_start = 0;
-static TraceFrame::Time instruction_trace_at_event_last = 0;
+static FrameTime instruction_trace_at_event_start = 0;
+static FrameTime instruction_trace_at_event_last = 0;
 
-bool trace_instructions_up_to_event(TraceFrame::Time event) {
+bool trace_instructions_up_to_event(FrameTime event) {
   return event > instruction_trace_at_event_start &&
          event <= instruction_trace_at_event_last;
 }
@@ -1051,6 +1094,11 @@ vector<string> read_proc_status_fields(pid_t tid, const char* name,
   return result;
 }
 
+bool is_zombie_process(pid_t pid) {
+  auto state = read_proc_status_fields(pid, "State");
+  return state.empty() || state[0].empty() || state[0][0] == 'Z';
+}
+
 static bool check_for_pax_kernel() {
   auto results = read_proc_status_fields(getpid(), "PaX");
   return !results.empty();
@@ -1061,17 +1109,19 @@ bool uses_invisible_guard_page() {
   return !is_pax_kernel;
 }
 
-void copy_file(Task* t, int dest_fd, int src_fd) {
-  char buf[1024];
+bool copy_file(int dest_fd, int src_fd) {
+  char buf[32 * 1024];
   while (1) {
     ssize_t bytes_read = read(src_fd, buf, sizeof(buf));
-    ASSERT(t, bytes_read >= 0);
+    if (bytes_read < 0) {
+      return false;
+    }
     if (!bytes_read) {
       break;
     }
-    ssize_t bytes_written = write(dest_fd, buf, bytes_read);
-    ASSERT(t, bytes_written == bytes_read);
+    write_all(dest_fd, buf, bytes_read);
   }
+  return true;
 }
 
 void* xmalloc(size_t size) {
@@ -1123,7 +1173,7 @@ XSaveLayout xsave_layout_from_trace(const std::vector<CPUIDRecord> records) {
   }
 
   CPUIDRecord cpuid_data = records[record_index];
-  assert(cpuid_data.ecx_in == 0);
+  DEBUG_ASSERT(cpuid_data.ecx_in == 0);
   layout.full_size = cpuid_data.out.ecx;
   layout.supported_feature_bits =
       cpuid_data.out.eax | (uint64_t(cpuid_data.out.edx) << 32);
@@ -1211,12 +1261,12 @@ void notifying_abort() {
 
 void dump_rr_stack() {
   static const char msg[] = "=== Start rr backtrace:\n";
-  write(STDERR_FILENO, msg, sizeof(msg) - 1);
+  write_all(STDERR_FILENO, msg, sizeof(msg) - 1);
   void* buffer[1024];
   int count = backtrace(buffer, 1024);
   backtrace_symbols_fd(buffer, count, STDERR_FILENO);
   static const char msg2[] = "=== End rr backtrace\n";
-  write(STDERR_FILENO, msg2, sizeof(msg2) - 1);
+  write_all(STDERR_FILENO, msg2, sizeof(msg2) - 1);
 }
 
 void check_for_leaks() {
@@ -1233,14 +1283,55 @@ void check_for_leaks() {
   }
 }
 
+void ensure_dir(const string& dir, const char* dir_type, mode_t mode) {
+  string d = dir;
+  while (!d.empty() && d[d.length() - 1] == '/') {
+    d = d.substr(0, d.length() - 1);
+  }
+
+  struct stat st;
+  if (0 > stat(d.c_str(), &st)) {
+    if (errno != ENOENT) {
+      FATAL() << "Error accessing " << dir_type << " " << dir << "'";
+    }
+
+    size_t last_slash = d.find_last_of('/');
+    if (last_slash == string::npos || last_slash == 0) {
+      FATAL() << "Can't find directory `" << dir << "'";
+    }
+    ensure_dir(d.substr(0, last_slash), dir_type, mode);
+
+    // Allow for a race condition where someone else creates the directory
+    if (0 > mkdir(d.c_str(), mode) && errno != EEXIST) {
+      FATAL() << "Can't create " << dir_type << " `" << dir << "'";
+    }
+    if (0 > stat(d.c_str(), &st)) {
+      FATAL() << "Can't stat " << dir_type << " `" << dir << "'";
+    }
+  }
+
+  if (!(S_IFDIR & st.st_mode)) {
+    FATAL() << "`" << dir << "' exists but isn't a directory.";
+  }
+  if (access(d.c_str(), W_OK)) {
+    FATAL() << "Can't write to " << dir_type << " `" << dir << "'.";
+  }
+}
+
 const char* tmp_dir() {
   const char* dir = getenv("RR_TMPDIR");
   if (dir) {
+    ensure_dir(string(dir), "temporary file directory (RR_TMPDIR)", S_IRWXU);
     return dir;
   }
   dir = getenv("TMPDIR");
   if (dir) {
+    ensure_dir(string(dir), "temporary file directory (TMPDIR)", S_IRWXU);
     return dir;
+  }
+  // Don't try to create "/tmp", that probably won't work well.
+  if (access("/tmp", W_OK)) {
+    FATAL() << "Can't write to temporary file directory /tmp.";
   }
   return "/tmp";
 }
@@ -1406,6 +1497,122 @@ int choose_cpu(BindCPU bind_cpu) {
     return cpu;
   }
   return random() % get_num_cpus();
+}
+
+uint32_t crc32(uint32_t crc, unsigned char* buf, size_t len) {
+  static const uint32_t crc32_table[256] = {
+    0x00000000, 0x77073096, 0xee0e612c, 0x990951ba, 0x076dc419, 0x706af48f,
+    0xe963a535, 0x9e6495a3, 0x0edb8832, 0x79dcb8a4, 0xe0d5e91e, 0x97d2d988,
+    0x09b64c2b, 0x7eb17cbd, 0xe7b82d07, 0x90bf1d91, 0x1db71064, 0x6ab020f2,
+    0xf3b97148, 0x84be41de, 0x1adad47d, 0x6ddde4eb, 0xf4d4b551, 0x83d385c7,
+    0x136c9856, 0x646ba8c0, 0xfd62f97a, 0x8a65c9ec, 0x14015c4f, 0x63066cd9,
+    0xfa0f3d63, 0x8d080df5, 0x3b6e20c8, 0x4c69105e, 0xd56041e4, 0xa2677172,
+    0x3c03e4d1, 0x4b04d447, 0xd20d85fd, 0xa50ab56b, 0x35b5a8fa, 0x42b2986c,
+    0xdbbbc9d6, 0xacbcf940, 0x32d86ce3, 0x45df5c75, 0xdcd60dcf, 0xabd13d59,
+    0x26d930ac, 0x51de003a, 0xc8d75180, 0xbfd06116, 0x21b4f4b5, 0x56b3c423,
+    0xcfba9599, 0xb8bda50f, 0x2802b89e, 0x5f058808, 0xc60cd9b2, 0xb10be924,
+    0x2f6f7c87, 0x58684c11, 0xc1611dab, 0xb6662d3d, 0x76dc4190, 0x01db7106,
+    0x98d220bc, 0xefd5102a, 0x71b18589, 0x06b6b51f, 0x9fbfe4a5, 0xe8b8d433,
+    0x7807c9a2, 0x0f00f934, 0x9609a88e, 0xe10e9818, 0x7f6a0dbb, 0x086d3d2d,
+    0x91646c97, 0xe6635c01, 0x6b6b51f4, 0x1c6c6162, 0x856530d8, 0xf262004e,
+    0x6c0695ed, 0x1b01a57b, 0x8208f4c1, 0xf50fc457, 0x65b0d9c6, 0x12b7e950,
+    0x8bbeb8ea, 0xfcb9887c, 0x62dd1ddf, 0x15da2d49, 0x8cd37cf3, 0xfbd44c65,
+    0x4db26158, 0x3ab551ce, 0xa3bc0074, 0xd4bb30e2, 0x4adfa541, 0x3dd895d7,
+    0xa4d1c46d, 0xd3d6f4fb, 0x4369e96a, 0x346ed9fc, 0xad678846, 0xda60b8d0,
+    0x44042d73, 0x33031de5, 0xaa0a4c5f, 0xdd0d7cc9, 0x5005713c, 0x270241aa,
+    0xbe0b1010, 0xc90c2086, 0x5768b525, 0x206f85b3, 0xb966d409, 0xce61e49f,
+    0x5edef90e, 0x29d9c998, 0xb0d09822, 0xc7d7a8b4, 0x59b33d17, 0x2eb40d81,
+    0xb7bd5c3b, 0xc0ba6cad, 0xedb88320, 0x9abfb3b6, 0x03b6e20c, 0x74b1d29a,
+    0xead54739, 0x9dd277af, 0x04db2615, 0x73dc1683, 0xe3630b12, 0x94643b84,
+    0x0d6d6a3e, 0x7a6a5aa8, 0xe40ecf0b, 0x9309ff9d, 0x0a00ae27, 0x7d079eb1,
+    0xf00f9344, 0x8708a3d2, 0x1e01f268, 0x6906c2fe, 0xf762575d, 0x806567cb,
+    0x196c3671, 0x6e6b06e7, 0xfed41b76, 0x89d32be0, 0x10da7a5a, 0x67dd4acc,
+    0xf9b9df6f, 0x8ebeeff9, 0x17b7be43, 0x60b08ed5, 0xd6d6a3e8, 0xa1d1937e,
+    0x38d8c2c4, 0x4fdff252, 0xd1bb67f1, 0xa6bc5767, 0x3fb506dd, 0x48b2364b,
+    0xd80d2bda, 0xaf0a1b4c, 0x36034af6, 0x41047a60, 0xdf60efc3, 0xa867df55,
+    0x316e8eef, 0x4669be79, 0xcb61b38c, 0xbc66831a, 0x256fd2a0, 0x5268e236,
+    0xcc0c7795, 0xbb0b4703, 0x220216b9, 0x5505262f, 0xc5ba3bbe, 0xb2bd0b28,
+    0x2bb45a92, 0x5cb36a04, 0xc2d7ffa7, 0xb5d0cf31, 0x2cd99e8b, 0x5bdeae1d,
+    0x9b64c2b0, 0xec63f226, 0x756aa39c, 0x026d930a, 0x9c0906a9, 0xeb0e363f,
+    0x72076785, 0x05005713, 0x95bf4a82, 0xe2b87a14, 0x7bb12bae, 0x0cb61b38,
+    0x92d28e9b, 0xe5d5be0d, 0x7cdcefb7, 0x0bdbdf21, 0x86d3d2d4, 0xf1d4e242,
+    0x68ddb3f8, 0x1fda836e, 0x81be16cd, 0xf6b9265b, 0x6fb077e1, 0x18b74777,
+    0x88085ae6, 0xff0f6a70, 0x66063bca, 0x11010b5c, 0x8f659eff, 0xf862ae69,
+    0x616bffd3, 0x166ccf45, 0xa00ae278, 0xd70dd2ee, 0x4e048354, 0x3903b3c2,
+    0xa7672661, 0xd06016f7, 0x4969474d, 0x3e6e77db, 0xaed16a4a, 0xd9d65adc,
+    0x40df0b66, 0x37d83bf0, 0xa9bcae53, 0xdebb9ec5, 0x47b2cf7f, 0x30b5ffe9,
+    0xbdbdf21c, 0xcabac28a, 0x53b39330, 0x24b4a3a6, 0xbad03605, 0xcdd70693,
+    0x54de5729, 0x23d967bf, 0xb3667a2e, 0xc4614ab8, 0x5d681b02, 0x2a6f2b94,
+    0xb40bbe37, 0xc30c8ea1, 0x5a05df1b, 0x2d02ef8d
+  };
+
+  for (unsigned char* end = buf + len; buf < end; ++buf) {
+    crc = crc32_table[(crc ^ *buf) & 0xff] ^ (crc >> 8);
+  }
+  return crc;
+}
+
+void write_all(int fd, const void* buf, size_t size) {
+  while (size > 0) {
+    ssize_t ret = ::write(fd, buf, size);
+    if (ret <= 0) {
+      FATAL() << "Can't write " << size << " bytes";
+    }
+    buf = static_cast<const char*>(buf) + ret;
+    size -= ret;
+  }
+}
+
+bool is_directory(const char* path) {
+  struct stat buf;
+  if (stat(path, &buf) < 0) {
+    return false;
+  }
+  return (buf.st_mode & S_IFDIR) != 0;
+}
+
+ssize_t read_to_end(const ScopedFd& fd, size_t offset, void* buf, size_t size) {
+  ssize_t ret = 0;
+  while (size) {
+    ssize_t r = pread(fd.get(), buf, size, offset);
+    if (r < 0) {
+      return -1;
+    }
+    if (r == 0) {
+      return ret;
+    }
+    offset += r;
+    ret += r;
+    size -= r;
+    buf = static_cast<uint8_t*>(buf) + r;
+  }
+  return ret;
+}
+
+static struct rlimit initial_fd_limit;
+
+void raise_resource_limits() {
+  if (getrlimit(RLIMIT_NOFILE, &initial_fd_limit) < 0) {
+    FATAL() << "Can't get RLIMIT_NOFILE";
+  }
+
+  struct rlimit new_limit = initial_fd_limit;
+  // Try raising fd limit to 65536
+  new_limit.rlim_cur = max<rlim_t>(new_limit.rlim_cur, 65536);
+  if (new_limit.rlim_max != RLIM_INFINITY) {
+    new_limit.rlim_cur = min<rlim_t>(new_limit.rlim_cur, new_limit.rlim_max);
+  }
+  if (new_limit.rlim_cur != initial_fd_limit.rlim_cur) {
+    if (setrlimit(RLIMIT_NOFILE, &new_limit) < 0) {
+      LOG(warn) << "Failed to raise file descriptor limit";
+    }
+  }
+}
+
+void restore_initial_resource_limits() {
+  if (setrlimit(RLIMIT_NOFILE, &initial_fd_limit) < 0) {
+    LOG(warn) << "Failed to reset file descriptor limit";
+  }
 }
 
 } // namespace rr

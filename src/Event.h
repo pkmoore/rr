@@ -3,14 +3,16 @@
 #ifndef RR_EVENT_H_
 #define RR_EVENT_H_
 
-#include <assert.h>
-
 #include <ostream>
 #include <stack>
 #include <string>
+#include <vector>
 
 #include "Registers.h"
+#include "core.h"
 #include "kernel_abi.h"
+#include "kernel_metadata.h"
+#include "preload/preload_interface.h"
 
 struct syscallbuf_record;
 
@@ -50,23 +52,18 @@ enum EventType {
   EV_NOOP,
   EV_DESCHED,
   EV_SECCOMP_TRAP,
+  EV_SYSCALL_INTERRUPTION,
+  // Not stored in trace, but synthesized when we reach the end of the trace.
+  EV_TRACE_TERMINATION,
 
   // Events present in traces:
 
   // No associated data.
   EV_EXIT,
-  // Tracee exited its sighandler.  We leave this breadcrumb so
-  // that the popping of not-restarted syscall interruptions and
-  // sigreturns is replayed in the same order.
-  EV_EXIT_SIGHANDLER,
-  // Pretty self-explanatory: recording detected that an
-  // interrupted syscall wasn't restarted, so the interruption
-  // record can be popped off the tracee's event stack.
-  EV_INTERRUPTED_SYSCALL_NOT_RESTARTED,
   // Scheduling signal interrupted the trace.
   EV_SCHED,
   // A disabled RDTSC or CPUID instruction.
-  EV_SEGV_DISABLED_INSN,
+  EV_INSTRUCTION_TRAP,
   // Recorded syscallbuf data for one or more buffered syscalls.
   EV_SYSCALLBUF_FLUSH,
   EV_SYSCALLBUF_ABORT_COMMIT,
@@ -81,76 +78,14 @@ enum EventType {
   // Map memory pages due to a (future) memory access. This is associated
   // with a mmap entry for the new pages.
   EV_GROW_MAP,
-  // The trace was terminated before all tasks exited, most
-  // likely because the recorder was sent a terminating signal.
-  // There are no more trace frames coming, so the best thing to
-  // do is probably to shut down.
-  EV_TRACE_TERMINATION,
-  // Like USR_EXIT, but recorded when the task is in an
-  // "unstable" state in which we're not sure we can
-  // synchronously wait for it to "really finish".
-  EV_UNSTABLE_EXIT,
   // Use .signal.
   EV_SIGNAL,
   EV_SIGNAL_DELIVERY,
   EV_SIGNAL_HANDLER,
   // Use .syscall.
   EV_SYSCALL,
-  EV_SYSCALL_INTERRUPTION,
 
   EV_LAST
-};
-
-enum HasExecInfo { NO_EXEC_INFO, HAS_EXEC_INFO };
-
-/**
- * An encoding of the relevant bits of |struct event| that can be
- * cheaply and easily serialized.
- */
-union EncodedEvent {
-  struct {
-    EventType type : 5;
-    HasExecInfo has_exec_info : 1;
-    SupportedArch arch_ : 1;
-    int data : 25;
-  };
-  int encoded;
-
-  bool operator==(const EncodedEvent& other) const {
-    return encoded == other.encoded;
-  }
-  bool operator!=(const EncodedEvent& other) const { return !(*this == other); }
-
-  SupportedArch arch() const { return arch_; }
-};
-
-static_assert(sizeof(int) == sizeof(EncodedEvent), "Bit fields are messed up");
-static_assert(EV_LAST < (1 << 5), "Allocate more bits to the |type| field");
-
-/**
- * Events are interesting occurrences during tracee execution which
- * are relevant for replay.  Most events correspond to tracee
- * execution, but some (a subset of "pseudosigs") save actions that
- * the *recorder* took on behalf of the tracee.
- */
-struct BaseEvent {
-  /**
-   * Pass |HAS_EXEC_INFO| if the event is at a stable execution
-   * point that we'll reach during replay too.
-   */
-  BaseEvent(HasExecInfo has_exec_info, SupportedArch arch)
-      : has_exec_info(has_exec_info), arch_(arch) {}
-
-  SupportedArch arch() const { return arch_; }
-
-  // When replaying an event is expected to leave the tracee in
-  // the same execution state as during replay, the event has
-  // meaningful execution info, and it should be recorded for
-  // checking.  But some pseudosigs aren't recorded in the same
-  // tracee state they'll be replayed, so the tracee exeuction
-  // state isn't meaningful.
-  HasExecInfo has_exec_info;
-  SupportedArch arch_;
 };
 
 /**
@@ -160,11 +95,9 @@ struct BaseEvent {
  * unbounded amount of time).  After the syscall exits, rr advances
  * the tracee to where the desched is "disarmed" by the tracee.
  */
-struct DeschedEvent : public BaseEvent {
+struct DeschedEvent {
   /** Desched of |rec|. */
-  DeschedEvent(remote_ptr<const struct syscallbuf_record> rec,
-               SupportedArch arch)
-      : BaseEvent(NO_EXEC_INFO, arch), rec(rec) {}
+  DeschedEvent(remote_ptr<const struct syscallbuf_record> rec) : rec(rec) {}
   // Record of the syscall that was interrupted by a desched
   // notification.  It's legal to reference this memory /while
   // the desched is being processed only/, because |t| is in the
@@ -173,55 +106,28 @@ struct DeschedEvent : public BaseEvent {
   remote_ptr<const struct syscallbuf_record> rec;
 };
 
+struct SyscallbufFlushEvent {
+  SyscallbufFlushEvent() {}
+  std::vector<mprotect_record> mprotect_records;
+};
+
 enum SignalDeterministic { NONDETERMINISTIC_SIG = 0, DETERMINISTIC_SIG = 1 };
-enum SignalBlocked { SIG_UNBLOCKED = 0, SIG_BLOCKED = 1 };
-enum SignalOutcome {
+enum SignalResolvedDisposition {
   DISPOSITION_FATAL = 0,
   DISPOSITION_USER_HANDLER = 1,
   DISPOSITION_IGNORED = 2,
 };
-struct SignalEvent : public BaseEvent {
+struct SignalEvent {
   /**
    * Signal |signo| is the signum, and |deterministic| is true
    * for deterministically-delivered signals (see
    * record_signal.cc).
    */
   SignalEvent(const siginfo_t& siginfo, SignalDeterministic deterministic,
-              Task* t);
-  SignalEvent(int signo, SignalDeterministic deterministic, SupportedArch arch)
-      : BaseEvent(HAS_EXEC_INFO, arch), deterministic(deterministic) {
-    memset(&siginfo, 0, sizeof(siginfo));
-    siginfo.si_signo = signo;
-  }
-
-  /**
-   * For SIGILL, SIGFPE, SIGSEGV, SIGBUS and SIGTRAP this is si_addr.
-   * For other signals this is zero.
-   */
-  uint64_t signal_data() const {
-    switch (siginfo.si_signo) {
-      case SIGILL:
-      case SIGFPE:
-      case SIGSEGV:
-      case SIGBUS:
-      case SIGTRAP:
-        return (uint64_t)siginfo.si_addr;
-      default:
-        return 0;
-    }
-  }
-
-  void set_signal_data(uint64_t data) {
-    switch (siginfo.si_signo) {
-      case SIGILL:
-      case SIGFPE:
-      case SIGSEGV:
-      case SIGBUS:
-      case SIGTRAP:
-        siginfo.si_addr = (void*)data;
-        break;
-    }
-  }
+              SignalResolvedDisposition disposition)
+      : siginfo(siginfo),
+        deterministic(deterministic),
+        disposition(disposition) {}
 
   // Signal info
   siginfo_t siginfo;
@@ -229,6 +135,7 @@ struct SignalEvent : public BaseEvent {
   // side effect of retiring an instruction during replay, for
   // example |load $r 0x0| deterministically raises SIGSEGV.
   SignalDeterministic deterministic;
+  SignalResolvedDisposition disposition;
 };
 
 /**
@@ -276,18 +183,33 @@ enum SyscallState {
   // with the recorded system call result.
   EXITING_SYSCALL
 };
-struct SyscallEvent : public BaseEvent {
+
+struct OpenedFd {
+  std::string path;
+  int fd;
+};
+
+struct SyscallEvent {
   /** Syscall |syscallno| is the syscall number. */
   SyscallEvent(int syscallno, SupportedArch arch)
-      : BaseEvent(HAS_EXEC_INFO, arch),
+      : arch_(arch),
         regs(arch),
         desched_rec(nullptr),
+        write_offset(-1),
         state(NO_SYSCALL),
         number(syscallno),
         switchable(PREVENT_SWITCH),
         is_restart(false),
         failed_during_preparation(false),
         in_sysemu(false) {}
+
+  std::string syscall_name() const { return rr::syscall_name(number, arch()); }
+
+  SupportedArch arch() const { return arch_; }
+  /** Change the architecture for this event. */
+  void set_arch(SupportedArch a) { arch_ = a; }
+
+  SupportedArch arch_;
   // The original (before scratch is set up) arguments to the
   // syscall passed by the tracee.  These are used to detect
   // restarted syscalls.
@@ -295,6 +217,12 @@ struct SyscallEvent : public BaseEvent {
   // If this is a descheduled buffered syscall, points at the
   // record for that syscall.
   remote_ptr<const struct syscallbuf_record> desched_rec;
+
+  // Extra data for specific syscalls. Only used for exit events currently.
+  // -1 to indicate there isn't one
+  int64_t write_offset;
+  std::vector<int> exec_fds_to_close;
+  std::vector<OpenedFd> opened;
 
   SyscallState state;
   // Syscall number.
@@ -324,76 +252,56 @@ static const syscall_interruption_t interrupted;
  */
 struct Event {
   Event() : event_type(EV_UNASSIGNED) {}
-  Event(EventType type, HasExecInfo info, SupportedArch arch)
-      : event_type(type), base(info, arch) {}
   Event(const DeschedEvent& ev) : event_type(EV_DESCHED), desched(ev) {}
-  Event(const SignalEvent& ev) : event_type(EV_SIGNAL), signal(ev) {}
+  Event(EventType type, const SignalEvent& ev) : event_type(type), signal(ev) {}
+  Event(const SyscallbufFlushEvent& ev)
+      : event_type(EV_SYSCALLBUF_FLUSH), syscallbuf_flush(ev) {}
   Event(const SyscallEvent& ev) : event_type(EV_SYSCALL), syscall(ev) {}
   Event(const syscall_interruption_t&, const SyscallEvent& ev)
       : event_type(EV_SYSCALL_INTERRUPTION), syscall(ev) {}
-  /**
-   * Re-construct this from an encoding created by
-   * |Event::encode()|.
-   */
-  Event(EncodedEvent e);
-
   Event(const Event& o);
   ~Event();
   Event& operator=(const Event& o);
 
-  // Events can always be cased to BaseEvent regardless of the
-  // current concrete type, because all constituent types
-  // inherit from BaseEvent.
-  BaseEvent& Base() { return base; }
-  const BaseEvent& Base() const { return base; }
-
   DeschedEvent& Desched() {
-    assert(EV_DESCHED == event_type);
+    DEBUG_ASSERT(EV_DESCHED == event_type);
     return desched;
   }
   const DeschedEvent& Desched() const {
-    assert(EV_DESCHED == event_type);
+    DEBUG_ASSERT(EV_DESCHED == event_type);
     return desched;
   }
 
+  SyscallbufFlushEvent& SyscallbufFlush() {
+    DEBUG_ASSERT(EV_SYSCALLBUF_FLUSH == event_type);
+    return syscallbuf_flush;
+  }
+  const SyscallbufFlushEvent& SyscallbufFlush() const {
+    DEBUG_ASSERT(EV_SYSCALLBUF_FLUSH == event_type);
+    return syscallbuf_flush;
+  }
+
   SignalEvent& Signal() {
-    assert(is_signal_event());
+    DEBUG_ASSERT(is_signal_event());
     return signal;
   }
   const SignalEvent& Signal() const {
-    assert(is_signal_event());
+    DEBUG_ASSERT(is_signal_event());
     return signal;
   }
 
   SyscallEvent& Syscall() {
-    assert(is_syscall_event());
+    DEBUG_ASSERT(is_syscall_event());
     return syscall;
   }
   const SyscallEvent& Syscall() const {
-    assert(is_syscall_event());
+    DEBUG_ASSERT(is_syscall_event());
     return syscall;
   }
 
-  enum {
-    // Deterministic signals are encoded as (signum | DET_SIGNAL_BIT).
-    DET_SIGNAL_BIT = 0x80
-  };
+  bool record_regs() const;
 
-  /**
-   * Return an encoding of this event that can be cheaply
-   * serialized.  The encoding is lossy.
-   */
-  EncodedEvent encode() const;
-
-  /**
-   * Return true if a tracee at this event has meaningful
-   * execution info (registers etc.)  that rr should record.
-   * "Meaningful" means that the same state will be seen when
-   * reaching this event during replay.
-   */
-  HasExecInfo record_exec_info() const;
-
-  HasExecInfo has_exec_info() const { return base.has_exec_info; }
+  bool record_extra_regs() const;
 
   bool has_ticks_slop() const;
 
@@ -422,37 +330,37 @@ struct Event {
   /** Return the current type of this. */
   EventType type() const { return event_type; }
 
-  /** Return the architecture associated with this. */
-  SupportedArch arch() const { return base.arch(); }
-
-  /** Change the architecture for this event. */
-  void set_arch(SupportedArch a) { base.arch_ = a; }
-
   /** Return a string naming |ev|'s type. */
   std::string type_name() const;
 
-  /** Return an event of type EV_NOOP. */
-  static Event noop(SupportedArch arch) {
-    return Event(EV_NOOP, NO_EXEC_INFO, arch);
+  static Event noop() { return Event(EV_NOOP); }
+  static Event trace_termination() { return Event(EV_TRACE_TERMINATION); }
+  static Event instruction_trap() { return Event(EV_INSTRUCTION_TRAP); }
+  static Event patch_syscall() { return Event(EV_PATCH_SYSCALL); }
+  static Event sched() { return Event(EV_SCHED); }
+  static Event seccomp_trap() { return Event(EV_SECCOMP_TRAP); }
+  static Event syscallbuf_abort_commit() {
+    return Event(EV_SYSCALLBUF_ABORT_COMMIT);
   }
+  static Event syscallbuf_reset() { return Event(EV_SYSCALLBUF_RESET); }
+  static Event grow_map() { return Event(EV_GROW_MAP); }
+  static Event exit() { return Event(EV_EXIT); }
+  static Event sentinel() { return Event(EV_SENTINEL); }
 
 private:
+  Event(EventType type) : event_type(type) {}
+
   EventType event_type;
   union {
-    BaseEvent base;
     DeschedEvent desched;
     SignalEvent signal;
     SyscallEvent syscall;
+    SyscallbufFlushEvent syscallbuf_flush;
   };
 };
 
 inline static std::ostream& operator<<(std::ostream& o, const Event& ev) {
   return o << ev.str();
-}
-
-inline static std::ostream& operator<<(std::ostream& o,
-                                       const EncodedEvent& ev) {
-  return o << Event(ev);
 }
 
 const char* state_name(SyscallState state);

@@ -20,6 +20,7 @@
 #include "TaskishUid.h"
 #include "TraceStream.h"
 #include "WaitStatus.h"
+#include "core.h"
 #include "kernel_abi.h"
 #include "kernel_supplement.h"
 #include "remote_code_ptr.h"
@@ -37,12 +38,12 @@ class RecordTask;
 class ReplaySession;
 class ScopedFd;
 class Session;
-class TaskGroup;
+class ThreadGroup;
 
 enum CloneFlags {
   /**
    * The child gets a semantic copy of all parent resources (and
-   * becomes a new task group).  This is the semantics of the
+   * becomes a new thread group).  This is the semantics of the
    * fork() syscall.
    */
   CLONE_SHARE_NOTHING = 0,
@@ -51,8 +52,8 @@ enum CloneFlags {
    * parent.
    */
   CLONE_SHARE_SIGHANDLERS = 1 << 0,
-  /** Child will join its parent's task group. */
-  CLONE_SHARE_TASK_GROUP = 1 << 1,
+  /** Child will join its parent's thread group. */
+  CLONE_SHARE_THREAD_GROUP = 1 << 1,
   /** Child will share its parent's address space. */
   CLONE_SHARE_VM = 1 << 2,
   /** Child will share its parent's file descriptor table. */
@@ -114,8 +115,6 @@ struct TrapReasons {
   bool breakpoint;
 };
 
-void fixup_syscall_registers(Registers& registers, SupportedArch arch);
-
 /**
  * A "task" is a task in the linux usage: the unit of scheduling.  (OS
  * people sometimes call this a "thread control block".)  Multiple
@@ -131,6 +130,10 @@ class Task {
   friend class ReplaySession;
 
 public:
+
+  bool spin_off_on_next_resume_execution = false;
+  bool spun_off = false;
+
   typedef std::vector<WatchConfig> DebugRegs;
 
   /**
@@ -197,11 +200,10 @@ public:
 
   /**
    * Syscalls have side effects on registers (e.g. setting the flags register).
-   * Perform those side effects on |regs| and do set_regs() on that to make it
-   * look like a syscall happened.
+   * Perform those side effects on |registers| to make it look like a syscall
+   * happened.
    */
-  void canonicalize_and_set_regs(const Registers& regs,
-                                 SupportedArch syscall_arch);
+  void canonicalize_regs(SupportedArch syscall_arch);
 
   /**
    * Return the ptrace message pid associated with the current ptrace
@@ -319,8 +321,9 @@ public:
   /**
    * Assuming we've just entered a syscall, exit that syscall and reset
    * state to reenter the syscall just as it was called the first time.
+   * Returns false if we see the process exit instead.
    */
-  void exit_syscall_and_prepare_restart();
+  bool exit_syscall_and_prepare_restart();
 
   /**
    * We're currently in user-space with registers set up to perform a system
@@ -333,9 +336,10 @@ public:
    * We have observed entry to a syscall (either by PTRACE_EVENT_SECCOMP or
    * a syscall, depending on the value of Session::syscall_seccomp_ordering()).
    * Continue into the kernel to perform the syscall and stop at the
-   * PTRACE_SYSCALL syscall-exit trap.
+   * PTRACE_SYSCALL syscall-exit trap. Returns false if we see the process exit
+   * before that.
    */
-  void exit_syscall();
+  bool exit_syscall();
 
   /**
    * Return the "task name"; i.e. what |prctl(PR_GET_NAME)| or
@@ -353,10 +357,8 @@ public:
   /**
    * Call this method when this task has exited a successful execve() syscall.
    * At this point it is safe to make remote syscalls.
-   * |event| is the TraceTaskEvent (EXEC) that will be recorded or is being
-   * replayed.
    */
-  void post_exec_syscall(TraceTaskEvent& event);
+  void post_exec_syscall();
 
   /**
    * Return true if this task has execed.
@@ -440,8 +442,7 @@ public:
    * If interrupt_after_elapsed is nonzero, we interrupt the task
    * after that many seconds have elapsed.
    *
-   * You probably want to use one of the cont*() helpers above,
-   * and not this.
+   * All tracee execution goes through here.
    */
   void resume_execution(ResumeRequest how, WaitRequest wait_how,
                         TicksRequest tick_period, int sig = 0);
@@ -449,8 +450,11 @@ public:
   /** Return the session this is part of. */
   Session& session() const { return *session_; }
 
-  /** Set the tracee's registers to |regs|. */
+  /** Set the tracee's registers to |regs|. Lazy. */
   void set_regs(const Registers& regs);
+
+  /** Ensure registers are flushed back to the underlying task. */
+  void flush_regs();
 
   /** Set the tracee's extra registers to |regs|. */
   void set_extra_regs(const ExtraRegisters& regs);
@@ -511,12 +515,12 @@ public:
 
   void clear_wait_status() { wait_status = WaitStatus(); }
 
-  /** Return the task group this belongs to. */
-  std::shared_ptr<TaskGroup> task_group() { return tg; }
+  /** Return the thread group this belongs to. */
+  std::shared_ptr<ThreadGroup> thread_group() const { return tg; }
 
   /** Return the id of this task's recorded thread group. */
   pid_t tgid() const;
-  /** Return id of real OS task group. */
+  /** Return id of real OS thread group. */
   pid_t real_tgid() const;
 
   TaskUid tuid() const { return TaskUid(rec_tid, serial); }
@@ -566,9 +570,14 @@ public:
    * block.
    */
   bool try_wait();
+  /**
+   * Return true if an unexpected exit was already detected for this task and
+   * it is ready to be reported.
+   */
+  bool wait_unexpected_exit();
 
   /**
-   * Currently we don't allow recording across uid changwrite_memes, so we can
+   * Currently we don't allow recording across uid changes, so we can
    * just return rr's uid.
    */
   uid_t getuid() { return ::getuid(); }
@@ -590,7 +599,7 @@ public:
   template <typename T>
   void write_mem(remote_ptr<T> child_addr, const T& val, bool* ok = nullptr,
                  uint32_t flags = 0) {
-    assert(type_has_no_holes<T>());
+    DEBUG_ASSERT(type_has_no_holes<T>());
     write_bytes_helper(child_addr, sizeof(val), static_cast<const void*>(&val),
                        ok, flags);
   }
@@ -604,7 +613,7 @@ public:
 
   template <typename T>
   void write_mem(remote_ptr<T> child_addr, const T* val, int count) {
-    assert(type_has_no_holes<T>());
+    DEBUG_ASSERT(type_has_no_holes<T>());
     write_bytes_helper(child_addr, sizeof(*val) * count,
                        static_cast<const void*>(val));
   }
@@ -631,13 +640,15 @@ public:
                           const void* buf, bool* ok = nullptr,
                           uint32_t flags = 0);
 
+  SupportedArch detect_syscall_arch();
+
   /**
    * Call this when performing a clone syscall in this task. Returns
    * true if the call completed, false if it was interrupted and
    * needs to be resumed. When the call returns true, the task is
    * stopped at a PTRACE_EVENT_CLONE or PTRACE_EVENT_FORK.
    */
-  bool clone_syscall_is_complete();
+  bool clone_syscall_is_complete(pid_t* new_pid, SupportedArch syscall_arch);
 
   /**
    * Called when SYS_rrcall_init_preload has happened.
@@ -657,36 +668,10 @@ public:
    */
   void open_mem_fd_if_needed();
 
-  /**
-   * Return the name of the given syscall.
-   */
-  std::string syscall_name(int syscallno) const;
-
-  /**
-   * Look up a TLS address for this thread.  |offset| and
-   * |load_module| are as specified in the qGetTLSAddr packet.  If the
-   * address is found, set |*result| and return true.  Otherwise,
-   * return false.
-   */
-  bool get_tls_address(size_t offset, remote_ptr<void> load_module,
-                       remote_ptr<void>* result);
-
-  /**
-   * Indicate that the symbol |name| has the given address.
-   */
-  void register_symbol(const std::string& name, remote_ptr<void> address);
-
-  /**
-   * Return a set of the names of all the symbols that might be needed
-   * by libthread_db.  Also clears the current mapping of symbol names
-   * to addresses.
-   */
-  const std::set<std::string> get_symbols_and_clear_map();
-
   /* True when any assumptions made about the status of this
    * process have been invalidated, and must be re-established
    * with a waitpid() call. Only applies to tasks which are dying, usually
-   * due to a signal sent to the entire task group. */
+   * due to a signal sent to the entire thread group. */
   bool unstable;
   /* exit(), or exit_group() with one task, has been called, so
    * the exit can be treated as stable. */
@@ -817,6 +802,10 @@ public:
     return seen_ptrace_exit_event || detected_unexpected_exit;
   }
 
+  remote_code_ptr last_execution_resume() const {
+    return address_of_last_execution_resume;
+  }
+
 protected:
   Task(Session& session, pid_t tid, pid_t rec_tid, uint32_t serial,
        SupportedArch a);
@@ -843,6 +832,11 @@ protected:
                       remote_ptr<void> tls, remote_ptr<int> cleartid_addr,
                       pid_t new_tid, pid_t new_rec_tid, uint32_t new_serial,
                       Session* other_session = nullptr);
+
+  /**
+   * Internal method called after the first wait() during a clone().
+   */
+  virtual void post_wait_clone(Task*, int) {}
 
   template <typename Arch>
   void on_syscall_exit_arch(int syscallno, const Registers& regs);
@@ -880,12 +874,6 @@ protected:
    * All errors are treated as fatal.
    */
   void xptrace(int request, remote_ptr<void> addr, void* data);
-
-  /**
-   * If the given memory region is mapped into the local address space, obtain
-   * the local address from which the `size` bytes at `addr` can be accessed.
-   */
-  uint8_t* local_mapping(remote_ptr<void> addr, size_t size);
 
   /**
    * Read tracee memory using PTRACE_PEEKDATA calls. Slow, only use
@@ -933,7 +921,7 @@ protected:
    * create the new child.
    */
   Task* os_fork_into(Session* session);
-  static Task* os_clone_into(const CapturedState& state, Task* task_leader,
+  static Task* os_clone_into(const CapturedState& state,
                              AutoRemoteSyscalls& remote);
 
   /**
@@ -951,7 +939,7 @@ protected:
    * The new clone will be tracked in |session|.  The other
    * arguments are as for |Task::clone()| above.
    */
-  static Task* os_clone(CloneReason reason, Task* parent, Session* session,
+  static Task* os_clone(CloneReason reason, Session* session,
                         AutoRemoteSyscalls& remote, pid_t rec_child_tid,
                         uint32_t new_serial, unsigned base_flags,
                         remote_ptr<void> stack = nullptr,
@@ -970,6 +958,8 @@ protected:
                      const std::vector<std::string>& envp, pid_t rec_tid = -1);
 
   void maybe_workaround_singlestep_bug();
+
+  void* preload_thread_locals();
 
   uint32_t serial;
   // The address space of this task.
@@ -1000,13 +990,16 @@ protected:
   // True when we consumed a PTRACE_EVENT_EXIT that was about to race with
   // a resume_execution, that was issued while stopped (i.e. SIGKILL).
   bool detected_unexpected_exit;
+  // True when 'registers' has changes that haven't been flushed back to the
+  // task yet.
+  bool registers_dirty;
   // When |extra_registers_known|, we have saved our extra registers.
   ExtraRegisters extra_registers;
   bool extra_registers_known;
   // The session we're part of.
   Session* session_;
-  // The task group this belongs to.
-  std::shared_ptr<TaskGroup> tg;
+  // The thread group this belongs to.
+  std::shared_ptr<ThreadGroup> tg;
   // Entries set by |set_thread_area()| or the |tls| argument to |clone()|
   // (when that's a user_desc). May be more than one due to different
   // entry_numbers.

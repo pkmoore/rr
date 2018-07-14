@@ -8,6 +8,7 @@
 
 #include "Ticks.h"
 #include "TraceFrame.h"
+#include "core.h"
 #include "util.h"
 
 namespace rr {
@@ -83,7 +84,7 @@ public:
   Scheduler(RecordSession& session);
 
   void set_max_ticks(Ticks max_ticks) {
-    assert(max_ticks <= MAX_MAX_TICKS);
+    DEBUG_ASSERT(max_ticks <= MAX_MAX_TICKS);
     max_ticks_ = max_ticks;
   }
   Ticks max_ticks() { return max_ticks_; }
@@ -128,6 +129,7 @@ public:
   void on_destroy(RecordTask* t);
 
   RecordTask* current() const { return current_; }
+  void set_current(RecordTask* t) { current_ = t; }
 
   Ticks current_timeslice_end() const { return current_timeslice_end_; }
 

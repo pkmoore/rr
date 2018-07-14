@@ -1,10 +1,11 @@
 /* -*- Mode: C++; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#ifndef RR_TRACE_H_
-#define RR_TRACE_H_
+#ifndef RR_TRACE_STREAM_H_
+#define RR_TRACE_STREAM_H_
 
 #include <unistd.h>
 
+#include <map>
 #include <memory>
 #include <set>
 #include <string>
@@ -22,7 +23,7 @@ namespace rr {
 
 struct CPUIDRecord;
 class KernelMapping;
-class Task;
+class RecordTask;
 
 /**
  * TraceStream stores all the data common to both recording and
@@ -37,6 +38,12 @@ protected:
   typedef std::string string;
 
 public:
+  struct RawDataMetadata {
+    remote_ptr<void> addr;
+    size_t size;
+    pid_t rec_tid;
+  };
+
   /**
    * Update |substreams| and TRACE_VERSION when you update this list.
    */
@@ -44,17 +51,12 @@ public:
     SUBSTREAM_FIRST,
     // Substream that stores events (trace frames).
     EVENTS = SUBSTREAM_FIRST,
-    // Substreams that store raw data saved from tracees (|RAW_DATA|), and
-    // metadata about the stored data (|RAW_DATA_HEADER|).
-    RAW_DATA_HEADER,
     RAW_DATA,
     // Substream that stores metadata about files mmap'd during
     // recording.
     MMAPS,
     // Substream that stores task creation and exec events
     TASKS,
-    // Substream that stores arbitrary per-event records
-    GENERIC,
     SUBSTREAM_COUNT
   };
 
@@ -68,7 +70,7 @@ public:
    * Return the current "global time" (event count) for this
    * trace.
    */
-  TraceFrame::Time time() const { return global_time; }
+  FrameTime time() const { return global_time; }
 
   std::string file_data_clone_file_name(const TaskUid& tuid);
 
@@ -83,7 +85,7 @@ public:
    * Where to obtain data for the mapped region.
    */
   struct MappedData {
-    TraceFrame::Time time;
+    FrameTime time;
     MappedDataSource source;
     /** Name of file to map the data from. */
     string file_name;
@@ -94,7 +96,7 @@ public:
   };
 
 protected:
-  TraceStream(const string& trace_dir, TraceFrame::Time initial_time);
+  TraceStream(const string& trace_dir, FrameTime initial_time);
 
   /**
    * Return the path of the file for the given substream.
@@ -107,6 +109,12 @@ protected:
    * trace.
    */
   string version_path() const { return trace_dir + "/version"; }
+  /**
+   * While the trace is being built, the version file is stored under this name.
+   * When the trace is closed we rename it to the correct name. This lets us
+   * detect incomplete traces.
+   */
+  string incomplete_version_path() const { return trace_dir + "/incomplete"; }
 
   /**
    * Increment the global time and return the incremented value.
@@ -120,7 +128,7 @@ protected:
 
   // Arbitrary notion of trace time, ticked on the recording of
   // each event (trace frame).
-  TraceFrame::Time global_time;
+  FrameTime global_time;
 };
 
 class TraceWriter : public TraceStream {
@@ -133,7 +141,8 @@ public:
    * Recording a trace frame has the side effect of ticking
    * the global time.
    */
-  void write_frame(const TraceFrame& frame);
+  void write_frame(RecordTask* t, const Event& ev, const Registers* registers,
+                   const ExtraRegisters* extra_registers);
 
   enum RecordInTrace { DONT_RECORD_IN_TRACE, RECORD_IN_TRACE };
   enum MappingOrigin {
@@ -149,7 +158,7 @@ public:
    * If this returns RECORD_IN_TRACE, then the data for the map should be
    * recorded in the trace raw-data.
    */
-  RecordInTrace write_mapped_region(Task* t, const KernelMapping& map,
+  RecordInTrace write_mapped_region(RecordTask* t, const KernelMapping& map,
                                     const struct stat& stat,
                                     MappingOrigin origin = SYSCALL_MAPPING);
 
@@ -168,11 +177,6 @@ public:
    * Write a task event (clone or exec record) to the trace.
    */
   void write_task_event(const TraceTaskEvent& event);
-
-  /**
-   * Write a generic data record to the trace.
-   */
-  void write_generic(const void* data, size_t len);
 
   /**
    * Return true iff all trace files are "good".
@@ -202,8 +206,10 @@ public:
   void make_latest_trace();
 
 private:
-  std::string try_hardlink_file(const std::string& file_name);
-  bool try_clone_file(const std::string& file_name, std::string* new_name);
+  bool try_hardlink_file(const std::string& file_name, std::string* new_name);
+  bool try_clone_file(RecordTask* t, const std::string& file_name,
+                      std::string* new_name);
+  bool copy_file(const std::string& file_name, std::string* new_name);
 
   CompressedWriter& writer(Substream s) { return *writers[s]; }
   const CompressedWriter& writer(Substream s) const { return *writers[s]; }
@@ -212,8 +218,12 @@ private:
   /**
    * Files that have already been mapped without being copied to the trace,
    * i.e. that we have already assumed to be immutable.
+   * We store the file name under which we assumed it to be immutable, since
+   * a file may be accessed through multiple names, only some of which
+   * are immutable.
    */
-  std::set<std::pair<dev_t, ino_t>> files_assumed_immutable;
+  std::map<std::pair<dev_t, ino_t>, std::string> files_assumed_immutable;
+  std::vector<RawDataMetadata> raw_recs;
   uint32_t mmap_count;
   bool supports_file_data_cloning_;
 };
@@ -255,24 +265,27 @@ public:
   /**
    * Read a task event (clone or exec record) from the trace.
    * Returns a record of type NONE at the end of the trace.
+   * Sets |*time| (if non-null) to the global time of the event.
    */
-  TraceTaskEvent read_task_event();
+  TraceTaskEvent read_task_event(FrameTime* time = nullptr);
 
   /**
-   * Read the next raw data record and return it.
+   * Read the next raw data record for this frame and return it. Aborts if
+   * there are no more raw data records for this frame.
    */
   RawData read_raw_data();
 
   /**
-   * Reads the next raw data record for 'frame' from the current point in
-   * the trace. If there are no more raw data records for 'frame', returns
-   * false.
+   * Reads the next raw data record for last-read frame. If there are no more
+   * raw data records for this frame, return false.
    */
-  bool read_raw_data_for_frame(const TraceFrame& frame, RawData& d);
+  bool read_raw_data_for_frame(RawData& d);
 
-  void read_generic(std::vector<uint8_t>& out);
-  bool read_generic_for_frame(const TraceFrame& frame,
-                              std::vector<uint8_t>& out);
+  /**
+   * Like read_raw_data_for_frame, but doesn't actually read the data bytes.
+   * The array is resized but the data is not filled in.
+   */
+  bool read_raw_data_metadata_for_frame(RawDataMetadata& d);
 
   /**
    * Return true iff all trace files are "good".
@@ -326,9 +339,10 @@ private:
 
   std::unique_ptr<CompressedReader> readers[SUBSTREAM_COUNT];
   std::vector<CPUIDRecord> cpuid_records_;
+  std::vector<RawDataMetadata> raw_recs;
   bool trace_uses_cpuid_faulting;
 };
 
 } // namespace rr
 
-#endif /* RR_TRACE_H_ */
+#endif /* RR_TRACE_STREAM_H_ */

@@ -1,6 +1,6 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
 
 static void handler(int sig, __attribute__((unused)) siginfo_t* si, void* p) {
   ucontext_t* ctx = p;
@@ -61,7 +61,8 @@ int main(void) {
   install_filter();
 
   /* Test SIGSYS for a buffered syscall */
-  test_assert(open("/dev/null", O_RDONLY) == 42);
+  /* Use syscall directly since glibc 2.26 uses SYS_openat to implement open. */
+  test_assert(syscall(SYS_open, "/dev/null", O_RDONLY) == 42);
 
   atomic_puts("EXIT-SUCCESS");
 

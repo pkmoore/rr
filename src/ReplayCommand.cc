@@ -1,9 +1,20 @@
 /* -*- Mode: C++; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include <assert.h>
+#include "ReplayCommand.h"
+
+#include <sys/prctl.h>
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <string>
+
+#include <Python.h>
+#include <sstream>
+#include "ReplayTask.h"
+
+#include <fstream>
+
+#include <algorithm>
 
 #include <limits>
 
@@ -12,29 +23,24 @@
 #include "GdbServer.h"
 #include "ReplaySession.h"
 #include "ScopedFd.h"
+#include "core.h"
 #include "kernel_metadata.h"
 #include "log.h"
 #include "main.h"
 
 using namespace std;
 
+extern PyObject* dump_state_func;
+extern PyObject* write_to_pipe_func;
+extern PyObject* close_pipe_func;
+
 namespace rr {
 
 static int DUMP_STATS_PERIOD = 0;
 
-class ReplayCommand : public Command {
-public:
-  virtual int run(vector<string>& args) override;
-
-protected:
-  ReplayCommand(const char* name, const char* help) : Command(name, help) {}
-
-  static ReplayCommand singleton;
-};
-
 ReplayCommand ReplayCommand::singleton(
     "replay",
-    " rr replay [OPTION]... [<trace-dir>]\n"
+    " rr replay [OPTION]... [<trace-dir>] [-- <debugger-options>]\n"
     "  -a, --autopilot            replay without debugger server\n"
     "  -f, --onfork=<PID>         start a debug server when <PID> has been\n"
     "                             fork()d, AND the target event has been\n"
@@ -59,6 +65,8 @@ ReplayCommand ReplayCommand::singleton(
     "Emacs\n"
     "  -d, --debugger=<FILE>      use <FILE> as the gdb command\n"
     "  -q, --no-redirect-output   don't replay writes to stdout/stderr\n"
+    "  -h, --dbghost=<HOST>       listen address for the debug server.\n"
+    "                             default listen address is set to localhost.\n"
     "  -s, --dbgport=<PORT>       only start a debug server on <PORT>,\n"
     "                             don't automatically launch the debugger\n"
     "                             client; set PORT to 0 to automatically\n"
@@ -74,9 +82,9 @@ struct ReplayFlags {
   // Start a debug server for the task scheduled at the first
   // event at which reached this event AND target_process has
   // been "created".
-  TraceFrame::Time goto_event;
+  FrameTime goto_event;
 
-  TraceFrame::Time singlestep_to_event;
+  FrameTime singlestep_to_event;
 
   pid_t target_process;
 
@@ -97,6 +105,9 @@ struct ReplayFlags {
   // IP port to listen on for debug connections.
   int dbg_port;
 
+  // IP host to listen on for debug connections.
+  string dbg_host;
+
   // Whether to keep listening with a new server after the existing server
   // detaches
   bool keep_listening;
@@ -110,9 +121,12 @@ struct ReplayFlags {
   /* When true, echo tracee stdout/stderr writes to console. */
   bool redirect;
 
+  std::vector<std::pair<int, int>> divert_on_event;
+
   // When true make all private mappings shared with the tracee by default
   // to test the corresponding code.
   bool share_private_mappings;
+
 
   ReplayFlags()
       : goto_event(0),
@@ -121,9 +135,11 @@ struct ReplayFlags {
         process_created_how(CREATED_NONE),
         dont_launch_debugger(false),
         dbg_port(-1),
+        dbg_host(localhost_addr),
         keep_listening(false),
         gdb_binary_file_path("gdb"),
         redirect(true),
+        divert_on_event({}),
         share_private_mappings(false) {}
 };
 
@@ -141,9 +157,11 @@ static bool parse_replay_arg(vector<string>& args, ReplayFlags& flags) {
     { 'o', "debugger-option", HAS_PARAMETER },
     { 'p', "onprocess", HAS_PARAMETER },
     { 'q', "no-redirect-output", NO_PARAMETER },
+    { 'h', "dbghost", HAS_PARAMETER },
     { 's', "dbgport", HAS_PARAMETER },
     { 't', "trace", HAS_PARAMETER },
     { 'x', "gdb-x", HAS_PARAMETER },
+    { 'n', "divert-on-event", HAS_PARAMETER },
     { 0, "share-private-mappings", NO_PARAMETER },
     { 1, "fullname", NO_PARAMETER },
     { 'i', "interpreter", HAS_PARAMETER }
@@ -152,6 +170,14 @@ static bool parse_replay_arg(vector<string>& args, ReplayFlags& flags) {
   if (!Command::parse_option(args, options, &opt)) {
     return false;
   }
+  std::string events_str;
+  std::string delimiter = ",";
+  std::string proc_event_sep = ":";
+  std::string str_pair;
+  std::string str_first;
+  std::string str_second;
+  size_t pos;
+  int sep_pos;
 
   switch (opt.short_name) {
     case 'a':
@@ -194,6 +220,10 @@ static bool parse_replay_arg(vector<string>& args, ReplayFlags& flags) {
     case 'q':
       flags.redirect = false;
       break;
+    case 'h':
+      flags.dbg_host = opt.value;
+      flags.dont_launch_debugger = true;
+      break;
     case 's':
       if (!opt.verify_valid_int(0, INT32_MAX)) {
         return false;
@@ -211,6 +241,27 @@ static bool parse_replay_arg(vector<string>& args, ReplayFlags& flags) {
       flags.gdb_options.push_back("-x");
       flags.gdb_options.push_back(opt.value);
       break;
+    case 'n':
+      events_str = opt.value;
+      // Ensure we have a , delimiter at the end of the string events list
+      if(!events_str.empty() && events_str.back() != ',') {
+          events_str.push_back(',');
+      }
+      while(events_str.length() > 0) {
+        pos = events_str.find(delimiter);
+        str_pair = events_str.substr(0, pos);
+        sep_pos = str_pair.find(proc_event_sep);
+        str_first = str_pair.substr(0, sep_pos);
+        str_second = str_pair.substr(sep_pos+1, std::string::npos);
+        flags.divert_on_event.push_back(std::make_pair(std::stoi(str_first,
+                                                                 nullptr,
+                                                                 10),
+                                                       std::stoi(str_second,
+                                                                 nullptr,
+                                                                 10)));
+        events_str.erase(0, pos + delimiter.length());
+      }
+      break;
     case 0:
       flags.share_private_mappings = true;
       break;
@@ -222,7 +273,7 @@ static bool parse_replay_arg(vector<string>& args, ReplayFlags& flags) {
       flags.gdb_options.push_back(opt.value);
       break;
     default:
-      assert(0 && "Unknown option");
+      DEBUG_ASSERT(0 && "Unknown option");
   }
   return true;
 }
@@ -231,8 +282,11 @@ static int find_pid_for_command(const string& trace_dir,
                                 const string& command) {
   TraceReader trace(trace_dir);
 
-  while (trace.good()) {
-    auto e = trace.read_task_event();
+  while (true) {
+    TraceTaskEvent e = trace.read_task_event();
+    if (e.type() == TraceTaskEvent::NONE) {
+      return -1;
+    }
     if (e.type() != TraceTaskEvent::EXEC) {
       continue;
     }
@@ -246,31 +300,34 @@ static int find_pid_for_command(const string& trace_dir,
       return e.tid();
     }
   }
-  return -1;
 }
 
 static bool pid_exists(const string& trace_dir, pid_t pid) {
   TraceReader trace(trace_dir);
 
-  while (trace.good()) {
+  while (true) {
     auto e = trace.read_task_event();
+    if (e.type() == TraceTaskEvent::NONE) {
+      return false;
+    }
     if (e.tid() == pid) {
       return true;
     }
   }
-  return false;
 }
 
 static bool pid_execs(const string& trace_dir, pid_t pid) {
   TraceReader trace(trace_dir);
 
-  while (trace.good()) {
+  while (true) {
     auto e = trace.read_task_event();
+    if (e.type() == TraceTaskEvent::NONE) {
+      return false;
+    }
     if (e.tid() == pid && e.type() == TraceTaskEvent::EXEC) {
       return true;
     }
   }
-  return false;
 }
 
 // The parent process waits until the server, |waiting_for_child|, creates a
@@ -292,11 +349,14 @@ static uint64_t to_microseconds(const struct timeval& tv) {
 
 static void serve_replay_no_debugger(const string& trace_dir,
                                      const ReplayFlags& flags) {
+  std::vector<std::pair<int, int>> events = flags.divert_on_event;
   ReplaySession::shr_ptr replay_session = ReplaySession::create(trace_dir);
   replay_session->set_flags(session_flags(flags));
   uint32_t step_count = 0;
   struct timeval last_dump_time;
   Session::Statistics last_stats;
+  // HACK HACK HACK:  Work around for each event being "handled" twice
+  FrameTime last_event_handled = -1;
   gettimeofday(&last_dump_time, NULL);
 
   while (true) {
@@ -304,18 +364,45 @@ static void serve_replay_no_debugger(const string& trace_dir,
     if (flags.singlestep_to_event > 0 &&
         replay_session->trace_reader().time() >= flags.singlestep_to_event) {
       cmd = RUN_SINGLESTEP;
-      fputs("Stepping from:", stderr);
+      fputs("Stepping from: ", stderr);
       Task* t = replay_session->current_task();
       t->regs().print_register_file_compact(stderr);
-      fputs(" ", stderr);
+      fputc(' ', stderr);
       t->extra_regs().print_register_file_compact(stderr);
       fprintf(stderr, " ticks:%" PRId64 "\n", t->tick_count());
     }
 
-    TraceFrame::Time before_time = replay_session->trace_reader().time();
+    FrameTime before_time = replay_session->trace_reader().time();
+    auto pred = [&before_time](const std::pair<int, int>& arg) {
+      return arg.second == (int)before_time;
+    };
+    std::vector<std::pair<int, int>>::iterator itr = std::find_if(events.begin(), events.end(), pred);
+    if (itr != events.end()) {
+      // HACK HACK HACK:  Work around for each event being "handled" twice
+      if(before_time != last_event_handled) { 
+        DiversionSession::shr_ptr diversion_session = replay_session->clone_diversion();
+        RunCommand rc = RUN_CONTINUE;
+        for (auto& v : diversion_session->tasks()) {
+            Task* t = v.second;
+            t->spin_off_on_next_resume_execution = true;
+            diversion_session->diversion_step(t, rc, 0);
+          if (itr->first == t->rec_tid) {
+            rrdump_dump_state(int(before_time));
+            rrdump_write_to_pipe(before_time, (ReplayTask*)t, true);
+          } else {
+            rrdump_write_to_pipe(before_time, (ReplayTask*)t, false);
+          }
+        }
+        events.erase(itr);
+        if(events.size() == 0) {
+            rrdump_close_pipe();
+        }
+        last_event_handled = before_time;
+      }
+    }
     auto result = replay_session->replay_step(cmd);
-    TraceFrame::Time after_time = replay_session->trace_reader().time();
-    assert(after_time >= before_time && after_time <= before_time + 1);
+    FrameTime after_time = replay_session->trace_reader().time();
+    DEBUG_ASSERT(after_time >= before_time && after_time <= before_time + 1);
 
     ++step_count;
     if (DUMP_STATS_PERIOD > 0 && step_count % DUMP_STATS_PERIOD == 0) {
@@ -336,12 +423,12 @@ static void serve_replay_no_debugger(const string& trace_dir,
     if (result.status == REPLAY_EXITED) {
       break;
     }
-    assert(result.status == REPLAY_CONTINUE);
-    assert(result.break_status.watchpoints_hit.empty());
-    assert(!result.break_status.breakpoint_hit);
-    assert(cmd == RUN_SINGLESTEP || !result.break_status.singlestep_complete);
+    DEBUG_ASSERT(result.status == REPLAY_CONTINUE);
+    DEBUG_ASSERT(result.break_status.watchpoints_hit.empty());
+    DEBUG_ASSERT(!result.break_status.breakpoint_hit);
+    DEBUG_ASSERT(cmd == RUN_SINGLESTEP ||
+                 !result.break_status.singlestep_complete);
   }
-
   LOG(info) << "Replayer successfully finished";
 }
 
@@ -359,14 +446,14 @@ static void serve_replay_no_debugger(const string& trace_dir,
  * why we use a signal handler instead of SIG_IGN).
  */
 static void handle_SIGINT_in_parent(int sig) {
-  assert(sig == SIGINT);
+  DEBUG_ASSERT(sig == SIGINT);
   // Just ignore it.
 }
 
 static GdbServer* server_ptr = nullptr;
 
 static void handle_SIGINT_in_child(int sig) {
-  assert(sig == SIGINT);
+  DEBUG_ASSERT(sig == SIGINT);
   if (server_ptr) {
     server_ptr->interrupt_replay_to_target();
   }
@@ -398,6 +485,7 @@ static int replay(const string& trace_dir, const ReplayFlags& flags) {
       auto session = ReplaySession::create(trace_dir);
       GdbServer::ConnectionFlags conn_flags;
       conn_flags.dbg_port = flags.dbg_port;
+      conn_flags.dbg_host = flags.dbg_host;
       conn_flags.debugger_name = flags.gdb_binary_file_path;
       conn_flags.keep_listening = flags.keep_listening;
       GdbServer(session, session_flags(flags), target).serve_replay(conn_flags);
@@ -418,10 +506,13 @@ static int replay(const string& trace_dir, const ReplayFlags& flags) {
     close(debugger_params_pipe[0]);
 
     {
+      prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0);
+
       ScopedFd debugger_params_write_pipe(debugger_params_pipe[1]);
       auto session = ReplaySession::create(trace_dir);
       GdbServer::ConnectionFlags conn_flags;
       conn_flags.dbg_port = flags.dbg_port;
+      conn_flags.dbg_host = flags.dbg_host;
       conn_flags.debugger_params_write_pipe = &debugger_params_write_pipe;
       GdbServer server(session, session_flags(flags), target);
 
@@ -491,6 +582,11 @@ int ReplayCommand::run(vector<string>& args) {
     if (parse_replay_arg(args, flags)) {
       continue;
     }
+    if (parse_literal(args, "--")) {
+      flags.gdb_options.insert(flags.gdb_options.end(), args.begin(),
+                               args.end());
+      break;
+    }
     if (!found_dir && parse_optional_trace_dir(args, &trace_dir)) {
       found_dir = true;
       continue;
@@ -524,7 +620,6 @@ int ReplayCommand::run(vector<string>& args) {
   }
 
   assert_prerequisites();
-  check_performance_settings();
 
   if (running_under_rr()) {
     if (!Flags::get().suppress_environment_warnings) {
@@ -549,3 +644,40 @@ int ReplayCommand::run(vector<string>& args) {
 }
 
 } // namespace rr
+
+void rrdump_dump_state(int event) {
+  PyObject* event_obj;
+  if((event_obj = PyInt_FromLong((long)event)) == NULL) {
+    std::cerr << "Failed to create event from int" << std::endl;
+  }
+  if(PyObject_CallFunctionObjArgs(dump_state_func, event_obj, NULL) == NULL) {
+    std::cerr << "dump_state call failed" << std::endl;
+    PyErr_Print();
+  }
+}
+
+void rrdump_write_to_pipe(int ft, rr::ReplayTask* t, bool inject) {
+    PyObject* proc_string_obj;
+    ostringstream os;
+    os << (inject ? "INJECT: " : "DONT_INJECT: ")
+       << "EVENT: " << ft
+       << " PID: " << t->tid
+       << " REC_PID: " << t->rec_tid
+       << "\n";
+    if((proc_string_obj = PyString_FromString(os.str().c_str())) == NULL) {
+        std::cerr << "Failed to create python string" << std::endl;
+    }
+    if(PyObject_CallFunctionObjArgs(write_to_pipe_func,
+                                    proc_string_obj,
+                                    NULL) == NULL) {
+        std::cerr << "write_to_pipe call failed" << std::endl;
+        PyErr_Print();
+    }
+}
+
+void rrdump_close_pipe() {
+    if(PyObject_CallFunction(close_pipe_func, NULL) == NULL) {
+        std::cerr << "close_pipe call failed" << std::endl;
+        PyErr_Print();
+    }
+}

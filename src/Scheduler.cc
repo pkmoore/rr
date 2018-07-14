@@ -4,7 +4,6 @@
 
 #include "Scheduler.h"
 
-#include <assert.h>
 #include <math.h>
 #include <signal.h>
 #include <stdio.h>
@@ -21,6 +20,7 @@
 #include "Flags.h"
 #include "RecordSession.h"
 #include "RecordTask.h"
+#include "core.h"
 #include "log.h"
 
 using namespace std;
@@ -112,7 +112,7 @@ RecordTask* Scheduler::get_next_task_with_same_priority(RecordTask* t) {
   }
 
   auto it = task_priority_set.find(make_pair(t->priority, t));
-  assert(it != task_priority_set.end());
+  DEBUG_ASSERT(it != task_priority_set.end());
   ++it;
   if (it == task_priority_set.end() || it->first != t->priority) {
     it = task_priority_set.lower_bound(make_pair(t->priority, nullptr));
@@ -350,8 +350,9 @@ bool Scheduler::treat_as_high_priority(RecordTask* t) {
 
 void Scheduler::validate_scheduled_task() {
   ASSERT(current_, !must_run_task || must_run_task == current_);
-  ASSERT(current_, task_round_robin_queue.empty() ||
-                       current_ == task_round_robin_queue.front());
+  ASSERT(current_,
+         task_round_robin_queue.empty() ||
+             current_ == task_round_robin_queue.front());
 }
 
 Scheduler::Rescheduled Scheduler::reschedule(Switchable switchable) {
@@ -495,7 +496,7 @@ Scheduler::Rescheduled Scheduler::reschedule(Switchable switchable) {
         }
         LOG(debug) << "  Arming one-second timer for polling";
       }
-      pid_t tid = waitpid(-1, &raw_status, __WALL | WSTOPPED | WUNTRACED);
+      pid_t tid = waitpid(-1, &raw_status, __WALL | WUNTRACED);
       if (enable_poll) {
         struct itimerval timer = { { 0, 0 }, { 0, 0 } };
         if (setitimer(ITIMER_REAL, &timer, nullptr) < 0) {
@@ -534,8 +535,9 @@ Scheduler::Rescheduled Scheduler::reschedule(Switchable switchable) {
         LOG(debug) << "    ... but it's dead";
       }
     } while (!next);
-    ASSERT(next, next->unstable || next->may_be_blocked() ||
-                     status.ptrace_event() == PTRACE_EVENT_EXIT)
+    ASSERT(next,
+           next->unstable || next->may_be_blocked() ||
+               status.ptrace_event() == PTRACE_EVENT_EXIT)
         << "Scheduled task should have been blocked or unstable";
     next->did_waitpid(status);
     result.by_waitpid = true;
@@ -588,7 +590,7 @@ double Scheduler::interrupt_after_elapsed_time() const {
 }
 
 void Scheduler::on_create(RecordTask* t) {
-  assert(!t->in_round_robin_queue);
+  DEBUG_ASSERT(!t->in_round_robin_queue);
   if (enable_chaos) {
     // new tasks get a random priority
     t->priority = choose_random_priority(t);
