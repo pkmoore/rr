@@ -17,6 +17,10 @@ EXCLUDE_OBJS := trace-statfs64.o strace-main.o strace-ucopy.o
 OBJECTS = $(wildcard *.o)
 NEW_OBJS = $(filter-out $(EXCLUDE_OBJS),$(OBJECTS))
 
+# shared library versions
+MAJOR := 1
+MINOR := 0
+PATCH := 1
 THIS_MAKEFILE := Makefile.libstrace
 
 all:
@@ -41,11 +45,12 @@ shared:
 	@$(MAKE) -f $(THIS_MAKEFILE) libprintstrace.a
 
 libstrace.so: libprintstrace.a
-	$(LD) -shared $< $(LDFLAGS) $(LDLIBS) -Wl,-soname,$@.1 -o $@.1.0.1
+	$(LD) -shared $< $(LDFLAGS) $(LDLIBS) -Wl,-soname,$@.$(MAJOR) -o $@.$(MAJOR).$(MINOR).$(PATCH)
 	@mkdir -pv $(LIBS_PATH)/
-	@cp -fv $@.1.0.1 $(LIBS_PATH)/
-	@ln -sfv $(LIBS_PATH)/$@.1.0.1 $(LIBS_PATH)/$@.1
-	@ln -sfv $(LIBS_PATH)/$@.1.0.1 $(LIBS_PATH)/$@
+	@cp -fv $@.$(MAJOR).$(MINOR).$(PATCH) $@
+	@cp -fv $@.$(MAJOR).$(MINOR).$(PATCH) $(LIBS_PATH)/
+	@ln -rsfv $(LIBS_PATH)/$@.$(MAJOR).$(MINOR).$(PATCH) $(LIBS_PATH)/$@.$(MAJOR)
+	@ln -rsfv $(LIBS_PATH)/$@.$(MAJOR).$(MINOR).$(PATCH) $(LIBS_PATH)/$@
 
 libprintstrace.a: $(NEW_OBJS) strace.o strace-lib.o
 	$(AR) rcs $@ $(NEW_OBJS)
