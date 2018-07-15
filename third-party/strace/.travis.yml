@@ -1,6 +1,16 @@
+dist: trusty
+before_install: ci/install-dependencies.sh
+script: ci/run-build-and-tests.sh
+sudo: required
 language: c
 cache: ccache
 group: deprecated-2017Q4
+git:
+    depth: 2147483647
+env:
+    global:
+      - SLEEP_A_BIT="sleep 0.2"
+      - VERBOSE="1"
 
 matrix:
   include:
@@ -14,6 +24,10 @@ matrix:
             - gcc-7
             - g++-7
       env:
+        - TARGET=x86
+        - STACKTRACE=libunwind
+        - CHECK=coverage
+        - KHEADERS=torvalds/linux
         - MATRIX_EVAL="export PREFIX=~/.local CC=gcc-7 CXX=g++-7"
         - VIRTUALENVWRAPPER_PYTHON="/usr/bin/python2"
         - VIRTUALENVWRAPPER_VIRTUALENV="/usr/bin/virtualenv2"
@@ -41,6 +55,10 @@ matrix:
             - gcc-6
             - g++-6
       env:
+        - TARGET=x86
+        - STACKTRACE=libunwind
+        - CHECK=coverage
+        - KHEADERS=torvalds/linux
         - MATRIX_EVAL="export PREFIX=~/.local CC=gcc-6 CXX=g++-6"
         - VIRTUALENVWRAPPER_PYTHON="/usr/bin/python2"
         - VIRTUALENVWRAPPER_VIRTUALENV="/usr/bin/virtualenv2"
@@ -58,32 +76,32 @@ matrix:
         - PATH="$LIND_BASE:$PATH"
         - PATH="$HOME/.local/bin:$PATH"
 
-    # works on Trusty
-    # - os: linux
-    #   addons:
-    #     apt:
-    #       sources:
-    #         - ubuntu-toolchain-r-test
-    #         - sourceline: "deb http://apt.llvm.org/trusty/ llvm-toolchain-trusty-5.0 main"
-    #       packages:
-    #         - clang-5.0 lldb-5.0 lld-5.0
-    #   env:
-    #     - MATRIX_EVAL="export PREFIX=~/.local CC=clang-5.0 CXX=clang++-5.0"
-    #     - VIRTUALENVWRAPPER_PYTHON="/usr/bin/python2"
-    #     - VIRTUALENVWRAPPER_VIRTUALENV="/usr/bin/virtualenv2"
-    #     - LIND_PREFIX="$HOME"
-    #     - LIND_BASE="$LIND_PREFIX/lind_project"
-    #     - LIND_SRC="$LIND_BASE/lind"
-    #     - LIND_MONITOR="$LIND_BASE/reference_monitor"
-    #     - REPY_PATH="$LIND_SRC/repy"
-    #     - NACL_SDK_ROOT="$REPY_PATH/sdk"
-    #     - PYTHON="python2"
-    #     - PNACLPYTHON="python2"
-    #     - LD_LIBRARY_PATH="/lib/glibc"
-    #     - PATH="$NACL_SDK_ROOT/toolchain/linux_x86_glibc/bin:$PATH"
-    #     - PATH="$REPY_PATH/bin:$PATH"
-    #     - PATH="$LIND_BASE:$PATH"
-    #     - PATH="$HOME/.local/bin:$PATH"
+    works on Trusty
+    - os: linux
+      addons:
+        apt:
+          sources:
+            - ubuntu-toolchain-r-test
+            - sourceline: "deb http://apt.llvm.org/trusty/ llvm-toolchain-trusty-6.0 main"
+          packages:
+            - clang-6.0 lldb-6.0 lld-6.0
+      env:
+        - MATRIX_EVAL="export PREFIX=~/.local CC=clang-6.0 CXX=clang++-6.0"
+        - VIRTUALENVWRAPPER_PYTHON="/usr/bin/python2"
+        - VIRTUALENVWRAPPER_VIRTUALENV="/usr/bin/virtualenv2"
+        - LIND_PREFIX="$HOME"
+        - LIND_BASE="$LIND_PREFIX/lind_project"
+        - LIND_SRC="$LIND_BASE/lind"
+        - LIND_MONITOR="$LIND_BASE/reference_monitor"
+        - REPY_PATH="$LIND_SRC/repy"
+        - NACL_SDK_ROOT="$REPY_PATH/sdk"
+        - PYTHON="python2"
+        - PNACLPYTHON="python2"
+        - LD_LIBRARY_PATH="/lib/glibc"
+        - PATH="$NACL_SDK_ROOT/toolchain/linux_x86_glibc/bin:$PATH"
+        - PATH="$REPY_PATH/bin:$PATH"
+        - PATH="$LIND_BASE:$PATH"
+        - PATH="$HOME/.local/bin:$PATH"
 
 before_install:
     - eval "$MATRIX_EVAL"
@@ -117,10 +135,4 @@ before_install:
                 | sudo tee /usr/include/linux/memfd.h
 
 script:
-    - ./bootstrap
-    - ./build_libprintstrace.sh
-    - make clean
-    - make static
-    - make shared
-    - make clean
-    - make all
+    - ./build_libstrace.sh
