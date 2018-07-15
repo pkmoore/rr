@@ -5,15 +5,14 @@ LIBS_PATH := ./libs/
 CPPFLAGS += -D_GNU_SOURCE=1 -D__STDC_FORMAT_MACROS=1
 CPPFLAGS += -D_POSIX_C_SOURCE=199506 -D_XOPEN_SOURCE=600
 CPPFLAGS += -DHAVE_CONFIG_H -D_DEFAULT_SOURCE=1
-CPPFLAGS += -DLIBPRINTSTRACE_COMPILE
 CFLAGS += -g3 -Wall -Wextra -pedantic -std=gnu99 -fPIC
 CFLAGS += -Wno-long-long -Wno-unused-parameter -fuse-ld=gold
 CFLAGS += -Wno-missing-field-initializers -fno-omit-frame-pointer
 CFLAGS += -fdiagnostics-show-option -I./ -I./linux -I./linux/i386
 LDFLAGS += -g3 -fPIC
-LDLIBS += -L$(LIBS_PATH) -lrt
+LDLIBS += -L$(LIBS_PATH) -lrt -lunwind
 
-EXCLUDE_OBJS := trace-statfs64.o strace-main.o strace-ucopy.o
+EXCLUDE_OBJS := trace-statfs64.o strace-main.o strace-ucopy.o strace.o syscall.o
 OBJECTS = $(wildcard *.o)
 NEW_OBJS = $(filter-out $(EXCLUDE_OBJS),$(OBJECTS))
 
@@ -52,8 +51,8 @@ libstrace.so: libprintstrace.a
 	@ln -rsfv $(LIBS_PATH)/$@.$(MAJOR).$(MINOR).$(PATCH) $(LIBS_PATH)/$@.$(MAJOR)
 	@ln -rsfv $(LIBS_PATH)/$@.$(MAJOR).$(MINOR).$(PATCH) $(LIBS_PATH)/$@
 
-libprintstrace.a: $(NEW_OBJS) strace.o strace-lib.o
-	$(AR) rcs $@ $(NEW_OBJS)
+libprintstrace.a: $(NEW_OBJS) strace-lib.o
+	$(AR) rcs $@ $^
 	@mkdir -pv $(LIBS_PATH)/
 	@cp -fv $@ $(LIBS_PATH)/
 	echo $^
@@ -66,7 +65,7 @@ strace-main.o: main.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 strace-lib.o: strace.c
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+	$(CC) $(CPPFLAGS) -DLIBPRINTSTRACE_COMPILE $(CFLAGS) -c $< -o $@
 
 %.o: %.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
