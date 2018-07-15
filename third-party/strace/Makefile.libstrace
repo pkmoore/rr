@@ -17,8 +17,10 @@ EXCLUDE_OBJS := trace-statfs64.o strace-main.o strace-ucopy.o
 OBJECTS = $(wildcard *.o)
 NEW_OBJS = $(filter-out $(EXCLUDE_OBJS),$(OBJECTS))
 
+THIS_MAKEFILE := Makefile.libstrace
+
 all:
-	$(MAKE) libstrace.so libprintstrace.a
+	$(MAKE) -f $(THIS_MAKEFILE) libstrace.so libprintstrace.a
 
 .PHONY: all clean i686 main print_vars shared static
 
@@ -27,16 +29,16 @@ i686: CC_FOR_BUILD=i686-elf-gcc
 i686: LD_FOR_BUILD=i686-elf-ld
 i686:
 	./bootstrap
-	@$(MAKE) all
+	@$(MAKE) -f $(THIS_MAKEFILE) all
 
 print_vars:
 	@echo $(NEW_OBJS)
 
 shared:
-	@$(MAKE) libstrace.so
+	@$(MAKE) -f $(THIS_MAKEFILE) libstrace.so
 
 shared:
-	@$(MAKE) libprintstrace.a
+	@$(MAKE) -f $(THIS_MAKEFILE) libprintstrace.a
 
 libstrace.so: libprintstrace.a
 	$(LD) -shared $< $(LDFLAGS) $(LDLIBS) -Wl,-soname,$@.1 -o $@.1.0.1
