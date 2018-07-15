@@ -461,11 +461,11 @@ endif()
 add_custom_target(libprintstrace.a
                   ALL
                   WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/third-party/strace/"
-                  COMMAND ./build_libprintstrace.sh
-                  COMMAND cp ./libprintstrace.a ${CMAKE_SOURCE_DIR}
+                  COMMAND ./build_libstrace.sh
+                  COMMAND cp ./libprintstrace.a ./libstrace.so ${CMAKE_SOURCE_DIR}
                   VERBATIM)
 
-add_dependencies(rr Generated Pages libprintstrace.a)
+add_dependencies(rr Generated Pages libprintstrace.a libstrace.so)
 
 option(strip "Strip debug info from rr binary")
 
@@ -478,7 +478,8 @@ target_link_libraries(rr
   -lrt
   -lpython2.7
   brotli
-  ${CMAKE_SOURCE_DIR}/libprintstrace.a
+  -L${CMAKE_SOURCE_DIR}/
+  -lstrace
 )
 
 if(staticlibs)
