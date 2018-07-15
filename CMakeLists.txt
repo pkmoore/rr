@@ -458,14 +458,14 @@ else()
   set(RR_BIN rr)
 endif()
 
-add_custom_target(libprintstrace.a
+add_custom_target(libstrace
                   ALL
                   WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/third-party/strace/"
                   COMMAND ./build_libstrace.sh
                   COMMAND cp ./libprintstrace.a ./libstrace.so ${CMAKE_SOURCE_DIR}
                   VERBATIM)
 
-add_dependencies(rr Generated Pages libprintstrace.a libstrace.so)
+add_dependencies(rr Generated Pages libstrace)
 
 option(strip "Strip debug info from rr binary")
 
