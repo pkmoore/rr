@@ -25,7 +25,7 @@ matrix:
             - g++-7
       env:
         - TARGET=x86
-        - STACKTRACE=libunwind
+        - STACKTRACE=no
         - CHECK=coverage
         - KHEADERS=torvalds/linux
         - MATRIX_EVAL="export PREFIX=~/.local CC=gcc-7 CXX=g++-7"
@@ -56,7 +56,7 @@ matrix:
             - g++-6
       env:
         - TARGET=x86
-        - STACKTRACE=libunwind
+        - STACKTRACE=no
         - CHECK=coverage
         - KHEADERS=torvalds/linux
         - MATRIX_EVAL="export PREFIX=~/.local CC=gcc-6 CXX=g++-6"
@@ -76,7 +76,7 @@ matrix:
         - PATH="$LIND_BASE:$PATH"
         - PATH="$HOME/.local/bin:$PATH"
 
-    works on Trusty
+    # works on Trusty
     - os: linux
       addons:
         apt:
@@ -86,6 +86,10 @@ matrix:
           packages:
             - clang-6.0 lldb-6.0 lld-6.0
       env:
+        - TARGET=x86
+        - STACKTRACE=no
+        - CHECK=coverage
+        - KHEADERS=torvalds/linux
         - MATRIX_EVAL="export PREFIX=~/.local CC=clang-6.0 CXX=clang++-6.0"
         - VIRTUALENVWRAPPER_PYTHON="/usr/bin/python2"
         - VIRTUALENVWRAPPER_VIRTUALENV="/usr/bin/virtualenv2"
