@@ -2,5 +2,5 @@
 
 unset CFLAGS CPATH CPPFLAGS CXXFLAGS LDFLAGS
 ./bootstrap
-make clean
-make all
+make -f Makefile.libstrace clean
+make -f Makefile.libstrace all
