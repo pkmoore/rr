@@ -5,7 +5,7 @@ LIBS_PATH := ./libs/
 CPPFLAGS += -D_GNU_SOURCE=1 -D__STDC_FORMAT_MACROS=1
 CPPFLAGS += -D_POSIX_C_SOURCE=199506 -D_XOPEN_SOURCE=600
 CPPFLAGS += -DHAVE_CONFIG_H -D_DEFAULT_SOURCE=1
-# CPPFLAGS += -DLIBPRINTSTRACE_COMPILE
+CPPFLAGS += -DLIBPRINTSTRACE_COMPILE
 CFLAGS += -march=i686 -g3 -Wall -Wextra -pedantic -std=gnu99 -fPIC -m32
 CFLAGS += -Wno-long-long -Wno-unused-parameter -fuse-ld=gold
 CFLAGS += -Wno-missing-field-initializers -fno-omit-frame-pointer
