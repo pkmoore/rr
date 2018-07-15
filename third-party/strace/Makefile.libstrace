@@ -10,9 +10,12 @@ CFLAGS += -Wno-long-long -Wno-unused-parameter -fuse-ld=gold
 CFLAGS += -Wno-missing-field-initializers -fno-omit-frame-pointer
 CFLAGS += -fdiagnostics-show-option -I./ -I./linux -I./linux/i386
 LDFLAGS += -g3 -fPIC
-LDLIBS += -L$(LIBS_PATH) -lrt -lunwind
+LDLIBS += -L$(LIBS_PATH) -lrt
 
-EXCLUDE_OBJS := trace-statfs64.o strace-main.o strace-ucopy.o strace.o syscall.o
+EXCLUDE_OBJS := trace-statfs64.o strace.o \
+	strace-main.o strace-ucopy.o \
+	strace-strace.o syscall.o \
+	strace-unwind.o strace-unwind-libunwind.o
 OBJECTS = $(wildcard *.o)
 NEW_OBJS = $(filter-out $(EXCLUDE_OBJS),$(OBJECTS))
 

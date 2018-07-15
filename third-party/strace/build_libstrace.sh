@@ -2,7 +2,7 @@
 
 unset CFLAGS CPATH CPPFLAGS CXXFLAGS LDFLAGS
 ./bootstrap
-./configure
+./configure --without-libunwind
 make clean
 make -f Makefile.libstrace clean
 make
