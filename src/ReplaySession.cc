@@ -526,12 +526,6 @@ void ReplaySession::rrdump_process_syscall(ReplayTask* t, bool is_entry) {
   PyObject* state_dict;
   PyObject* name;
   PyObject* entering;
-  PyObject* new_fds = NULL;
-  std::string new_fds_key = "new_fds";
-  PyObject* new_fds_key_obj;
-  PyObject* closed_fds = NULL;
-  std::string closed_fds_key = "closed_fds";
-  PyObject* closed_fds_key_obj;
 
   std::string name_str;
   Registers regs = t->current_trace_frame().regs();
@@ -581,16 +575,6 @@ void ReplaySession::rrdump_process_syscall(ReplayTask* t, bool is_entry) {
   rrdump_insert_value_into_dict(state_dict, "rec_tid", t->rec_tid);
 
 
-  if((new_fds_key_obj = PyString_FromString(new_fds_key.c_str())) == NULL) {
-    PyErr_Print();
-    FATAL() << "Couldn't create closed_fds_key_obj string object";
-  }
-
-  if((closed_fds_key_obj = PyString_FromString(closed_fds_key.c_str())) == NULL) {
-    PyErr_Print();
-    FATAL() << "Couldn't create new_fds_key_obj string object";
-  }
-
   if((name_str.compare("time") == 0) && !is_entry) {
     rrdump_process_time(t);
   }
@@ -600,100 +584,15 @@ void ReplaySession::rrdump_process_syscall(ReplayTask* t, bool is_entry) {
   if((name_str.compare("clock_gettime") == 0) && !is_entry) {
     rrdump_process_clock_gettime(t);
   }
-  if((name_str.compare("pipe") == 0) && !is_entry) {
-    new_fds = rrdump_process_pipe(t);
-  }
-  if((name_str.compare("fcntl64") == 0) && !is_entry) {
-    new_fds = rrdump_process_fcntl64(t);
-  }
-
-  if(new_fds) {
-    if(PyDict_SetItem(state_dict, new_fds_key_obj, new_fds) == -1) {
-      PyErr_Print();
-      std::cerr << "Couldn't add new_fds to dict";
-    }
-    Py_DECREF(new_fds);
-  }
-  if(closed_fds) {
-    if(PyDict_SetItem(state_dict, closed_fds_key_obj, closed_fds) == -1) {
-      PyErr_Print();
-      std::cerr << "Couldn't add closed_fds to dict";
-    }
-    Py_DECREF(closed_fds);
-  }
 
   if(PyObject_CallFunctionObjArgs(process_syscall_func, state_dict, NULL) == NULL) {
     PyErr_Print();
     std::cerr << "Calling process_syscall failed";
   }
 
-  Py_DECREF(new_fds_key_obj);
-  Py_DECREF(closed_fds_key_obj);
   Py_DECREF(state_dict);
   Py_DECREF(name);
   Py_DECREF(entering);
-}
-
-PyObject* ReplaySession::rrdump_process_pipe(ReplayTask* t) {
-  size_t nbytes = sizeof(int) * 2;
-  unsigned char buf[nbytes];
-  int* fd1_ptr;
-  int* fd2_ptr;
-  remote_ptr<void> addr = t->current_trace_frame().regs().arg1();
-  t->read_bytes_helper(addr, nbytes, buf);
-  fd1_ptr = (int*)buf;
-  fd2_ptr = (int*)(buf + sizeof(int));
-  PyObject* fd;
-  PyObject* new_fds;
-  if((new_fds = PyList_New(0)) == NULL) {
-    PyErr_Print();
-    FATAL() << "Couldn't create new fds list when processing pipe";
-  }
-  if((fd = PyInt_FromLong(*fd1_ptr)) == NULL) {
-    PyErr_Print();
-    FATAL() << "Couldn't parse fd to PyLong";
-  }
-  if(PyList_Append(new_fds, fd) == -1) {
-    PyErr_Print();
-    FATAL() << "Couldn't append first fd to new_fds";
-  }
-  Py_DECREF(fd);
-  if((fd = PyInt_FromLong(*fd2_ptr)) == NULL) {
-    PyErr_Print();
-    FATAL() << "Couldn't parse fd to PyLong";
-  }
-  if(PyList_Append(new_fds, fd) == -1) {
-    PyErr_Print();
-    FATAL() << "Couldn't append second fd to new_fds";
-  }
-  Py_DECREF(fd);
-  return new_fds;
-}
-
-PyObject* ReplaySession::rrdump_process_fcntl64(ReplayTask* t) {
-  int cmd;;
-  int result;
-  PyObject* new_fds;
-  PyObject* fd;
-  cmd = t->current_trace_frame().regs().arg2();
-  result = t->current_trace_frame().regs().syscall_result();
-  if(cmd == F_DUPFD && result > -1) {
-    if((new_fds = PyList_New(0)) == NULL) {
-      PyErr_Print();
-      FATAL() << "Couldn't create new fds list when processing pipe";
-    }
-    if((fd = PyInt_FromLong(result)) == NULL) {
-      PyErr_Print();
-      FATAL() << "Couldn't parse fd to PyLong";
-    }
-    if(PyList_Append(new_fds, fd) == -1) {
-      PyErr_Print();
-      FATAL() << "Couldn't append first fd to new_fds";
-    }
-    Py_DECREF(fd);
-    return new_fds;
-  }
-  return NULL;
 }
 
 void ReplaySession::rrdump_process_time(ReplayTask* t) {

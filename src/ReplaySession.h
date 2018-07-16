@@ -341,8 +341,6 @@ private:
   void rrdump_process_time(ReplayTask* t);
   void rrdump_process_gettimeofday(ReplayTask* t);
   void rrdump_process_clock_gettime(ReplayTask* t);
-  PyObject* rrdump_process_pipe(ReplayTask* t);
-  PyObject* rrdump_process_fcntl64(ReplayTask* t);
 
   std::shared_ptr<EmuFs> emu_fs;
   TraceReader trace_in;
