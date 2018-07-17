@@ -471,14 +471,19 @@ if(strip)
   set_target_properties(rr PROPERTIES LINK_FLAGS "-s")
 endif()
 
+# expands to something like: -ldw -lbz2 -lelf -lz -lz -llzma -pthread
+exec_program(pkg-config ARGS libdw --cflags --libs --static OUTPUT_VARIABLE CMAKE_DW_LIBS)
+
 target_link_libraries(rr
   ${CMAKE_DL_LIBS}
   -lrt
   -lpython2.7
   brotli
+  # "${CMAKE_SOURCE_DIR}/libprintstrace.a"
   -L"${CMAKE_SOURCE_DIR}/"
-  -lprintstrace
-  -lunwind
+  # -lstrace
+  -l:libprintstrace.a
+  ${CMAKE_DW_LIBS}
 )
 
 if(staticlibs)

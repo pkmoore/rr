@@ -1,18 +1,23 @@
 AR ?= ar
 CC ?= gcc
-LD := gcc
+LD = $(CC)
 LIBS_PATH := ./libs/
 CPPFLAGS += -D_GNU_SOURCE=1 -D__STDC_FORMAT_MACROS=1
 CPPFLAGS += -D_POSIX_C_SOURCE=199506 -D_XOPEN_SOURCE=600
 CPPFLAGS += -DHAVE_CONFIG_H -D_DEFAULT_SOURCE=1
-CFLAGS += -g3 -Wall -Wextra -pedantic -std=gnu99 -fPIC
-CFLAGS += -Wno-long-long -Wno-unused-parameter -fuse-ld=gold
-CFLAGS += -Wno-missing-field-initializers -fno-omit-frame-pointer
-CFLAGS += -fdiagnostics-show-option -I./ -I./linux -I./linux/i386
-LDFLAGS += -g3 -fPIC
-LDLIBS += -L$(LIBS_PATH) -lrt
+CFLAGS += -I./ -I./linux -I./linux/i386
+CFLAGS += -g3 -std=gnu11 -fPIC
+CFLAGS += -Wall -Wextra -pedantic -Wno-long-long
+CFLAGS += -Wno-unused-parameter -Wno-missing-field-initializers
+CFLAGS += -fno-omit-frame-pointer -fdiagnostics-show-option
+LDFLAGS += -g3 -fPIC -L$(LIBS_PATH)
+LDLIBS += -lrt -l:libdw.a -l:libelf.a -l:libz.a -l:libz.a -llzma -pthread
 
-EXCLUDE_OBJS := trace-statfs64.o strace.o strace-main.o strace-ucopy.o strace-strace.o syscall.o
+EXCLUDE_OBJS := syscall.o trace-statfs64.o
+EXCLUDE_OBJS += strace.o Estrace-main.o
+EXCLUDE_OBJS += strace-ucopy.o strace-strace.o
+EXCLUDE_OBJS += strace-unwind-libdw.o strace-unwind.o
+EXCLUDE_OBJS += unwind.o unwind-libunwind.o
 OBJECTS = $(wildcard *.o)
 NEW_OBJS = $(filter-out $(EXCLUDE_OBJS),$(OBJECTS))
 
@@ -51,21 +56,24 @@ libstrace.so: libprintstrace.a
 	@ln -rsfv $(LIBS_PATH)/$@.$(MAJOR).$(MINOR).$(PATCH) $(LIBS_PATH)/$@.$(MAJOR)
 	@ln -rsfv $(LIBS_PATH)/$@.$(MAJOR).$(MINOR).$(PATCH) $(LIBS_PATH)/$@
 
-libprintstrace.a: $(NEW_OBJS) strace-lib.o
+libprintstrace.a: $(NEW_OBJS) strace-lib.o | print_vars
+	@rm -fv -- $@
 	$(AR) rcs $@ $^
 	@mkdir -pv $(LIBS_PATH)/
 	@cp -fv $@ $(LIBS_PATH)/
-	echo $^
 
-# currently broken
-strace: strace-lib.o strace-main.o syscall.o
-	$(LD) $(LDFLAGS) $^ $(LDLIBS) -o $@
+strace: %: strace-lib.o strace-main.o syscall.o
+	$(LD) $^ $(LDFLAGS) $(LDLIBS) -o $@
 
-strace-main.o: main.c
+strace-main.o: %.o: main.c
+	$(CC) $< $(CPPFLAGS) $(CFLAGS) -c -o $@
+
+strace-lib.o: %.o: strace.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+	# $(CC) $(CPPFLAGS) -DLIBPRINTSTRACE_COMPILE $(CFLAGS) -c $< -o $@
 
-strace-lib.o: strace.c
-	$(CC) $(CPPFLAGS) -DLIBPRINTSTRACE_COMPILE $(CFLAGS) -c $< -o $@
+%: %.o
+	$(LD) $< $(LDFLAGS) $(LDLIBS) -o $@
 
 %.o: %.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@

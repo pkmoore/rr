@@ -26,4 +26,4 @@ for m in m32 mx32; do
 done
 
 autoreconf -f -i .
-./configure --with-libunwind
+./configure --enable-stacktrace=no --without-libunwind --with-libdw
