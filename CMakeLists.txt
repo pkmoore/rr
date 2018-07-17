@@ -3,11 +3,12 @@
 cmake_minimum_required(VERSION 2.8.5)
 project(rr C CXX ASM)
 
-# "Do not add flags to export symbols from executables without the ENABLE_EXPORTS target property."
-# This avoids linking executables with -rdynamic. -rdynamic has been observed
-# to cause rr_exec_stub to be linked with the dynamic linker with some
-# version(s) of clang (but linked to an incorrect file name, causing
-# exec of rr_exec_stub to fail).
+# "Do not add flags to export symbols from executables without the
+# ENABLE_EXPORTS target property." This avoids linking executables
+# with -rdynamic. -rdynamic has been observed to cause rr_exec_stub
+# to be linked with the dynamic linker with some version(s) of clang
+# (but linked to an incorrect file name, causing exec of rr_exec_stub
+# to fail).
 if(POLICY CMP0065)
   cmake_policy(SET CMP0065 NEW)
 endif()
@@ -89,7 +90,7 @@ if(CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "x86_64" AND rr_32BIT)
   # try_compile won't accept LINK_FLAGS, so do this manually.
   file(WRITE "${CMAKE_BINARY_DIR}/test32.c" "int main() { return 0; }")
   execute_process(COMMAND ${CMAKE_C_COMPILER} -o ${CMAKE_BINARY_DIR}/test32 ${CMAKE_BINARY_DIR}/test32.c -m32
-			RESULT_VARIABLE COMPILER_32BIT_RESULT)
+                        RESULT_VARIABLE COMPILER_32BIT_RESULT)
   if(NOT (COMPILER_32BIT_RESULT EQUAL 0))
     message(FATAL_ERROR "Your toolchain doesn't support 32-bit cross-compilation. Install the required packages or pass -Ddisable32bit=ON to cmake.")
   endif()
@@ -113,11 +114,11 @@ if(CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "x86_64" AND NOT rr_64BIT)
     if(IS_DIRECTORY ${libdir})
       set(ENV{PKG_CONFIG_LIBDIR} ${libdir})
       break()
-     endif()
-   endforeach(libdir)
-   if(NOT DEFINED ENV{PKG_CONFIG_LIBDIR})
-     message(FATAL_ERROR "Couldn't find a suitable 32-bit pkgconfig lib dir. You probably need to install a 32-bit pkgconfig package (pkgconfig.i686 for Fedora or pkg-config:i386 for Ubuntu")
-   endif()
+    endif()
+  endforeach()
+  if(NOT DEFINED ENV{PKG_CONFIG_LIBDIR})
+    message(FATAL_ERROR "Couldn't find a suitable 32-bit pkgconfig lib dir. You probably need to install a 32-bit pkgconfig package (pkgconfig.i686 for Fedora or pkg-config:i386 for Ubuntu")
+  endif()
 endif()
 
 find_program(CAPNP capnp)
@@ -141,7 +142,7 @@ foreach(required_lib ${REQUIRED_LIBS})
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${${PKG}_CFLAGS}")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${${PKG}_CFLAGS}")
   endif()
-endforeach(required_lib)
+endforeach()
 
 # ==== brotli ====
 set(BROTLI_FILES
@@ -244,13 +245,11 @@ else()
 endif()
 
 foreach(py_module ${REQUIRED_PYTHON_MODULES})
-  execute_process(COMMAND "${PYTHON_EXECUTABLE}" "-c"
-			"import ${py_module}"
-			RESULT_VARIABLE module_status)
+  execute_process(COMMAND "${PYTHON_EXECUTABLE}" "-c" "import ${py_module}" RESULT_VARIABLE module_status)
   if(module_status)
     message(FATAL_ERROR "Couldn't find required Python module ${py_module}.")
   endif()
-endforeach(py_module)
+endforeach()
 
 if(WILL_RUN_TESTS)
   # Check for gdb
@@ -262,7 +261,7 @@ endif()
 
 set(PRELOAD_COMPILE_FLAGS "-fno-stack-protector")
 
-if (DEBUG_PRELOAD_LIB)
+if(DEBUG_PRELOAD_LIB)
   set(PRELOAD_COMPILE_FLAGS "${PRELOAD_COMPILE_FLAGS} ${RR_FLAGS_DEBUG}")
 else()
   set(PRELOAD_COMPILE_FLAGS "${PRELOAD_COMPILE_FLAGS} ${RR_FLAGS_RELEASE}")
@@ -310,36 +309,35 @@ foreach(generated_file ${GENERATED_FILES})
                               PROPERTIES GENERATED true HEADER_FILE_ONLY true)
   add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/${generated_file}"
                      COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/src/generate_syscalls.py"
-		               "${CMAKE_CURRENT_BINARY_DIR}/${generated_file}"
-		     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/generate_syscalls.py"
-		       "${CMAKE_CURRENT_SOURCE_DIR}/src/syscalls.py"
-		       "${CMAKE_CURRENT_SOURCE_DIR}/src/assembly_templates.py")
-endforeach(generated_file)
+                             "${CMAKE_CURRENT_BINARY_DIR}/${generated_file}"
+                     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/generate_syscalls.py"
+                             "${CMAKE_CURRENT_SOURCE_DIR}/src/syscalls.py"
+                             "${CMAKE_CURRENT_SOURCE_DIR}/src/assembly_templates.py")
+endforeach()
 
 add_custom_target(Generated DEPENDS ${GENERATED_FILES})
 
 add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_64"
                    COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/src/generate_rr_page.py"
-                   "${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_64"
+                           "${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_64"
                    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/generate_rr_page.py")
 add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_32"
                    COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/src/generate_rr_page.py"
-                   "${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_32"
+                           "${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_32"
                    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/generate_rr_page.py")
 add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_64_replay"
                    COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/src/generate_rr_page.py"
-                   "${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_64_replay"
+                           "${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_64_replay"
                    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/generate_rr_page.py")
 add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_32_replay"
                    COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/src/generate_rr_page.py"
-                   "${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_32_replay"
+                           "${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_32_replay"
                    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/generate_rr_page.py")
 
-add_custom_target(Pages DEPENDS
-                  "${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_32"
-                  "${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_64"
-                  "${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_32_replay"
-                  "${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_64_replay")
+add_custom_target(Pages DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_32"
+                                "${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_64"
+                                "${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_32_replay"
+                                "${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_64_replay")
 
 add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/rr_trace.capnp.c++"
                           "${CMAKE_CURRENT_BINARY_DIR}/rr_trace.capnp.h"
@@ -432,7 +430,7 @@ function(post_build_executable target)
 #  add_custom_command(TARGET ${target}
 #                     POST_BUILD
 #                     COMMAND setfattr ARGS -n user.pax.flags -v m $<TARGET_FILE:${target}>)
-endfunction(post_build_executable)
+endfunction()
 
 option(RR_BUILD_SHARED "Build the rr shared library as well as the binary (experimental).")
 
@@ -448,9 +446,9 @@ if(RR_BUILD_SHARED)
   set_target_properties(brotli PROPERTIES POSITION_INDEPENDENT_CODE ON)
   target_link_libraries(rrbin rr)
   install(TARGETS rr
-    RUNTIME DESTINATION bin
-    LIBRARY DESTINATION lib
-    ARCHIVE DESTINATION lib)
+          RUNTIME DESTINATION bin
+          LIBRARY DESTINATION lib
+          ARCHIVE DESTINATION lib)
 else()
   add_executable(rr ${RR_SOURCES} src/main.cc)
   set_target_properties(rr PROPERTIES ENABLE_EXPORTS true)
@@ -460,9 +458,9 @@ endif()
 
 add_custom_target(libstrace
                   ALL
-                  WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/third-party/strace/"
+                  WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/third-party/strace"
                   COMMAND ./build_libstrace.sh
-                  COMMAND cp ./libprintstrace.a ./libstrace.so ${CMAKE_SOURCE_DIR}
+                  COMMAND cp libprintstrace.a libstrace.so "${CMAKE_SOURCE_DIR}"
                   VERBATIM)
 
 add_dependencies(rr Generated Pages libstrace)
@@ -478,7 +476,7 @@ target_link_libraries(rr
   -lrt
   -lpython2.7
   brotli
-  -L${CMAKE_SOURCE_DIR}/
+  -L"${CMAKE_SOURCE_DIR}/"
   -lprintstrace
 )
 
@@ -522,7 +520,7 @@ foreach(file ${RR_GDB_RESOURCES})
                  COPYONLY)
   install(FILES third-party/gdb/${file}
           DESTINATION share/rr)
-endforeach(file)
+endforeach()
 
 install(PROGRAMS scripts/signal-rr-recording.sh
                   ${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_64
@@ -532,9 +530,9 @@ install(PROGRAMS scripts/signal-rr-recording.sh
   DESTINATION bin)
 
 install(TARGETS ${RR_BIN} rrpreload rr_exec_stub
-  RUNTIME DESTINATION bin
-  LIBRARY DESTINATION lib/rr
-  ARCHIVE DESTINATION lib/rr)
+        RUNTIME DESTINATION bin
+        LIBRARY DESTINATION lib/rr
+        ARCHIVE DESTINATION lib/rr)
 
 # Build 32-bit librrpreload on 64-bit builds.
 # We copy the source files into '32' subdirectories in the output
@@ -546,7 +544,7 @@ if(rr_32BIT AND rr_64BIT)
     configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/preload/${file}"
                    "${CMAKE_CURRENT_BINARY_DIR}/32/${file}"
                    COPYONLY)
-  endforeach(file)
+  endforeach()
 
   foreach(file syscallbuf.c overrides.c raw_syscall.S syscall_hook.S breakpoint_table.S)
     configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/preload/${file}"
@@ -554,7 +552,7 @@ if(rr_32BIT AND rr_64BIT)
                    COPYONLY)
     set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/32/${file}"
                                 PROPERTIES COMPILE_FLAGS "-m32 ${RR_FLAGS_RELEASE}")
-  endforeach(file)
+  endforeach()
 
   # Order matters here! syscall_hook.S must be immediately before syscallbuf.c.
   # breakpoint_table.S must be before overrides.c, which must be last.
@@ -576,7 +574,7 @@ if(rr_32BIT AND rr_64BIT)
                    COPYONLY)
     set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/32/${file}"
                                 PROPERTIES COMPILE_FLAGS "-m32 -fno-stack-protector")
-  endforeach(file)
+  endforeach()
 
   add_executable(rr_exec_stub_32 32/exec_stub.c)
   post_build_executable(rr_exec_stub_32)
@@ -1190,7 +1188,7 @@ if(BUILD_TESTS)
                                 PROPERTIES COMPILE_FLAGS ${RR_TEST_FLAGS})
     add_dependencies(${test} Generated)
     target_link_libraries(${test} -lrt -ldl)
-  endforeach(test)
+  endforeach()
 
   # Test disabled because it requires libuvc to be built and installed, and a
   # working USB camera
@@ -1206,7 +1204,7 @@ if(BUILD_TESTS)
                                 PROPERTIES COMPILE_FLAGS ${RR_TEST_FLAGS})
     add_dependencies(${test} Generated)
     target_link_libraries(${test} -lrt)
-  endforeach(test)
+  endforeach()
 
   add_library(test_lib
     src/test/test_lib.c
@@ -1238,23 +1236,23 @@ if(BUILD_TESTS)
     # The real timeouts are handled by test-monitor
     set_tests_properties(${test}
       PROPERTIES FAIL_REGULAR_EXPRESSION "FAILED" TIMEOUT 1000)
-  endfunction(configure_test)
+  endfunction()
 
   foreach(test ${BASIC_TESTS} ${BASIC_CPP_TESTS} ${OTHER_TESTS})
-    add_test(${test}
-      bash ${CMAKE_SOURCE_DIR}/src/test/basic_test.run ${test} -b ${PROJECT_BINARY_DIR} ${TEST_MONITOR_DEFAULT_TIMEOUT})
+    add_test(${test} bash ${CMAKE_SOURCE_DIR}/src/test/basic_test.run
+             ${test} -b ${PROJECT_BINARY_DIR} ${TEST_MONITOR_DEFAULT_TIMEOUT})
     configure_test(${test})
-    add_test(${test}-no-syscallbuf
-      bash ${CMAKE_SOURCE_DIR}/src/test/basic_test.run ${test} -n ${PROJECT_BINARY_DIR} ${TEST_MONITOR_DEFAULT_TIMEOUT})
+    add_test(${test}-no-syscallbuf bash ${CMAKE_SOURCE_DIR}/src/test/basic_test.run
+             ${test} -n ${PROJECT_BINARY_DIR} ${TEST_MONITOR_DEFAULT_TIMEOUT})
     configure_test(${test}-no-syscallbuf)
-  endforeach(test)
+  endforeach()
 
   foreach(test ${TESTS_WITH_PROGRAM} ${TESTS_WITHOUT_PROGRAM})
-    add_test(${test}
-      bash ${CMAKE_SOURCE_DIR}/src/test/${test}.run ${test} -b ${PROJECT_BINARY_DIR} ${TEST_MONITOR_DEFAULT_TIMEOUT})
+    add_test(${test} bash ${CMAKE_SOURCE_DIR}/src/test/${test}.run
+             ${test} -b ${PROJECT_BINARY_DIR} ${TEST_MONITOR_DEFAULT_TIMEOUT})
     configure_test(${test})
-    add_test(${test}-no-syscallbuf
-      bash ${CMAKE_SOURCE_DIR}/src/test/${test}.run ${test} -n ${PROJECT_BINARY_DIR} ${TEST_MONITOR_DEFAULT_TIMEOUT})
+    add_test(${test}-no-syscallbuf bash ${CMAKE_SOURCE_DIR}/src/test/${test}.run
+             ${test} -n ${PROJECT_BINARY_DIR} ${TEST_MONITOR_DEFAULT_TIMEOUT})
     configure_test(${test}-no-syscallbuf)
   endforeach(test)
 
@@ -1300,7 +1298,7 @@ if(BUILD_TESTS)
       add_dependencies(${test}_32 Generated)
       set_target_properties(${test}_32 PROPERTIES LINK_FLAGS "-m32 ${RR_TEST_FLAGS}")
       target_link_libraries(${test}_32 -lrt -ldl)
-    endforeach(test)
+    endforeach()
 
     foreach(test ${BASIC_CPP_TESTS})
       add_executable(${test}_32 "${CMAKE_CURRENT_BINARY_DIR}/32/${test}.cc")
@@ -1308,7 +1306,7 @@ if(BUILD_TESTS)
       add_dependencies(${test}_32 Generated)
       set_target_properties(${test}_32 PROPERTIES LINK_FLAGS "-m32 ${RR_TEST_FLAGS}")
       target_link_libraries(${test}_32 -lrt)
-    endforeach(test)
+    endforeach()
 
     add_library(test_lib_32
       "${CMAKE_CURRENT_BINARY_DIR}/32/test_lib.c"
@@ -1326,22 +1324,22 @@ if(BUILD_TESTS)
     target_link_libraries(cpuid_32 -lrt)
 
     foreach(test ${BASIC_TESTS} ${BASIC_CPP_TESTS} ${OTHER_TESTS})
-      add_test(${test}-32
-        bash ${CMAKE_SOURCE_DIR}/src/test/basic_test.run ${test}_32 -b ${PROJECT_BINARY_DIR})
+      add_test(${test}-32 bash ${CMAKE_SOURCE_DIR}/src/test/basic_test.run
+               ${test}_32 -b ${PROJECT_BINARY_DIR})
       configure_test(${test}-32)
-      add_test(${test}-32-no-syscallbuf
-        bash ${CMAKE_SOURCE_DIR}/src/test/basic_test.run ${test}_32 -n ${PROJECT_BINARY_DIR})
+      add_test(${test}-32-no-syscallbuf bash ${CMAKE_SOURCE_DIR}/src/test/basic_test.run
+               ${test}_32 -n ${PROJECT_BINARY_DIR})
       configure_test(${test}-32-no-syscallbuf)
-    endforeach(test)
+    endforeach()
 
     foreach(test ${TESTS_WITH_PROGRAM} ${TESTS_WITHOUT_PROGRAM})
-      add_test(${test}-32
-        bash ${CMAKE_SOURCE_DIR}/src/test/${test}.run ${test}_32 -b ${PROJECT_BINARY_DIR})
+      add_test(${test}-32 bash ${CMAKE_SOURCE_DIR}/src/test/${test}.run
+               ${test}_32 -b ${PROJECT_BINARY_DIR})
       configure_test(${test}-32)
-      add_test(${test}-32-no-syscallbuf
-	    bash ${CMAKE_SOURCE_DIR}/src/test/${test}.run ${test}_32 -n ${PROJECT_BINARY_DIR})
+      add_test(${test}-32-no-syscallbuf bash ${CMAKE_SOURCE_DIR}/src/test/${test}.run
+               ${test}_32 -n ${PROJECT_BINARY_DIR})
       configure_test(${test}-32-no-syscallbuf)
-    endforeach(test)
+    endforeach()
   endif()
 
   set(CHAOS_TESTS
@@ -1356,7 +1354,7 @@ if(BUILD_TESTS)
     add_executable(${test} src/chaos-test/${test}.c)
     post_build_executable(${test})
     target_link_libraries(${test} -lrt)
-  endforeach(test)
+  endforeach()
 endif()
 
 add_executable(ftrace_helper src/ftrace/ftrace_helper.c)
@@ -1376,7 +1374,7 @@ add_custom_target(fastcheck COMMAND ${CMAKE_CTEST_COMMAND} --verbose --exclude-r
 ##--------------------------------------------------
 ## Package configuration
 
-include (InstallRequiredSystemLibraries)
+include(InstallRequiredSystemLibraries)
 
 set(CPACK_PACKAGE_NAME "rr")
 set(CPACK_PACKAGE_VERSION_MAJOR "${rr_VERSION_MAJOR}")
@@ -1420,9 +1418,11 @@ set(CPACK_RPM_PACKAGE_LICENSE "MIT and BSD")
 # Prevent binaries from being stripped
 set(CPACK_RPM_SPEC_INSTALL_POST "/bin/true")
 
-include (CPack)
+include(CPack)
 
 ##--------------------------------------------------
 ## Misc
 
 add_custom_target(setup-travis COMMAND src/script/setup_travis.sh)
+
+# cmake:ft=cmake:
