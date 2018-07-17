@@ -478,6 +478,7 @@ target_link_libraries(rr
   brotli
   -L"${CMAKE_SOURCE_DIR}/"
   -lprintstrace
+  -lunwind
 )
 
 if(staticlibs)
