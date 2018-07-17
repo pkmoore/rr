@@ -14,7 +14,7 @@ for m in m32 mx32; do
 	k="s/^\\(SIZEOF_KERNEL_LONG_T$s=\\).*/\\1 4/"
 	rm -rfv -- "$tests"
 	mkdir -pv -- "$tests"
-	test "$m" != m32 && k=
+	test "$m" != m32 && k=""
 	sed "s/@arch@/@arch_$m@/;
 	     s/^\\(SIZEOF_LONG$s=\\).*/\\1 4/;
 	     $k;
@@ -22,8 +22,8 @@ for m in m32 mx32; do
 	     s/^MPERS_CC_FLAGS$s=.*/& @cc_flags_$m@/;
 	     s/^ARCH_MFLAGS$s=.*/& -DMPERS_IS_\$(MPERS_NAME) \$(MPERS_CC_FLAGS)/;
 	     " tests/Makefile.am > "$tests/Makefile.am"
-	find tests/ -maxdepth 1 -type f \! -name '*Makefile*' -exec ln -sv -- {} "$tests/" \;
+	find tests/ -maxdepth 1 -type f \! -name '*Makefile*' -exec ln -rsv -- {} "$tests/" \;
 done
 
-test -f dist/README && cp -v -- dist/README ./
-autoreconf -f -i "$@"
+autoreconf -f -i .
+./configure --with-libunwind
