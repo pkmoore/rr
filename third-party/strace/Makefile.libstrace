@@ -38,8 +38,10 @@ all:
 i686: CC_FOR_BUILD=i686-elf-gcc
 i686: LD_FOR_BUILD=i686-elf-ld
 i686:
-	./bootstrap
 	@$(MAKE) -f $(THIS_MAKEFILE) all
+
+bootstrap.d:
+	./bootstrap
 
 print_vars:
 	@echo $(NEW_OBJS)
@@ -70,7 +72,7 @@ strace: %: strace-lib.o strace-main.o syscall.o
 strace-main.o: %.o: main.c
 	$(CC) $< $(CPPFLAGS) $(CFLAGS) -c -o $@
 
-strace-lib.o: %.o: strace.c
+strace-lib.o: %.o: strace.c bootstrap.d
 	$(CC) $(CPPFLAGS) -DLIBPRINTSTRACE_COMPILE $(CFLAGS) -c $< -o $@
 
 %: %.o

@@ -27,3 +27,4 @@ done
 
 autoreconf -f -i .
 ./configure --enable-stacktrace=no --without-libunwind --with-libdw
+echo > bootstrap.d
