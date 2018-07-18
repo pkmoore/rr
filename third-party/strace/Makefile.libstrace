@@ -6,14 +6,16 @@ CPPFLAGS += -D_GNU_SOURCE=1 -D__STDC_FORMAT_MACROS=1
 CPPFLAGS += -D_POSIX_C_SOURCE=199506 -D_XOPEN_SOURCE=600
 CPPFLAGS += -DHAVE_CONFIG_H -D_DEFAULT_SOURCE=1
 CFLAGS += -I./ -I./linux -I./linux/i386
-CFLAGS += -g3 -std=gnu11 -fPIC
-CFLAGS += -Wall -Wextra -pedantic -Wno-long-long
-CFLAGS += -Wno-unused-parameter -Wno-missing-field-initializers
+CFLAGS += -g3 -std=gnu11 -fPIC -fno-omit-frame-pointer
+CFLAGS += -fdiagnostics-show-option -Wall -Wextra -pedantic
 CFLAGS += -fno-omit-frame-pointer -fdiagnostics-show-option
+CFLAGS += -Wno-long-long -Wno-unused-parameter
+CFLAGS += -Wno-missing-field-initializers
 LDFLAGS += -g3 -fPIC -L$(LIBS_PATH)
-LDLIBS += -lrt -l:libdw.a -l:libelf.a -l:libz.a -l:libz.a -llzma -pthread
+LDLIBS += -lrt $(shell pkg-config libdw --cflags --libs --static)
 
-EXCLUDE_OBJS := syscall.o trace-statfs64.o
+EXCLUDE_OBJS := trace-statfs64.o
+# EXCLUDE_OBJS := syscall.o trace-statfs64.o
 EXCLUDE_OBJS += strace.o strace-main.o
 EXCLUDE_OBJS += strace-ucopy.o strace-strace.o
 EXCLUDE_OBJS += strace-unwind-libdw.o strace-unwind.o
@@ -78,9 +80,6 @@ strace-lib.o: %.o: strace.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 clean:
-	$(RM) -fv *.o
-	$(RM) -fv *.a
-	$(RM) -fv *.so
-	$(RM) -fv strace-main
+	$(RM) -fv -- *.a *.d *.o *.so strace
 
 # vi:ft=make:
