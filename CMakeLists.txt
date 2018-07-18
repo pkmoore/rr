@@ -460,7 +460,7 @@ add_custom_target(libstrace
                   ALL
                   WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/third-party/strace"
                   COMMAND ./build_libstrace.sh
-                  COMMAND cp libstrace.a libstrace.so "${CMAKE_SOURCE_DIR}"
+                  COMMAND cp libstrace.a libstrace.so "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
                   VERBATIM)
 
 add_dependencies(rr Generated Pages libstrace)
@@ -481,7 +481,7 @@ target_link_libraries(rr
   -lrt
   -lpython2.7
   brotli
-  -L"${CMAKE_SOURCE_DIR}/"
+  -L"${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
   -l:libstrace.a
   ${CMAKE_DW_LIBS}
 )
