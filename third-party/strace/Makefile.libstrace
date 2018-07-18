@@ -11,11 +11,10 @@ CFLAGS += -fdiagnostics-show-option -Wall -Wextra -pedantic
 CFLAGS += -fno-omit-frame-pointer -fdiagnostics-show-option
 CFLAGS += -Wno-long-long -Wno-unused-parameter
 CFLAGS += -Wno-missing-field-initializers
-LDFLAGS += -g3 -fPIC -L$(LIBS_PATH)
+LDFLAGS += -fPIC -Wl,-O3,-z,relro,-z,now,-z,noexecstack -L$(LIBS_PATH)
 LDLIBS += -lrt $(shell pkg-config libdw --cflags --libs --static)
 
 EXCLUDE_OBJS := trace-statfs64.o
-# EXCLUDE_OBJS := syscall.o trace-statfs64.o
 EXCLUDE_OBJS += strace.o strace-main.o
 EXCLUDE_OBJS += strace-ucopy.o strace-strace.o
 EXCLUDE_OBJS += strace-unwind-libdw.o strace-unwind.o
@@ -30,37 +29,28 @@ PATCH := 1
 THIS_MAKEFILE := Makefile.libstrace
 
 all:
-	$(MAKE) -f $(THIS_MAKEFILE) libstrace.so libprintstrace.a
+	$(MAKE) -f $(THIS_MAKEFILE) libstrace.so libstrace.a
 
-.PHONY: all clean i686 main print_vars shared static
-
-# use a 32-bit cross compiler for build
-i686: CC_FOR_BUILD=i686-elf-gcc
-i686: LD_FOR_BUILD=i686-elf-ld
-i686:
-	@$(MAKE) -f $(THIS_MAKEFILE) all
+.PHONY: all clean main print_vars shared static
 
 bootstrap.d:
-	./bootstrap
-
-print_vars:
-	@echo $(NEW_OBJS)
+	@./bootstrap
 
 shared:
 	@$(MAKE) -f $(THIS_MAKEFILE) libstrace.so
 
-shared:
-	@$(MAKE) -f $(THIS_MAKEFILE) libprintstrace.a
+static:
+	@$(MAKE) -f $(THIS_MAKEFILE) libstrace.a
 
-libstrace.so: libprintstrace.a
+libstrace.so: libstrace.a
 	$(LD) -shared $< $(LDFLAGS) $(LDLIBS) -Wl,-soname,$@.$(MAJOR) -o $@.$(MAJOR).$(MINOR).$(PATCH)
-	@mkdir -pv $(LIBS_PATH)/
-	@cp -fv $@.$(MAJOR).$(MINOR).$(PATCH) $@
-	@cp -fv $@.$(MAJOR).$(MINOR).$(PATCH) $(LIBS_PATH)/
-	@ln -rsfv $(LIBS_PATH)/$@.$(MAJOR).$(MINOR).$(PATCH) $(LIBS_PATH)/$@.$(MAJOR)
-	@ln -rsfv $(LIBS_PATH)/$@.$(MAJOR).$(MINOR).$(PATCH) $(LIBS_PATH)/$@
+	@mkdir -pv -- $(LIBS_PATH)/
+	@cp -fv -- $@.$(MAJOR).$(MINOR).$(PATCH) $@
+	@cp -fv -- $@.$(MAJOR).$(MINOR).$(PATCH) $(LIBS_PATH)/
+	@ln -rsfv -- $(LIBS_PATH)/$@.$(MAJOR).$(MINOR).$(PATCH) $(LIBS_PATH)/$@.$(MAJOR)
+	@ln -rsfv -- $(LIBS_PATH)/$@.$(MAJOR).$(MINOR).$(PATCH) $(LIBS_PATH)/$@
 
-libprintstrace.a: $(NEW_OBJS) strace-lib.o | print_vars
+libstrace.a: $(NEW_OBJS) strace-lib.o
 	@rm -fv -- $@
 	$(AR) rcs $@ $^
 	@mkdir -pv $(LIBS_PATH)/

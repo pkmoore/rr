@@ -460,7 +460,7 @@ add_custom_target(libstrace
                   ALL
                   WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/third-party/strace"
                   COMMAND ./build_libstrace.sh
-                  COMMAND cp libprintstrace.a libstrace.so "${CMAKE_SOURCE_DIR}"
+                  COMMAND cp libstrace.a libstrace.so "${CMAKE_SOURCE_DIR}"
                   VERBATIM)
 
 add_dependencies(rr Generated Pages libstrace)
@@ -471,18 +471,18 @@ if(strip)
   set_target_properties(rr PROPERTIES LINK_FLAGS "-s")
 endif()
 
-# expands to something like: -ldw -lbz2 -lelf -lz -lz -llzma -pthread
-exec_program(pkg-config ARGS libdw --cflags --libs --static OUTPUT_VARIABLE CMAKE_DW_LIBS)
+# libdw is needed by libstrace
+exec_program(pkg-config
+             ARGS libdw --cflags --libs --static
+             OUTPUT_VARIABLE CMAKE_DW_LIBS)
 
 target_link_libraries(rr
   ${CMAKE_DL_LIBS}
   -lrt
   -lpython2.7
   brotli
-  # "${CMAKE_SOURCE_DIR}/libprintstrace.a"
   -L"${CMAKE_SOURCE_DIR}/"
-  # -lstrace
-  -l:libprintstrace.a
+  -l:libstrace.a
   ${CMAKE_DW_LIBS}
 )
 
