@@ -63,7 +63,7 @@ strace-main.o: %.o: main.c
 	$(CC) $< $(CPPFLAGS) $(CFLAGS) -c -o $@
 
 strace-lib.o: %.o: strace.c bootstrap.d
-	$(CC) $(CPPFLAGS) -DLIBPRINTSTRACE_COMPILE $(CFLAGS) -c $< -o $@
+	$(CC) $(CPPFLAGS) -DLIBSTRACE_COMPILE $(CFLAGS) -c $< -o $@
 
 %: %.o
 	$(LD) $< $(LDFLAGS) $(LDLIBS) -o $@
@@ -72,6 +72,6 @@ strace-lib.o: %.o: strace.c bootstrap.d
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 clean:
-	$(RM) -fv -- *.a *.d *.o *.so strace
+	@$(RM) -fv -- *.a *.d *.o *.so strace
 
 # vi:ft=make:

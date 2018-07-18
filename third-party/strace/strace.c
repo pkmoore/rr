@@ -2679,7 +2679,7 @@ terminate(void)
 	exit(exit_code);
 }
 
-#ifndef LIBPRINTSTRACE_COMPILE
+#ifndef LIBSTRACE_COMPILE
 int
 main(int argc, char *argv[])
 {
