@@ -14,7 +14,7 @@ LDFLAGS += -g3 -fPIC -L$(LIBS_PATH)
 LDLIBS += -lrt -l:libdw.a -l:libelf.a -l:libz.a -l:libz.a -llzma -pthread
 
 EXCLUDE_OBJS := syscall.o trace-statfs64.o
-EXCLUDE_OBJS += strace.o Estrace-main.o
+EXCLUDE_OBJS += strace.o strace-main.o
 EXCLUDE_OBJS += strace-ucopy.o strace-strace.o
 EXCLUDE_OBJS += strace-unwind-libdw.o strace-unwind.o
 EXCLUDE_OBJS += unwind.o unwind-libunwind.o
@@ -69,8 +69,7 @@ strace-main.o: %.o: main.c
 	$(CC) $< $(CPPFLAGS) $(CFLAGS) -c -o $@
 
 strace-lib.o: %.o: strace.c
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
-	# $(CC) $(CPPFLAGS) -DLIBPRINTSTRACE_COMPILE $(CFLAGS) -c $< -o $@
+	$(CC) $(CPPFLAGS) -DLIBPRINTSTRACE_COMPILE $(CFLAGS) -c $< -o $@
 
 %: %.o
 	$(LD) $< $(LDFLAGS) $(LDLIBS) -o $@
