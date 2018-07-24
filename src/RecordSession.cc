@@ -23,6 +23,13 @@
 #include "record_syscall.h"
 #include "seccomp-bpf.h"
 
+#include "strace_defs.h"
+
+extern struct tcb *current_tcp;
+struct tcb tcp;
+FILE* strace_outfile = NULL;
+static rr::RecordTask* current_record_task;
+
 namespace rr {
 
 // Undef si_addr_lsb since it's an alias for a field name that doesn't exist,
@@ -913,6 +920,37 @@ void RecordSession::syscall_state_changed(RecordTask* t,
         arm_desched_event(t);
       }
 
+      if(this->strace_output) {
+        if (strace_outfile == NULL) {
+          strace_outfile = fopen("strace_out.strace", "w");
+        }
+        // Set up global reference to the current task to call from our
+        // overridden copies of umoven and umovestr
+        current_record_task = t;
+        // Data that we need to decode.  We can set this stuff each time
+        current_tcp = &tcp;
+        printing_tcp = &tcp;
+        clear_regs(&tcp); // Unset regs error
+        tcp._priv_data = NULL; // Must be initialized to null
+        tcp.curcol = 0; // reset to 1 each time?
+        tcp.outf = strace_outfile;
+        tcp.pid = t->rec_tid;
+        tcp.scno = t->regs().original_syscallno();
+        // These values go into registers
+        tcp.u_rval   = t->regs().syscall_result();
+        tcp.u_arg[0] = t->regs().arg1();
+        tcp.u_arg[1] = t->regs().arg2();
+        tcp.u_arg[2] = t->regs().arg3();
+        tcp.u_arg[3] = t->regs().arg4();
+        tcp.u_arg[4] = t->regs().arg5();
+        tcp.u_arg[5] = t->regs().arg6();
+        int res = syscall_entering_decode(&tcp);
+        // We must save the return value from here
+        res = syscall_entering_trace(&tcp, 0);
+        // And pass it in here
+        syscall_entering_finish(&tcp, res);
+      }
+
       return;
     }
 
@@ -1047,6 +1085,27 @@ void RecordSession::syscall_state_changed(RecordTask* t,
       if (!is_in_privileged_syscall(t)) {
         maybe_trigger_emulated_ptrace_syscall_exit_stop(t);
       }
+
+      if(this->strace_output) { 
+        // Set up global reference to the current task to call from our
+        // overridden copies of umoven and umovestr
+        current_record_task = t;
+        current_tcp = &tcp;
+        printing_tcp = &tcp;
+        clear_regs(&tcp);
+        tcp.pid = t->rec_tid;
+        tcp.scno = t->regs().original_syscallno();
+        // When to set return value?
+        tcp.u_rval   = t->regs().syscall_result();
+        // Must have a struct ts allocated even if we don't use it
+        struct timespec ts = {};
+        int res = syscall_exiting_decode(&tcp, &ts);
+        // We must also save the return value here
+        syscall_exiting_trace(&tcp, NULL, res);
+        // And pass it in here
+        syscall_exiting_finish(&tcp);
+      }
+
       return;
     }
 
@@ -1981,7 +2040,6 @@ RecordSession::RecordResult RecordSession::record_step() {
         desched_state_changed(t);
         break;
       case EV_SYSCALL:
-        t->strace_output = strace_output;
         syscall_state_changed(t, &step_state);
         break;
       case EV_SIGNAL:
@@ -2053,3 +2111,29 @@ RecordTask* RecordSession::find_task(const TaskUid& tuid) const {
 }
 
 } // namespace rr
+
+extern "C" {
+int umoven(struct tcb *, kernel_ulong_t addr, unsigned int len, void *laddr) {
+  rr::remote_ptr<void> r_addr = rr::remote_ptr<void>(addr);
+  char buffer[len];
+  current_record_task->read_bytes_helper(r_addr, len, buffer);
+  memcpy(laddr, buffer, len);
+  return 0;
+}
+
+int umovestr(struct tcb *, kernel_ulong_t addr, unsigned int len, char *laddr) {
+  rr::remote_ptr<void> r_addr;
+  char* orig_addr = laddr;
+  while(len) {
+    r_addr = rr::remote_ptr<void>(addr);
+    current_record_task->read_bytes_helper(r_addr, 1, laddr);
+    if(memchr(laddr, '\0', 1)) {
+      return laddr - orig_addr;
+    }
+    len -= 1;
+    laddr+= 1;
+    addr+= 1;
+  }
+  return len;
+}
+}

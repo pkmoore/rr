@@ -1,0 +1,77 @@
+AR ?= ar
+CC ?= gcc
+LD = $(CC)
+LIBS_PATH := ./libs/
+CPPFLAGS += -D_GNU_SOURCE=1 -D__STDC_FORMAT_MACROS=1
+CPPFLAGS += -D_POSIX_C_SOURCE=199506 -D_XOPEN_SOURCE=600
+CPPFLAGS += -DHAVE_CONFIG_H -D_DEFAULT_SOURCE=1
+CFLAGS += -I./ -I./linux -I./linux/i386
+CFLAGS += -g3 -std=gnu11 -fPIC -fno-omit-frame-pointer
+CFLAGS += -fdiagnostics-show-option -Wall -Wextra -pedantic
+CFLAGS += -fno-omit-frame-pointer -fdiagnostics-show-option
+CFLAGS += -Wno-long-long -Wno-unused-parameter
+CFLAGS += -Wno-missing-field-initializers
+LDFLAGS += -fPIC -Wl,-O3,-z,relro,-z,now,-z,noexecstack -L$(LIBS_PATH)
+LDLIBS += -lrt $(shell pkg-config libdw --cflags --libs --static)
+
+EXCLUDE_OBJS := trace-statfs64.o
+EXCLUDE_OBJS += strace.o strace-main.o
+EXCLUDE_OBJS += strace-ucopy.o strace-strace.o
+EXCLUDE_OBJS += strace-unwind-libdw.o strace-unwind.o
+EXCLUDE_OBJS += unwind.o unwind-libunwind.o
+OBJECTS = $(wildcard *.o)
+NEW_OBJS = $(filter-out $(EXCLUDE_OBJS),$(OBJECTS))
+
+# shared library versions
+MAJOR := 1
+MINOR := 0
+PATCH := 1
+THIS_MAKEFILE := Makefile.libstrace
+
+all:
+	$(MAKE) -f $(THIS_MAKEFILE) libstrace.so libstrace.a
+
+.PHONY: all clean main print_vars shared static
+
+bootstrap.d:
+	@./bootstrap
+
+shared:
+	@$(MAKE) -f $(THIS_MAKEFILE) libstrace.so
+
+static:
+	@$(MAKE) -f $(THIS_MAKEFILE) libstrace.a
+
+libstrace.so: libstrace.a
+	$(LD) -shared $< $(LDFLAGS) $(LDLIBS) -Wl,-soname,$@.$(MAJOR) -o $@.$(MAJOR).$(MINOR).$(PATCH)
+	@mkdir -pv -- $(LIBS_PATH)/
+	@cp -fv -- $@.$(MAJOR).$(MINOR).$(PATCH) $@
+	@cp -fv -- $@.$(MAJOR).$(MINOR).$(PATCH) $(LIBS_PATH)/
+	@ln -rsfv -- $(LIBS_PATH)/$@.$(MAJOR).$(MINOR).$(PATCH) $(LIBS_PATH)/$@.$(MAJOR)
+	@ln -rsfv -- $(LIBS_PATH)/$@.$(MAJOR).$(MINOR).$(PATCH) $(LIBS_PATH)/$@
+
+libstrace.a: $(NEW_OBJS) strace-lib.o
+	@rm -fv -- $@
+	$(AR) rcs $@ $^
+	@mkdir -pv $(LIBS_PATH)/
+	@cp -fv $@ $(LIBS_PATH)/
+
+strace: %: strace-lib.o strace-main.o syscall.o
+	$(LD) $^ $(LDFLAGS) $(LDLIBS) -o $@
+
+strace-main.o: %.o: main.c
+	$(CC) $< $(CPPFLAGS) $(CFLAGS) -c -o $@
+
+strace-lib.o: %.o: strace.c bootstrap.d
+	$(CC) $(CPPFLAGS) -DLIBSTRACE_COMPILE $(CFLAGS) -c $< -o $@
+
+%: %.o
+	$(LD) $< $(LDFLAGS) $(LDLIBS) -o $@
+
+%.o: %.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+clean:
+	@$(RM) -fv -- *.a *.d *.o *.so strace
+
+# vi:ft=make:

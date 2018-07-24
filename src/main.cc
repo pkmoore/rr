@@ -11,6 +11,8 @@
 
 #include "Python.h"
 
+#include "strace_defs.h"
+
 #include <sstream>
 
 #include "Command.h"
@@ -208,7 +210,26 @@ PyObject* dump_state_func;
 PyObject* write_to_pipe_func;
 PyObject* close_pipe_func;
 
+
+extern struct tcb *current_tcp;
+extern bool print_pid_pfx;
+extern int acolumn;
+extern char *acolumn_spaces;
+extern unsigned int max_strlen;
+
 int main(int argc, char* argv[]) {
+  // This is also set up by strace.  Needs to be run once
+  acolumn_spaces = (char*)xmalloc(acolumn + 1);
+  memset(acolumn_spaces, ' ', acolumn);
+  acolumn_spaces[acolumn] = '\0';
+  // Tell strace to be super verbose and filter nothing
+  qualify("trace=all");
+  qualify("abbrev=none");
+  qualify("verbose=all");
+  qualify("signal=all");
+  print_pid_pfx = true; // Tell strace to print out the PID information
+  max_strlen = 65535;
+
   PyObject* py_rrdump_modname;
   PyObject* py_rrdump_module;
   PyObject* py_rrdump_dict;

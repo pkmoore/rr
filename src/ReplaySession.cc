@@ -496,6 +496,7 @@ Completion ReplaySession::enter_syscall(ReplayTask* t,
   if (current_trace_frame().event().Syscall().state == ENTERING_SYSCALL) {
     rep_after_enter_syscall(t);
   }
+
   rrdump_process_syscall(t, true);
   return COMPLETE;
 }
@@ -1617,6 +1618,7 @@ ReplayTask* ReplaySession::setup_replay_one_trace_frame(ReplayTask* t) {
         rep_prepare_run_to_syscall(t, &current_step);
       } else {
         rep_process_syscall(t, &current_step);
+
         if (current_step.action == TSTEP_RETIRE) {
           t->on_syscall_exit(current_step.syscall.number,
                              current_step.syscall.arch, trace_frame.regs());
