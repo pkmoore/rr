@@ -72,3 +72,6 @@ Makefile
 Makefile.in
 core
 libprintstrace.a
+libs/
+*.so*
+shared.*

@@ -1,4 +1,6 @@
-#!/bin/sh -eu
+#!/bin/sh
+
+set -o errexit nounset
 
 ./m4/gen_bpf_attr_m4.sh
 ./generate_mpers_am.sh
@@ -7,27 +9,22 @@
 ./tests/gen_tests.sh
 
 for m in m32 mx32; do
-	tests=tests-$m
-	rm -rf $tests
-	mkdir $tests
-	s='[[:space:]]*'
-	[ "$m" = m32 ] && k="s/^\\(SIZEOF_KERNEL_LONG_T$s=\\).*/\\1 4/;" || k=
+	tests="tests-$m"
+	s='[[:blank:]]*'
+	k="s/^\\(SIZEOF_KERNEL_LONG_T$s=\\).*/\\1 4/"
+	rm -rfv -- "$tests"
+	mkdir -pv -- "$tests"
+	test "$m" != m32 && k=""
 	sed "s/@arch@/@arch_$m@/;
-	     s/^\\(SIZEOF_LONG$s=\\).*/\\1 4/; $k
+	     s/^\\(SIZEOF_LONG$s=\\).*/\\1 4/;
+	     $k;
 	     s/^MPERS_NAME$s=.*/& $m/;
 	     s/^MPERS_CC_FLAGS$s=.*/& @cc_flags_$m@/;
-	     s/^ARCH_MFLAGS$s=.*/& -DMPERS_IS_\$(MPERS_NAME) \$(MPERS_CC_FLAGS)/" \
-		tests/Makefile.am > $tests/Makefile.am
-	for f in tests/*; do
-		case "${f##*/}" in
-		Makefile*) continue;;
-		esac
-		ln -s ../"$f" $tests/
-	done
+	     s/^ARCH_MFLAGS$s=.*/& -DMPERS_IS_\$(MPERS_NAME) \$(MPERS_CC_FLAGS)/;
+	     " tests/Makefile.am > "$tests/Makefile.am"
+	find tests/ -maxdepth 1 -type f \! -name '*Makefile*' -exec ln -rsv -- {} "$tests/" \;
 done
 
-for f in README; do
-	cp "dist/$f" .
-done
-
-autoreconf -f -i "$@"
+autoreconf -f -i .
+./configure --enable-stacktrace=no --without-libunwind --with-libdw
+echo > bootstrap.d

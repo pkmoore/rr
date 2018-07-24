@@ -73,11 +73,9 @@ bool stack_trace_enabled;
 #define my_tkill(tid, sig) syscall(__NR_tkill, (tid), (sig))
 
 /* Glue for systems without a MMU that cannot provide fork() */
-#if !defined(HAVE_FORK)
+#if !defined(HAVE_FORK) || defined(NOMMU_SYSTEM)
 # undef NOMMU_SYSTEM
 # define NOMMU_SYSTEM 1
-#endif
-#if NOMMU_SYSTEM
 # define fork() vfork()
 #endif
 
@@ -95,9 +93,6 @@ bool count_wallclock;
 unsigned int qflag;
 static unsigned int tflag;
 static bool rflag;
-#ifndef LIBPRINTSTRACE_COMPILE
-static
-#endif
 bool print_pid_pfx;
 
 /* -I n */
@@ -147,13 +142,7 @@ static uid_t run_uid;
 static gid_t run_gid;
 
 unsigned int max_strlen = DEFAULT_STRLEN;
-#ifndef LIBPRINTSTRACE_COMPILE
-static
-#endif
 int acolumn = DEFAULT_ACOLUMN;
-#ifndef LIBPRINTSTRACE_COMPILE
-static
-#endif
 char *acolumn_spaces;
 
 /* Default output style for xlat entities */
@@ -165,9 +154,6 @@ static FILE *shared_log;
 static bool open_append;
 
 struct tcb *printing_tcp;
-#ifndef LIBPRINTSTRACE_COMPILE
-static
-#endif
 struct tcb *current_tcp;
 
 static struct tcb **tcbtab;
@@ -191,7 +177,7 @@ static volatile int interrupted, restart_failed;
 #endif
 
 static sigset_t timer_set;
-static void timer_sighandler(int);
+static void timer_sighandler(int sig);
 
 #ifndef HAVE_STRERROR
 
@@ -1546,7 +1532,7 @@ get_os_release(void)
 		if (!(*p >= '0' && *p <= '9'))
 			error_msg_and_die("Bad OS release string: '%s'", u.release);
 		/* Note: this open-codes KERNEL_VERSION(): */
-		rel = (rel << 8) | atoi(p);
+		rel = (rel << 8) | strtol(p, 0, 10);
 		if (rel >= KERNEL_VERSION(1, 0, 0))
 			break;
 		while (*p >= '0' && *p <= '9')
@@ -2053,18 +2039,18 @@ maybe_allocate_tcb(const int pid, int status)
 		if (!qflag)
 			error_msg("Process %d attached", pid);
 		return tcp;
-	} else {
-		/*
-		 * This can happen if a clone call misused CLONE_PTRACE itself.
-		 *
-		 * There used to be a dance around possible re-injection of
-		 * WSTOPSIG(status), but it was later removed as the only
-		 * observable stop here is the initial ptrace-stop.
-		 */
-		ptrace(PTRACE_DETACH, pid, NULL, 0L);
-		error_msg("Detached unknown pid %d", pid);
-		return NULL;
 	}
+
+	/*
+	 * This can happen if a clone call misused CLONE_PTRACE itself.
+	 *
+	 * There used to be a dance around possible re-injection of
+	 * WSTOPSIG(status), but it was later removed as the only
+	 * observable stop here is the initial ptrace-stop.
+	 */
+	ptrace(PTRACE_DETACH, pid, NULL, 0L);
+	error_msg("Detached unknown pid %d", pid);
+	return NULL;
 }
 
 static struct tcb *
@@ -2430,20 +2416,20 @@ trace_syscall(struct tcb *tcp, unsigned int *sig)
 		}
 		syscall_entering_finish(tcp, res);
 		return res;
-	} else {
-		struct timespec ts = {};
-		int res = syscall_exiting_decode(tcp, &ts);
-		if (res != 0) {
-			res = syscall_exiting_trace(tcp, &ts, res);
-		}
-		syscall_exiting_finish(tcp);
-		return res;
 	}
+
+	struct timespec ts = {};
+	int res = syscall_exiting_decode(tcp, &ts);
+	if (res != 0) {
+		res = syscall_exiting_trace(tcp, &ts, res);
+	}
+	syscall_exiting_finish(tcp);
+	return res;
 }
 
 /* Returns true iff the main trace loop has to continue. */
 static bool
-dispatch_event(enum trace_event ret, int *pstatus, siginfo_t *si)
+dispatch_event(enum trace_event ret, const int *pstatus, siginfo_t *si)
 {
 	unsigned int restart_op = PTRACE_SYSCALL;
 	unsigned int restart_sig = 0;
@@ -2693,7 +2679,7 @@ terminate(void)
 	exit(exit_code);
 }
 
-#ifndef LIBPRINTSTRACE_COMPILE
+#ifndef LIBSTRACE_COMPILE
 int
 main(int argc, char *argv[])
 {

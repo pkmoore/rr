@@ -1,9 +1,7 @@
-#!/bin/bash
+#!/bin/sh
 
-#./bootstrap
-# This always fails at the end but we need the objects in place for the next
-# make
+./bootstrap
 make clean
-make CFLAGS=-DLIBPRINTSTRACE_COMPILE -j2 || true
-make -f othermake libprintstrace.a
-
+make -f Makefile.libstrace clean
+make
+make -f Makefile.libstrace libprintstrace.a
