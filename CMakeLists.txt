@@ -471,10 +471,11 @@ if(strip)
   set_target_properties(rr PROPERTIES LINK_FLAGS "-s")
 endif()
 
-# libdw is needed by libstrace
-exec_program(pkg-config
-             ARGS libdw --cflags --libs --static
-             OUTPUT_VARIABLE CMAKE_DW_LIBS)
+# libdw dependencies for libstrace
+execute_process(COMMAND bash
+                "-c"
+                "pkg-config libdw --cflags --libs --static 2>/dev/null || printf %s -ldwarf"
+                OUTPUT_VARIABLE CMAKE_DW_LIBS)
 
 target_link_libraries(rr
   ${CMAKE_DL_LIBS}
