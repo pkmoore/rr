@@ -2503,6 +2503,11 @@ static void check_signals_while_exiting(RecordTask* t) {
   }
 }
 
+static bool send_signal_during_init_buffers() {
+  static bool send = getenv("RR_INIT_BUFFERS_SEND_SIGNAL") != nullptr;
+  return send;
+}
+
 /**
  * At thread exit time, undo the work that init_buffers() did.
  *
@@ -2750,7 +2755,6 @@ static void prepare_clone(RecordTask* t, TaskSyscallState& syscall_state) {
   RecordTask* new_task = static_cast<RecordTask*>(
       t->session().clone(t, clone_flags_to_task_flags(flags), params.stack,
                          params.tls, params.ctid, new_tid));
-  new_task->update_own_namespace_tid();
 
   // Restore modified registers in cloned task
   Registers new_r = new_task->regs();
@@ -4090,12 +4094,10 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
             << "Personality value " << HEX(p)
             << " not compatible with chaos mode addres-space randomization";
       }
-      // XXX READ_IMPLIES_EXEC not handled. We would need to audit rr to see
-      // if we're relying on it.
       if (p & 0xffffff00 &
           ~(ADDR_COMPAT_LAYOUT | ADDR_NO_RANDOMIZE | ADDR_LIMIT_32BIT |
             ADDR_LIMIT_3GB | FDPIC_FUNCPTRS | MMAP_PAGE_ZERO | SHORT_INODE |
-            STICKY_TIMEOUTS | UNAME26 | WHOLE_SECONDS)) {
+            STICKY_TIMEOUTS | UNAME26 | WHOLE_SECONDS | READ_IMPLIES_EXEC)) {
         syscall_state.expect_errno = EINVAL;
       }
       return PREVENT_SWITCH;
@@ -4133,6 +4135,10 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
       return PREVENT_SWITCH;
 
     case SYS_rrcall_init_buffers:
+      // This is purely for testing purposes. See signal_during_preload_init.
+      if (send_signal_during_init_buffers()) {
+        syscall(SYS_tgkill, t->tgid(), t->tid, SIGCHLD);
+      }
       syscall_state.reg_parameter<rrcall_init_buffers_params<Arch>>(1, IN_OUT);
       return PREVENT_SWITCH;
 
@@ -4483,8 +4489,6 @@ static void process_execve(RecordTask* t, TaskSyscallState& syscall_state) {
     }
   }
 
-  init_scratch_memory(t, FIXED_ADDRESS);
-
   for (auto& p : pages_to_record) {
     t->record_remote(p, page_size());
   }
@@ -4492,6 +4496,8 @@ static void process_execve(RecordTask* t, TaskSyscallState& syscall_state) {
   // Patch LD_PRELOAD and VDSO after saving the mappings. Replay will apply
   // patches to the saved mappings.
   t->vm()->monkeypatcher().patch_after_exec(t);
+
+  init_scratch_memory(t, FIXED_ADDRESS);
 }
 
 static void process_mmap(RecordTask* t, size_t length, int prot, int flags,
@@ -4579,7 +4585,8 @@ static void process_mmap(RecordTask* t, size_t length, int prot, int flags,
   // at an assertion, in the worst case, we'd end up modifying the underlying
   // file.
   if (!(flags & MAP_SHARED)) {
-    t->vm()->monkeypatcher().patch_after_mmap(t, addr, size, offset_pages, fd);
+    t->vm()->monkeypatcher().patch_after_mmap(t, addr, size, offset_pages, fd,
+                                              Monkeypatcher::MMAP_SYSCALL);
   }
 
   if ((prot & (PROT_WRITE | PROT_READ)) == PROT_READ && (flags & MAP_SHARED) &&
@@ -4777,7 +4784,7 @@ static void record_iovec_output(RecordTask* t, RecordTask* dest,
   // See https://bugzilla.kernel.org/show_bug.cgi?id=113541
   auto iovs = t->read_mem(piov, iov_cnt);
   for (auto& iov : iovs) {
-    dest->record_remote_fallible(iov.iov_base, iov.iov_len);
+    dest->record_remote_writeable(iov.iov_base, iov.iov_len);
   }
 }
 
@@ -5094,6 +5101,19 @@ static void rec_process_syscall_arch(RecordTask* t,
         }
       }
       break;
+
+    case Arch::sched_getaffinity: {
+      pid_t pid = (pid_t)t->regs().arg1();
+      if (!t->regs().syscall_failed() && (pid == 0 || pid == t->rec_tid)) {
+        if (t->regs().syscall_result() > sizeof(cpu_set_t)) {
+          LOG(warn) << "Don't understand kernel's sched_getaffinity result";
+        } else {
+          t->write_bytes_helper(t->regs().arg3(), t->regs().syscall_result(),
+              &t->session().scheduler().pretend_affinity_mask());
+        }
+      }
+      break;
+    }
 
     case Arch::setsockopt: {
       // restore possibly-modified regs

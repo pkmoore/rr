@@ -239,6 +239,10 @@ struct mprotect_record {
  * Variables used to communicate between preload and rr.
  * We package these up into a single struct to simplify the preload/rr
  * interface.
+ * You can add to the end of this struct without breaking trace compatibility,
+ * but don't move existing fields. Do not write to it during replay except for
+ * the 'in_replay' field. Be careful reading fields during replay as noted
+ * below, since they don't all exist in all trace versions.
  */
 struct preload_globals {
   /* 0 during recording, 1 during replay. Set by rr.
@@ -253,6 +257,11 @@ struct preload_globals {
   /* 0 during recording and replay, 1 during diversion. Set by rr.
    */
   unsigned char in_diversion;
+  /* 1 if chaos mode is enabled. DO NOT READ from rr during replay, because
+     this field is not initialized in old traces. */
+  unsigned char in_chaos;
+  /* Padding, currently unused; can be used later. */
+  unsigned char padding;
   /* Number of cores to pretend we have. 0 means 1. rr sets this when
    * the preload library is initialized. */
   int pretend_num_cores;
@@ -267,6 +276,9 @@ struct preload_globals {
   VOLATILE char syscallbuf_fds_disabled[SYSCALLBUF_FDS_DISABLED_SIZE];
   /* mprotect records. Set by preload. */
   struct mprotect_record mprotect_records[MPROTECT_RECORD_COUNT];
+  /* Random seed that can be used for various purposes. DO NOT READ from rr
+     during replay, because this field does not exist in old traces. */
+  uint64_t random_seed;
 };
 
 /**
@@ -327,7 +339,8 @@ struct preload_thread_locals {
   /* Nonzero when thread-local state like the syscallbuf has been
    * initialized.  */
   int thread_inited;
-  /* When buffering is enabled, points at the thread's mapped buffer
+  /* The offset of this field MUST NOT CHANGE, it is part of the ABI tools
+   * depend on. When buffering is enabled, points at the thread's mapped buffer
    * segment.  At the start of the segment is an object of type |struct
    * syscallbuf_hdr|, so |buffer| is also a pointer to the buffer
    * header. */

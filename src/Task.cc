@@ -18,8 +18,10 @@
 #include <string.h>
 #include <sys/personality.h>
 #include <sys/prctl.h>
+#include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <sys/user.h>
 #include <sys/wait.h>
 #include <syscall.h>
@@ -186,8 +188,9 @@ ScopedFd Task::open_fd(int fd, int flags) {
 
 string Task::file_name_of_fd(int fd) {
   char path[PATH_MAX];
-  snprintf(path, sizeof(path) - 1, "/proc/%d/fd/%d", tid, fd);
-  ssize_t nbytes = readlink(path, path, sizeof(path) - 1);
+  char procfd[40];
+  snprintf(procfd, sizeof(procfd) - 1, "/proc/%d/fd/%d", tid, fd);
+  ssize_t nbytes = readlink(procfd, path, sizeof(path) - 1);
   if (nbytes < 0) {
     path[0] = 0;
   } else {
@@ -841,11 +844,11 @@ TrapReasons Task::compute_trap_reasons() {
     // step over those instructions so we need to detect that here.
     reasons.singlestep = true;
   } else if (is_singlestep_resume(how_last_execution_resumed) &&
-             disabled_insn_at(this, address_of_last_execution_resume) ==
-                 DisabledInsn::CPUID &&
+             trapped_instruction_at(this, address_of_last_execution_resume) ==
+                 TrappedInstruction::CPUID &&
              ip() ==
                  address_of_last_execution_resume +
-                     disabled_insn_len(DisabledInsn::CPUID)) {
+                     trapped_instruction_len(TrappedInstruction::CPUID)) {
     // Likewise we emulate CPUID instructions and must forcibly detect that
     // here.
     reasons.singlestep = true;
@@ -860,7 +863,9 @@ TrapReasons Task::compute_trap_reasons() {
   // XXX Read/exec watchpoints can't be detected this way so they're still
   // broken in the above configuration :-(.
   if ((DS_WATCHPOINT_ANY | DS_SINGLESTEP) & status) {
-    as->notify_watchpoint_fired(status);
+    as->notify_watchpoint_fired(status,
+        is_singlestep_resume(how_last_execution_resumed)
+            ? address_of_last_execution_resume : nullptr);
   }
   reasons.watchpoint =
       as->has_any_watchpoint_changes() || (DS_WATCHPOINT_ANY & status);
@@ -1659,12 +1664,6 @@ Task* Task::clone(CloneReason reason, int flags, remote_ptr<void> stack,
   Task* t =
       new_task_session->new_task(new_tid, new_rec_tid, new_serial, arch());
 
-  if (CLONE_SHARE_THREAD_GROUP & flags) {
-    t->tg = tg;
-  } else {
-    t->tg = new_task_session->clone(t, tg);
-  }
-  t->tg->insert_task(t);
   if (CLONE_SHARE_VM & flags) {
     t->as = as;
     if (!stack.is_null()) {
@@ -1709,6 +1708,12 @@ Task* Task::clone(CloneReason reason, int flags, remote_ptr<void> stack,
   t->wait();
 
   t->post_wait_clone(this, flags);
+  if (CLONE_SHARE_THREAD_GROUP & flags) {
+    t->tg = tg;
+  } else {
+    t->tg = new_task_session->clone(t, tg);
+  }
+  t->tg->insert_task(t);
 
   t->open_mem_fd_if_needed();
   t->thread_areas_ = thread_areas_;
@@ -1878,10 +1883,10 @@ void Task::copy_state(const CapturedState& state) {
   {
     AutoRemoteSyscalls remote(this);
     {
-      char prname[16];
+      char prname[17];
       strncpy(prname, state.prname.c_str(), sizeof(prname));
-      AutoRestoreMem remote_prname(remote, (const uint8_t*)prname,
-                                   sizeof(prname));
+      prname[16] = 0;
+      AutoRestoreMem remote_prname(remote, (const uint8_t*)prname, 16);
       LOG(debug) << "    setting name to " << prname;
       remote.infallible_syscall(syscall_number_for_prctl(arch()), PR_SET_NAME,
                                 remote_prname.get().as_int());
@@ -2385,11 +2390,12 @@ static long perform_remote_clone(AutoRemoteSyscalls& remote,
   return child;
 }
 
-static void setup_fd_table(FdTable& fds) {
+static void setup_fd_table(FdTable& fds, int tracee_socket_fd_number) {
   fds.add_monitor(STDOUT_FILENO, new StdioMonitor(STDOUT_FILENO));
   fds.add_monitor(STDERR_FILENO, new StdioMonitor(STDERR_FILENO));
   fds.add_monitor(RR_MAGIC_SAVE_DATA_FD, new MagicSaveDataMonitor());
   fds.add_monitor(RR_RESERVED_ROOT_DIR_FD, new PreserveFileMonitor());
+  fds.add_monitor(tracee_socket_fd_number, new PreserveFileMonitor());
 }
 
 static void set_cpu_affinity(int cpu) {
@@ -2425,7 +2431,8 @@ static void spawned_child_fatal_error(const ScopedFd& err_fd,
  * preventing direct access to sources of nondeterminism, and ensuring
  * that rr bugs don't adversely affect the underlying system.
  */
-static void set_up_process(Session& session, const ScopedFd& err_fd) {
+static void set_up_process(Session& session, const ScopedFd& err_fd,
+                           const ScopedFd& sock_fd, int sock_fd_number) {
   /* TODO tracees can probably undo some of the setup below
    * ... */
 
@@ -2458,6 +2465,11 @@ static void set_up_process(Session& session, const ScopedFd& err_fd) {
       spawned_child_fatal_error(err_fd,
                                 "error duping to RR_RESERVED_ROOT_DIR_FD");
     }
+  }
+
+  if (sock_fd_number != dup2(sock_fd, sock_fd_number)) {
+    spawned_child_fatal_error(err_fd,
+                              "error duping to RR_RESERVED_SOCKET_FD");
   }
 
   if (session.is_replaying()) {
@@ -2537,6 +2549,8 @@ static void set_up_seccomp_filter(SeccompFilter<struct sock_filter>& f,
 }
 
 static void run_initial_child(Session& session, const ScopedFd& error_fd,
+                              const ScopedFd& sock_fd,
+                              int sock_fd_number,
                               const string& exe_path,
                               const vector<string>& argv,
                               const vector<string>& envp) {
@@ -2549,7 +2563,7 @@ static void run_initial_child(Session& session, const ScopedFd& error_fd,
   SeccompFilter<struct sock_filter> filter = create_seccomp_filter();
   pid_t pid = getpid();
 
-  set_up_process(session, error_fd);
+  set_up_process(session, error_fd, sock_fd, sock_fd_number);
   // The preceding code must run before sending SIGSTOP here,
   // since after SIGSTOP replay emulates almost all syscalls, but
   // we need the above syscalls to run "for real".
@@ -2592,12 +2606,38 @@ static void run_initial_child(Session& session, const ScopedFd& error_fd,
 }
 
 /*static*/ Task* Task::spawn(Session& session, const ScopedFd& error_fd,
+                             ScopedFd* sock_fd_out,
+                             int* tracee_socket_fd_number_out,
                              const TraceStream& trace,
                              const std::string& exe_path,
                              const std::vector<std::string>& argv,
                              const std::vector<std::string>& envp,
                              pid_t rec_tid) {
   DEBUG_ASSERT(session.tasks().size() == 0);
+
+  int sockets[2];
+  long ret = socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets);
+  if (ret < 0) {
+    FATAL() << "socketpair failed";
+  }
+  *sock_fd_out = ScopedFd(sockets[0]);
+  ScopedFd sock(sockets[1]);
+
+  // Find a usable FD number to dup to in the child. RR_RESERVED_SOCKET_FD
+  // might already be used by an outer rr.
+  int fd_number = RR_RESERVED_SOCKET_FD;
+  // We assume no other thread is mucking with this part of the fd address space.
+  while (true) {
+    ret = fcntl(fd_number, F_GETFD);
+    if (ret < 0) {
+      if (errno != EBADF) {
+        FATAL() << "Error checking fd";
+      }
+      break;
+    }
+    ++fd_number;
+  }
+  *tracee_socket_fd_number_out = fd_number;
 
   if (trace.bound_to_cpu() >= 0) {
     // Set CPU affinity now, after we've created any helper threads
@@ -2616,7 +2656,8 @@ static void run_initial_child(Session& session, const ScopedFd& error_fd,
   } while (0 > tid && errno == EAGAIN);
 
   if (0 == tid) {
-    run_initial_child(session, error_fd, exe_path, argv, envp);
+    run_initial_child(session, error_fd, sock, fd_number, exe_path, argv,
+                      envp);
     // run_initial_child never returns
   }
 
@@ -2635,7 +2676,7 @@ static void run_initial_child(Session& session, const ScopedFd& error_fd,
     options |= PTRACE_O_TRACEVFORK | PTRACE_O_TRACESECCOMP | PTRACE_O_TRACEEXEC;
   }
 
-  long ret =
+  ret =
       ptrace(PTRACE_SEIZE, tid, nullptr, (void*)(options | PTRACE_O_EXITKILL));
   if (ret < 0 && errno == EINVAL) {
     // PTRACE_O_EXITKILL was added in kernel 3.8, and we only need
@@ -2661,12 +2702,12 @@ static void run_initial_child(Session& session, const ScopedFd& error_fd,
 
   Task* t = session.new_task(tid, rec_tid, session.next_task_serial(),
                              NativeArch::arch());
-  auto tg = session.create_tg(t);
+  auto tg = session.create_initial_tg(t);
   t->tg.swap(tg);
   auto as = session.create_vm(t);
   t->as.swap(as);
   t->fds = FdTable::create(t);
-  setup_fd_table(*t->fds);
+  setup_fd_table(*t->fds, fd_number);
 
   // Install signal handler here, so that when creating the first RecordTask
   // it sees the exact same signal state in the parent as will be in the child.

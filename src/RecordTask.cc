@@ -202,6 +202,7 @@ RecordTask::RecordTask(RecordSession& session, pid_t _tid, uint32_t serial,
     auto sh = Sighandlers::create();
     sh->init_from_current_process();
     sighandlers.swap(sh);
+    own_namespace_rec_tid = _tid;
   }
 }
 
@@ -335,6 +336,8 @@ void RecordTask::post_wait_clone(Task* cloned_from, int flags) {
     auto sh = rt->sighandlers->clone();
     sighandlers.swap(sh);
   }
+
+  update_own_namespace_tid();
 }
 
 static string exe_path(RecordTask* t) {
@@ -392,10 +395,24 @@ template <typename Arch> static void do_preload_init_arch(RecordTask* t) {
       params.get_pc_thunks_start.rptr().as_int();
   t->syscallbuf_code_layout.get_pc_thunks_end =
       params.get_pc_thunks_end.rptr().as_int();
+
+  unsigned char in_chaos = t->session().enable_chaos();
+  auto in_chaos_ptr REMOTE_PTR_FIELD(params.globals.rptr(), in_chaos);
+  t->write_mem(in_chaos_ptr, in_chaos);
+  t->record_local(in_chaos_ptr, &in_chaos);
+
   int cores = t->session().scheduler().pretend_num_cores();
   auto cores_ptr = REMOTE_PTR_FIELD(params.globals.rptr(), pretend_num_cores);
   t->write_mem(cores_ptr, cores);
   t->record_local(cores_ptr, &cores);
+
+  uint64_t random_seed;
+  do {
+    random_seed = rand() | (uint64_t(rand()) << 32);
+  } while (!random_seed);
+  auto random_seed_ptr REMOTE_PTR_FIELD(params.globals.rptr(), random_seed);
+  t->write_mem(random_seed_ptr, random_seed);
+  t->record_local(random_seed_ptr, &random_seed);
 }
 
 void RecordTask::push_syscall_event(int syscallno) {
@@ -589,6 +606,9 @@ void RecordTask::will_resume_execution(ResumeRequest, WaitRequest,
     }
     int ret = fallible_ptrace(PTRACE_SETSIGMASK, remote_ptr<void>(8), &sigset);
     if (ret < 0) {
+      if (errno == EIO) {
+        FATAL() << "PTRACE_SETSIGMASK not supported; rr requires Linux kernel >= 3.11";
+      }
       ASSERT(this, errno == EINVAL);
     } else {
       LOG(debug) << "Set signal mask to block all signals (bar "
@@ -1486,10 +1506,28 @@ void RecordTask::record_remote(remote_ptr<void> addr, ssize_t num_bytes) {
   trace_writer().write_raw(rec_tid, buf.data(), num_bytes, addr);
 }
 
+void RecordTask::record_remote_writeable(remote_ptr<void> addr,
+                                         ssize_t num_bytes) {
+  ASSERT(this, num_bytes >= 0);
+
+  remote_ptr<void> p = addr;
+  while (p < addr + num_bytes) {
+    if (!as->has_mapping(p)) {
+      break;
+    }
+    auto m = as->mapping_of(p);
+    if (!(m.map.prot() & PROT_WRITE)) {
+      break;
+    }
+    p = m.map.end();
+  }
+  num_bytes = min(num_bytes, p - addr);
+
+  record_remote(addr, num_bytes);
+}
+
 void RecordTask::record_remote_fallible(remote_ptr<void> addr,
                                         ssize_t num_bytes) {
-  maybe_flush_syscallbuf();
-
   ASSERT(this, num_bytes >= 0);
 
   if (record_remote_by_local_map(addr, num_bytes) != 0) {
@@ -1766,10 +1804,12 @@ void RecordTask::kill_if_alive() {
 
 pid_t RecordTask::get_parent_pid() { return get_ppid(tid); }
 
-void RecordTask::set_tid_and_update_serial(pid_t tid) {
+void RecordTask::set_tid_and_update_serial(pid_t tid,
+                                           pid_t own_namespace_tid) {
   hpc.set_tid(tid);
   this->tid = rec_tid = tid;
   serial = session().next_task_serial();
+  own_namespace_rec_tid = own_namespace_tid;
 }
 
 template <typename Arch>

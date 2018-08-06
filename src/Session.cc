@@ -38,7 +38,9 @@ struct Session::CloneCompletion {
 };
 
 Session::Session()
-    : next_task_serial_(1),
+    : tracee_socket(shared_ptr<ScopedFd>(new ScopedFd())),
+      tracee_socket_fd_number(0),
+      next_task_serial_(1),
       syscall_seccomp_ordering_(PTRACE_SYSCALL_BEFORE_SECCOMP_UNKNOWN),
       done_initial_exec_(false),
       visible_execution_(true),
@@ -62,6 +64,8 @@ Session::Session(const Session& other) {
   done_initial_exec_ = other.done_initial_exec_;
   visible_execution_ = other.visible_execution_;
   has_cpuid_faulting_ = other.has_cpuid_faulting_;
+  tracee_socket = other.tracee_socket;
+  tracee_socket_fd_number = other.tracee_socket_fd_number;
 }
 
 void Session::on_create(ThreadGroup* tg) { thread_group_map[tg->tguid()] = tg; }
@@ -111,9 +115,10 @@ AddressSpace::shr_ptr Session::clone(Task* t, AddressSpace::shr_ptr vm) {
   return as;
 }
 
-ThreadGroup::shr_ptr Session::create_tg(Task* t) {
+ThreadGroup::shr_ptr Session::create_initial_tg(Task* t) {
   ThreadGroup::shr_ptr tg(
-      new ThreadGroup(this, nullptr, t->rec_tid, t->tid, t->tuid().serial()));
+      new ThreadGroup(this, nullptr, t->rec_tid, t->tid,
+                      t->tid, t->tuid().serial()));
   tg->insert_task(t);
   return tg;
 }
@@ -123,13 +128,15 @@ ThreadGroup::shr_ptr Session::clone(Task* t, ThreadGroup::shr_ptr tg) {
   // If tg already belongs to our session this is a fork to create a new
   // taskgroup, otherwise it's a session-clone of an existing taskgroup
   if (this == tg->session()) {
-    return ThreadGroup::shr_ptr(new ThreadGroup(this, tg.get(), t->rec_tid,
-                                                t->tid, t->tuid().serial()));
+    return ThreadGroup::shr_ptr(
+       new ThreadGroup(this, tg.get(), t->rec_tid,
+                       t->tid, t->own_namespace_tid(), t->tuid().serial()));
   }
   ThreadGroup* parent =
       tg->parent() ? find_thread_group(tg->parent()->tguid()) : nullptr;
   return ThreadGroup::shr_ptr(
-      new ThreadGroup(this, parent, tg->tgid, t->tid, tg->tguid().serial()));
+      new ThreadGroup(this, parent, tg->tgid, t->tid,
+                      t->own_namespace_tid(), tg->tguid().serial()));
 }
 
 Task* Session::new_task(pid_t tid, pid_t rec_tid, uint32_t serial,

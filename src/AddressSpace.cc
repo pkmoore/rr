@@ -1038,14 +1038,28 @@ static bool watchpoint_triggered(uintptr_t debug_status,
   return false;
 }
 
-bool AddressSpace::notify_watchpoint_fired(uintptr_t debug_status) {
+bool AddressSpace::notify_watchpoint_fired(uintptr_t debug_status,
+    remote_code_ptr address_of_singlestep_start) {
   bool triggered = false;
   for (auto& it : watchpoints) {
-    if (((it.second.watched_bits() & WRITE_BIT) &&
-         update_watchpoint_value(it.first, it.second)) ||
-        ((it.second.watched_bits() & (READ_BIT | EXEC_BIT)) &&
+    // On Skylake/4.14.13-300.fc27.x86_64 at least, we have observed a
+    // situation where singlestepping through the instruction before a hardware
+    // execution watchpoint causes singlestep completion *and* also reports the
+    // hardware execution watchpoint being triggered. The latter is incorrect.
+    // This could be a HW issue or a kernel issue. Work around it by ignoring
+    // triggered watchpoints that aren't on the instruction we just tried to
+    // execute.
+    bool write_triggered = (it.second.watched_bits() & WRITE_BIT) &&
+        update_watchpoint_value(it.first, it.second);
+    bool read_triggered = (it.second.watched_bits() & READ_BIT) &&
+        watchpoint_triggered(debug_status,
+                             it.second.debug_regs_for_exec_read);
+    bool exec_triggered = (it.second.watched_bits() & EXEC_BIT) &&
+        (address_of_singlestep_start.is_null() ||
+         it.first.start() == address_of_singlestep_start.to_data_ptr<void>()) &&
          watchpoint_triggered(debug_status,
-                              it.second.debug_regs_for_exec_read))) {
+                              it.second.debug_regs_for_exec_read);
+    if (write_triggered || read_triggered || exec_triggered) {
       it.second.changed = true;
       triggered = true;
     }
@@ -1204,31 +1218,23 @@ static bool is_adjacent_mapping(const KernelMapping& mleft,
                                 HandleHeap handle_heap,
                                 int32_t flags_to_check = 0xFFFFFFFF) {
   if (mleft.end() != mright.start()) {
-    LOG(debug) << "    (not adjacent in memory)";
     return false;
   }
   if (((mleft.flags() ^ mright.flags()) & flags_to_check) ||
       mleft.prot() != mright.prot()) {
-    LOG(debug) << "    (flags or prot differ)";
     return false;
   }
   if (!normalized_file_names_equal(mleft, mright, handle_heap)) {
-    LOG(debug) << "    (not the same filename)";
     return false;
   }
   if (mleft.device() != mright.device() || mleft.inode() != mright.inode()) {
-    LOG(debug) << "    (not the same device/inode)";
     return false;
   }
   if (mleft.is_real_device() &&
       mleft.file_offset_bytes() + off64_t(mleft.size()) !=
           mright.file_offset_bytes()) {
-    LOG(debug) << "    (" << mleft.file_offset_bytes() << " + " << mleft.size()
-               << " != " << mright.file_offset_bytes()
-               << ": offsets into real device aren't adjacent)";
     return false;
   }
-  LOG(debug) << "    adjacent!";
   return true;
 }
 
@@ -1315,6 +1321,8 @@ void AddressSpace::verify(Task* t) const {
   if (thread_group_in_exec(t)) {
     return;
   }
+
+  LOG(debug) << "Verifying address space for task " << t->tid;
 
   MemoryMap::const_iterator mem_it = mem.begin();
   KernelMapIterator kernel_it(t);
@@ -1842,49 +1850,82 @@ static MemoryRange adjust_range_for_stack_growth(const KernelMapping& km) {
   return MemoryRange(start, km.end());
 }
 
-remote_ptr<void> AddressSpace::chaos_mode_find_free_memory(Task* t,
-                                                           size_t len) {
-  remote_ptr<void> addr;
-  // Half the time, try to allocate at a completely random address. The other
-  // half of the time, we'll try to allocate immediately before or after a
-  // randomly chosen existing mapping.
-  if (random() % 2) {
-    int bits = random_addr_bits(t->arch());
-    // Some of these addresses will not be mappable. That's fine, the
-    // kernel will fall back to a valid address if the hint is not valid.
-    uint64_t r = ((uint64_t)(uint32_t)random() << 32) | (uint32_t)random();
-    addr = floor_page_size(remote_ptr<void>(r & ((uint64_t(1) << bits) - 1)));
-  } else {
-    ASSERT(t, !mem.empty());
-    int map_index = random() % mem.size();
-    int map_count = 0;
-    for (const auto& m : maps()) {
-      if (map_count == map_index) {
-        addr = m.map.start();
-        break;
-      }
-      ++map_count;
-    }
+// Choose a 4TB range to exclude from random mappings. This makes room for
+// advanced trace analysis tools that require a large address range in tracees
+// that is never mapped.
+static MemoryRange choose_global_exclusion_range() {
+  if (sizeof(uintptr_t) < 8) {
+    return MemoryRange(nullptr, 0);
   }
 
-  // If there's a collision (which there always will be in the second case
-  // above), either move the mapping forwards or backwards in memory until it
-  // fits. Choose the direction randomly.
-  int direction = (random() % 2) ? 1 : -1;
+  const uint64_t range_size = uint64_t(4)*1024*1024*1024*1024;
+  int bits = random_addr_bits(x86_64);
+  uint64_t r = ((uint64_t)(uint32_t)random() << 32) | (uint32_t)random();
+  uint64_t r_addr = r & ((uint64_t(1) << bits) - 1);
+  r_addr = min(r_addr, (uint64_t(1) << bits) - range_size);
+  remote_ptr<void> addr = floor_page_size(remote_ptr<void>(r_addr));
+  return MemoryRange(addr, range_size);
+}
+
+remote_ptr<void> AddressSpace::chaos_mode_find_free_memory(Task* t,
+                                                           size_t len) {
+  static MemoryRange global_exclusion_range = choose_global_exclusion_range();
+
+  int bits = random_addr_bits(t->arch());
+  uint64_t addr_space_limit = uint64_t(1) << bits;
   while (true) {
-    Maps m = maps_starting_at(addr);
-    if (m.begin() == m.end()) {
-      return addr;
-    }
-    MemoryRange range = adjust_range_for_stack_growth(m.begin()->map);
-    if (range.start() >= addr + len) {
-      // No overlap with an existing mapping; we're good!
-      return addr;
-    }
-    if (direction == -1) {
-      addr = range.start() - len;
+    remote_ptr<void> addr;
+    // Half the time, try to allocate at a completely random address. The other
+    // half of the time, we'll try to allocate immediately before or after a
+    // randomly chosen existing mapping.
+    if (random() % 2) {
+      // Some of these addresses will not be mappable. That's fine, the
+      // kernel will fall back to a valid address if the hint is not valid.
+      uint64_t r = ((uint64_t)(uint32_t)random() << 32) | (uint32_t)random();
+      addr = floor_page_size(remote_ptr<void>(r & (addr_space_limit - 1)));
     } else {
-      addr = range.end();
+      ASSERT(t, !mem.empty());
+      int map_index = random() % mem.size();
+      int map_count = 0;
+      for (const auto& m : maps()) {
+        if (map_count == map_index) {
+          addr = m.map.start();
+          break;
+        }
+        ++map_count;
+      }
+    }
+
+    // If there's a collision (which there always will be in the second case
+    // above), either move the mapping forwards or backwards in memory until it
+    // fits. Choose the direction randomly.
+    int direction = (random() % 2) ? 1 : -1;
+    while (true) {
+      Maps m = maps_starting_at(addr);
+      if (m.begin() == m.end()) {
+        break;
+      }
+      MemoryRange range = adjust_range_for_stack_growth(m.begin()->map);
+      if (range.start() >= addr + len) {
+        // No overlap with an existing mapping; we're good!
+        break;
+      }
+      if (direction == -1) {
+        addr = range.start() - len;
+      } else {
+        addr = range.end();
+      }
+    }
+
+    if (uint64_t(addr.as_int()) >= addr_space_limit ||
+        uint64_t(addr.as_int()) + ceil_page_size(len) >= addr_space_limit) {
+      // We fell off one end of the address space. Try everything again.
+      continue;
+    }
+
+    MemoryRange r(addr, ceil_page_size(len));
+    if (!r.intersects(global_exclusion_range)) {
+      return addr;
     }
   }
 }

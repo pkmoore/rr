@@ -25,6 +25,7 @@ Makefile
 Profile
 .project
 vgcore*
+.vscode/
 *.log
 *.orig
 *.rej

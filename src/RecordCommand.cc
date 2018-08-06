@@ -31,6 +31,18 @@ RecordCommand RecordCommand::singleton(
     "  -c, --num-cpu-ticks=<NUM>  maximum number of 'CPU ticks' (currently \n"
     "                             retired conditional branches) to allow a \n"
     "                             task to run before interrupting it\n"
+    "  --disable-cpuid-features <CCC>[,<DDD>]\n"
+    "                             Mask out CPUID EAX=1 feature bits\n"
+    "                             <CCC>: Bitmask of bits to clear from ECX\n"
+    "                             <DDD>: Bitmask of bits to clear from EDX\n"
+    "  --disable-cpuid-features-ext <BBB>[,<CCC>[,<DDD>]]\n"
+    "                             Mask out CPUID EAX=7,ECX=0 feature bits\n"
+    "                             <BBB>: Bitmask of bits to clear from EBX\n"
+    "                             <CCC>: Bitmask of bits to clear from ECX\n"
+    "                             <DDD>: Bitmask of bits to clear from EDX\n"
+    "  --disable-cpuid-features-xsave <AAA>\n"
+    "                             Mask out CPUID EAX=0xD,ECX=1 feature bits\n"
+    "                             <AAA>: Bitmask of bits to clear from EAX\n"
     "  -h, --chaos                randomize scheduling decisions to try to \n"
     "                             reproduce bugs\n"
     "  -i, --ignore-signal=<SIG>  block <SIG> from being delivered to \n"
@@ -91,6 +103,9 @@ struct RecordFlags {
    * size.
    */
   size_t syscall_buffer_size;
+
+  /* CPUID features to disable */
+  DisableCPUIDFeatures disable_cpuid_features;
 
   int print_trace_dir;
 
@@ -161,6 +176,21 @@ static void parse_signal_name(ParsedOption& opt) {
   }
 }
 
+static vector<uint32_t> parse_feature_bits(ParsedOption& opt) {
+  vector<uint32_t> ret;
+  const char* p = opt.value.c_str();
+  while (*p) {
+    char* endptr;
+    unsigned long long v = strtoull(p, &endptr, 0);
+    if (v > UINT32_MAX || (*endptr && *endptr != ',')) {
+      return vector<uint32_t>();
+    }
+    ret.push_back(v);
+    p = *endptr == ',' ? endptr + 1 : endptr;
+  }
+  return ret;
+}
+
 static bool parse_record_arg(vector<string>& args, RecordFlags& flags) {
   if (parse_global_option(args)) {
     return true;
@@ -174,6 +204,9 @@ static bool parse_record_arg(vector<string>& args, RecordFlags& flags) {
     { 4, "scarce-fds", NO_PARAMETER },
     { 5, "setuid-sudo", NO_PARAMETER },
     { 6, "bind-to-cpu", HAS_PARAMETER },
+    { 7, "disable-cpuid-features", HAS_PARAMETER },
+    { 8, "disable-cpuid-features-ext", HAS_PARAMETER },
+    { 9, "disable-cpuid-features-xsave", HAS_PARAMETER },
     { 'b', "force-syscall-buffer", NO_PARAMETER },
     { 'c', "num-cpu-ticks", HAS_PARAMETER },
     { 'h', "chaos", NO_PARAMETER },
@@ -245,6 +278,45 @@ static bool parse_record_arg(vector<string>& args, RecordFlags& flags) {
     case 5:
       flags.setuid_sudo = true;
       break;
+    case 6:
+      if (!opt.verify_valid_int(0, INT32_MAX)) {
+        return false;
+      }
+      flags.bind_cpu = BindCPU(opt.int_value);
+      break;
+    case 7: {
+      vector<uint32_t> bits = parse_feature_bits(opt);
+      if (bits.empty() || bits.size() > 2) {
+        return false;
+      }
+      flags.disable_cpuid_features.features_ecx = bits[0];
+      if (bits.size() > 1) {
+        flags.disable_cpuid_features.features_edx = bits[1];
+      }
+      break;
+    }
+    case 8: {
+      vector<uint32_t> bits = parse_feature_bits(opt);
+      if (bits.empty() || bits.size() > 3) {
+        return false;
+      }
+      flags.disable_cpuid_features.extended_features_ebx = bits[0];
+      if (bits.size() > 1) {
+        flags.disable_cpuid_features.extended_features_ecx = bits[1];
+        if (bits.size() > 2) {
+          flags.disable_cpuid_features.extended_features_edx = bits[2];
+        }
+      }
+      break;
+    }
+    case 9: {
+      vector<uint32_t> bits = parse_feature_bits(opt);
+      if (bits.size() != 1) {
+        return false;
+      }
+      flags.disable_cpuid_features.xsave_features_eax = bits[0];
+      break;
+    }
     case 's':
       flags.always_switch = true;
       break;
@@ -254,12 +326,6 @@ static bool parse_record_arg(vector<string>& args, RecordFlags& flags) {
         return false;
       }
       flags.continue_through_sig = opt.int_value;
-      break;
-    case 6:
-      if (!opt.verify_valid_int(0, INT32_MAX)) {
-        return false;
-      }
-      flags.bind_cpu = BindCPU(opt.int_value);
       break;
     case 'u':
       flags.bind_cpu = UNBOUND_CPU;
@@ -281,7 +347,7 @@ static bool parse_record_arg(vector<string>& args, RecordFlags& flags) {
   return true;
 }
 
-static bool term_request;
+static volatile bool term_request;
 
 /**
  * A terminating signal was received.  Set the |term_request| bit to
@@ -289,6 +355,9 @@ static bool term_request;
  *
  * If there's already a term request pending, then assume rr is wedged
  * and abort().
+ *
+ * Note that this is not only called in a signal handler but it could
+ * be called off the main thread.
  */
 static void handle_SIGTERM(__attribute__((unused)) int sig) {
   // Don't use LOG() here because we're in a signal handler. If we do anything
@@ -348,7 +417,8 @@ static WaitStatus record(const vector<string>& args, const RecordFlags& flags) {
   LOG(info) << "Start recording...";
 
   auto session = RecordSession::create(
-    args, flags.extra_env, flags.use_syscall_buffer, flags.bind_cpu, flags.strace_output);
+      args, flags.extra_env, flags.disable_cpuid_features,
+      flags.use_syscall_buffer, flags.bind_cpu, flags.strace_output);
   setup_session_from_flags(*session, flags);
 
   static_session = session.get();
@@ -476,6 +546,17 @@ int RecordCommand::run(vector<string>& args) {
     }
 
     reset_uid_sudo();
+  }
+
+  if (flags.chaos) {
+    // Add up to one page worth of random padding to the environment to induce
+    // a variety of possible stack pointer offsets
+    vector<char> chars;
+    chars.resize(random() % page_size());
+    memset(chars.data(), '0', chars.size());
+    chars.push_back(0);
+    string padding = string("RR_CHAOS_PADDING=") + chars.data();
+    flags.extra_env.push_back(padding);
   }
 
   WaitStatus status = record(args, flags);

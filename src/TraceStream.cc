@@ -1092,7 +1092,8 @@ static string make_trace_dir(const string& exe_path) {
 #define STR(x) STR_HELPER(x)
 
 TraceWriter::TraceWriter(const std::string& file_name, int bind_to_cpu,
-                         bool has_cpuid_faulting)
+                         bool has_cpuid_faulting,
+                         const DisableCPUIDFeatures& disable_cpuid_features)
     : TraceStream(make_trace_dir(file_name),
                   // Somewhat arbitrarily start the
                   // global time from 1.
@@ -1119,6 +1120,9 @@ TraceWriter::TraceWriter(const std::string& file_name, int bind_to_cpu,
   // We are now bound to the selected CPU (if any), so collect CPUID records
   // (which depend on the bound CPU number).
   vector<CPUIDRecord> cpuid_records = all_cpuid_records();
+  for (auto& r : cpuid_records) {
+    disable_cpuid_features.amend_cpuid_data(r.eax_in, r.ecx_in, &r.out);
+  }
 
   MallocMessageBuilder header_msg;
   trace::Header::Builder header = header_msg.initRoot<trace::Header>();
@@ -1127,6 +1131,7 @@ TraceWriter::TraceWriter(const std::string& file_name, int bind_to_cpu,
   header.setCpuidRecords(
       Data::Reader(reinterpret_cast<const uint8_t*>(cpuid_records.data()),
                    cpuid_records.size() * sizeof(CPUIDRecord)));
+  header.setXcr0(xcr0());
   header.setSyscallbufProtocolVersion(SYSCALLBUF_PROTOCOL_VERSION);
   // Add a random UUID to the trace metadata. This lets tools identify a trace
   // easily.
@@ -1174,7 +1179,14 @@ void TraceWriter::make_latest_trace() {
   // and it "won".  The link is then valid and points at some
   // very-recent trace, so that's good enough.
   unlink(link_name.c_str());
-  int ret = symlink(trace_dir.c_str(), link_name.c_str());
+  // Link only the trace name, not the full path, so moving a directory full
+  // of traces around doesn't break the latest-trace link.
+  const char* trace_name = trace_dir.c_str();
+  const char* last = strrchr(trace_name, '/');
+  if (last) {
+    trace_name = last + 1;
+  }
+  int ret = symlink(trace_name, link_name.c_str());
   if (ret < 0 && errno != EEXIST) {
     FATAL() << "Failed to update symlink `" << link_name << "' to `"
             << trace_dir << "'.";
@@ -1278,6 +1290,7 @@ TraceReader::TraceReader(const string& dir)
   cpuid_records_.resize(len);
   memcpy(cpuid_records_.data(), cpuid_records_bytes.begin(),
          len * sizeof(CPUIDRecord));
+  xcr0_ = header.getXcr0();
 
   // Set the global time at 0, so that when we tick it for the first
   // event, it matches the initial global time at recording, 1.
@@ -1300,6 +1313,7 @@ TraceReader::TraceReader(const TraceReader& other)
   trace_uses_cpuid_faulting = other.trace_uses_cpuid_faulting;
   cpuid_records_ = other.cpuid_records_;
   raw_recs = other.raw_recs;
+  xcr0_ = other.xcr0_;
 }
 
 TraceReader::~TraceReader() {}
@@ -1318,6 +1332,23 @@ uint64_t TraceReader::compressed_bytes() const {
     total += reader(s).compressed_bytes();
   }
   return total;
+}
+
+uint64_t TraceReader::xcr0() const {
+  if (xcr0_) {
+    return xcr0_;
+  }
+  // All valid XCR0 values have bit 0 (x87) == 1. So this is the default
+  // value for traces that didn't store XCR0. Assume that the OS enabled
+  // all CPU-supported XCR0 bits.
+  const CPUIDRecord* record =
+    find_cpuid_record(cpuid_records_, CPUID_GETXSAVE, 0);
+  if (!record) {
+    // No XSAVE support at all on the recording CPU??? Assume just
+    // x87/SSE enabled.
+    return 3;
+  }
+  return (uint64_t(record->out.edx) << 32) | record->out.eax;
 }
 
 } // namespace rr

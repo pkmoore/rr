@@ -311,6 +311,11 @@ public:
    * Hook called by `did_waitpid`.
    */
   virtual void did_wait() {}
+  /**
+   * Return the pid of the task in its own pid namespace.
+   * Only RecordTasks actually change pid namespaces.
+   */
+  virtual pid_t own_namespace_tid() { return tid; }
 
   /**
    * Assuming ip() is just past a breakpoint instruction, adjust
@@ -953,6 +958,7 @@ protected:
    * readable from the other end of the pipe whose write end is error_fd.
    */
   static Task* spawn(Session& session, const ScopedFd& error_fd,
+                     ScopedFd* sock_fd_out, int* tracee_socket_fd_number_out,
                      const TraceStream& trace, const std::string& exe_path,
                      const std::vector<std::string>& argv,
                      const std::vector<std::string>& envp, pid_t rec_tid = -1);

@@ -25,6 +25,7 @@ set(BUILD_SHARED_LIBS ON)
 
 set(EXECUTABLE_OUTPUT_PATH ${PROJECT_BINARY_DIR}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/lib/rr)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 set(BUILD_TESTS ON CACHE BOOL "Build tests")
 set(WILL_RUN_TESTS ${BUILD_TESTS} CACHE BOOL "Run tests")
@@ -33,7 +34,7 @@ set(WILL_RUN_TESTS ${BUILD_TESTS} CACHE BOOL "Run tests")
 # debian is happy with it.  However, "_" is illegal in debs, while RPM
 # is cool with it.  Sigh.
 set(rr_VERSION_MAJOR 5)
-set(rr_VERSION_MINOR 1)
+set(rr_VERSION_MINOR 2)
 set(rr_VERSION_PATCH 0)
 
 add_definitions(-DRR_VERSION="${rr_VERSION_MAJOR}.${rr_VERSION_MINOR}.${rr_VERSION_PATCH}")
@@ -48,7 +49,9 @@ set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -g3")
 set(RR_FLAGS_DEBUG "-Wall -Wextra -Wno-error -O0 -DDEBUG -UNDEBUG")
 set(RR_FLAGS_RELEASE "-Wall -Wextra -O2 -UDEBUG -DNDEBUG")
 set(RR_TEST_FLAGS "${RR_FLAGS_DEBUG}")
-if(CMAKE_BUILD_TYPE MATCHES "Debug")
+
+string(TOLOWER ${CMAKE_BUILD_TYPE} LOWERCASE_CMAKE_BUILD_TYPE)
+if(LOWERCASE_CMAKE_BUILD_TYPE STREQUAL "debug")
   set(RR_FLAGS ${RR_FLAGS_DEBUG})
 else()
   set(RR_FLAGS ${RR_FLAGS_RELEASE})
@@ -358,6 +361,7 @@ set(RR_SOURCES
   src/Command.cc
   src/CompressedReader.cc
   src/CompressedWriter.cc
+  src/CPUFeaturesCommand.cc
   src/CPUIDBugDetector.cc
   src/DiversionSession.cc
   src/DumpCommand.cc
@@ -489,7 +493,7 @@ target_link_libraries(rr
 if(staticlibs)
   # Urgh ... this might not work for everyone, but there doesn't seem to be
   # a way to persuade pkg-confing/pkg_check_modules to produce the right flags
-  target_link_libraries(rr -l:libcapnp.a -l:libkj.a)
+  target_link_libraries(rr -L/home/roc/lib -l:libcapnp.a -l:libkj.a)
 else()
   target_link_libraries(rr ${CAPNP_LDFLAGS})
 endif()
@@ -859,6 +863,8 @@ set(BASIC_TESTS
   sighandler_mask
   sigill
   signal_deferred
+  signal_during_preload_init
+  signal_frame
   signal_unstoppable
   signalfd
   sigprocmask
@@ -890,6 +896,7 @@ set(BASIC_TESTS
   stack_overflow_altstack
   stack_overflow_with_guard
   statfs
+  statx
   stdout_child
   stdout_cloexec
   stdout_dup
@@ -988,11 +995,13 @@ set(TESTS_WITH_PROGRAM
   dev_tty
   diversion_syscall
   dlopen
+  elapsed_time
   exec_failed
   exec_many
   execve_loop
   exit_codes
   exit_group
+  exit_race
   exit_status
   explicit_checkpoints
   fork_stress
@@ -1061,6 +1070,7 @@ set(TESTS_WITH_PROGRAM
   term_trace_reset
   term_trace_syscall
   thread_exit_signal
+  thread_open_race
   thread_stress
   threaded_syscall_spam
   threads
@@ -1077,6 +1087,7 @@ set(TESTS_WITH_PROGRAM
   watchpoint
   watchpoint_at_sched
   watchpoint_before_signal
+  watchpoint_no_progress
   watchpoint_syscall
   watchpoint_unaligned
 )
@@ -1130,6 +1141,7 @@ set(TESTS_WITHOUT_PROGRAM
   gcrypt_rdrand
   get_thread_list
   hardlink_mmapped_files
+  hbreak
   mprotect_step
   parent_no_break_child_bkpt
   parent_no_stop_child_crash
@@ -1350,6 +1362,9 @@ if(BUILD_TESTS)
 
   set(CHAOS_TESTS
     core_count
+    futex_wakeup
+    getaffinity_core_count
+    pipe_wakeup
     mmap_adjacent
     mmap_bits
     starvation_multithreaded

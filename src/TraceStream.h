@@ -22,6 +22,7 @@
 namespace rr {
 
 struct CPUIDRecord;
+struct DisableCPUIDFeatures;
 class KernelMapping;
 class RecordTask;
 
@@ -197,7 +198,8 @@ public:
    * The trace name is determined by |file_name| and _RR_TRACE_DIR (if set).
    */
   TraceWriter(const std::string& file_name, int bind_to_cpu,
-              bool has_cpuid_faulting);
+              bool has_cpuid_faulting,
+              const DisableCPUIDFeatures& disable_cpuid_features);
 
   /**
    * We got far enough into recording that we should set this as the latest
@@ -332,11 +334,13 @@ public:
     return cpuid_records_;
   }
   bool uses_cpuid_faulting() const { return trace_uses_cpuid_faulting; }
+  uint64_t xcr0() const;
 
 private:
   CompressedReader& reader(Substream s) { return *readers[s]; }
   const CompressedReader& reader(Substream s) const { return *readers[s]; }
 
+  uint64_t xcr0_;
   std::unique_ptr<CompressedReader> readers[SUBSTREAM_COUNT];
   std::vector<CPUIDRecord> cpuid_records_;
   std::vector<RawDataMetadata> raw_recs;

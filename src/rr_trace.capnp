@@ -51,6 +51,9 @@ struct Header {
   # A list of captured CPUID values.
   # A series of 24-byte records. See CPUIDRecord in util.h.
   cpuidRecords @3 :Data;
+  # Captured XCR0 value defining XSAVE features enabled by OS.
+  # 0 means "unknown"; default to everything supporteed by CPUID EAX=0xd ECX=0
+  xcr0 @5 :UInt64;
   # The syscallbuf protocol version. See SYSCALLBUF_PROTOCOL_VERSION.
   syscallbufProtocolVersion @4 :UInt16;
 }
@@ -113,6 +116,9 @@ struct TaskEvent {
       # Added after 5.0.0
       exeBase @8 :RemotePtr;
     }
+    # Most frame 'exit' events generate one of these, but these are not
+    # generated if rr ends abnormally so the tasks did not in fact exit during
+    # recording.
     exit :group {
       exitStatus @7 :Int32;
     }

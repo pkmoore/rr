@@ -164,6 +164,7 @@ static CpuMicroarch get_cpu_microarch() {
     case 0x40660:
       return IntelHaswell;
     case 0x306D0:
+    case 0x40670:
     case 0x406F0:
     case 0x50660:
       return IntelBroadwell;
@@ -289,6 +290,8 @@ static void check_for_ioc_period_bug() {
 
 static const int NUM_BRANCHES = 500;
 
+volatile int accumulator_sink = 0;
+
 static void do_branches() {
   // Do NUM_BRANCHES conditional branches that can't be optimized out.
   // 'accumulator' is always odd and can't be zero
@@ -296,7 +299,8 @@ static void do_branches() {
   for (int i = 0; i < NUM_BRANCHES && accumulator; ++i) {
     accumulator = ((accumulator * 7) + 2) & 0xffffff;
   }
-  srand(accumulator);
+  // Use 'accumulator' so it can't be  optimized out.
+  accumulator_sink = accumulator;
 }
 
 static void check_for_kvm_in_txcp_bug() {
@@ -446,7 +450,8 @@ static void check_for_xen_pmi_bug() {
     if (count == 0) {
       count = read_counter(fd);
     }
-    srand(accumulator);
+    // Use 'accumulator' so it can't be optimized out.
+    accumulator_sink = accumulator;
   }
 
   has_xen_pmi_bug = count > NUM_BRANCHES || count == -1;

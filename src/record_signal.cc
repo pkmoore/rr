@@ -81,27 +81,23 @@ static void restore_signal_state(RecordTask* t, int sig,
   }
 }
 
-static const uintptr_t CPUID_RDRAND_FLAG = 1 << 30;
-static const uintptr_t CPUID_RTM_FLAG = 1 << 11;
-static const uintptr_t CPUID_RDSEED_FLAG = 1 << 18;
-
 /**
  * Return true if |t| was stopped because of a SIGSEGV resulting
  * from a disabled instruction and |t| was updated appropriately, false
  * otherwise.
  */
-static bool try_handle_disabled_insn(RecordTask* t, siginfo_t* si) {
+static bool try_handle_trapped_instruction(RecordTask* t, siginfo_t* si) {
   ASSERT(t, si->si_signo == SIGSEGV);
 
-  auto disabled_insn = disabled_insn_at(t, t->ip());
-  switch (disabled_insn) {
-    case DisabledInsn::RDTSC:
-    case DisabledInsn::RDTSCP:
+  auto trapped_instruction = trapped_instruction_at(t, t->ip());
+  switch (trapped_instruction) {
+    case TrappedInstruction::RDTSC:
+    case TrappedInstruction::RDTSCP:
       if (t->tsc_mode == PR_TSC_SIGSEGV) {
         return false;
       }
       break;
-    case DisabledInsn::CPUID:
+    case TrappedInstruction::CPUID:
       if (t->cpuid_mode == 0) {
         return false;
       }
@@ -110,32 +106,22 @@ static bool try_handle_disabled_insn(RecordTask* t, siginfo_t* si) {
       return false;
   }
 
-  size_t len = disabled_insn_len(disabled_insn);
+  size_t len = trapped_instruction_len(trapped_instruction);
   ASSERT(t, len > 0);
 
   Registers r = t->regs();
-  if (disabled_insn == DisabledInsn::RDTSC ||
-      disabled_insn == DisabledInsn::RDTSCP) {
+  if (trapped_instruction == TrappedInstruction::RDTSC ||
+      trapped_instruction == TrappedInstruction::RDTSCP) {
     unsigned long long current_time = rdtsc();
     r.set_rdtsc_output(current_time);
 
     LOG(debug) << " trapped for rdtsc: returning " << current_time;
-  } else if (disabled_insn == DisabledInsn::CPUID) {
+  } else if (trapped_instruction == TrappedInstruction::CPUID) {
     auto eax = r.syscallno();
     auto ecx = r.cx();
     auto cpuid_data = cpuid(eax, ecx);
-    switch (eax) {
-      case CPUID_GETFEATURES:
-        cpuid_data.ecx &= ~CPUID_RDRAND_FLAG;
-        break;
-      case CPUID_GETEXTENDEDFEATURES:
-        if (ecx == 0) {
-          cpuid_data.ebx &= ~(CPUID_RDSEED_FLAG | CPUID_RTM_FLAG);
-        }
-        break;
-      default:
-        break;
-    }
+    t->session().disable_cpuid_features()
+        .amend_cpuid_data(eax, ecx, &cpuid_data);
     r.set_cpuid_output(cpuid_data.eax, cpuid_data.ebx, cpuid_data.ecx,
                        cpuid_data.edx);
     LOG(debug) << " trapped for cpuid: " << HEX(eax) << ":" << HEX(ecx);
@@ -625,7 +611,7 @@ SignalHandled handle_signal(RecordTask* t, siginfo_t* si,
     // signal was generated for rr's purposes, we need to restore the signal
     // state ourselves.
     if (sig == SIGSEGV &&
-        (try_handle_disabled_insn(t, si) || try_grow_map(t, si))) {
+        (try_handle_trapped_instruction(t, si) || try_grow_map(t, si))) {
       if (signal_was_blocked || t->is_sig_ignored(sig)) {
         restore_signal_state(t, sig, signal_was_blocked);
       }

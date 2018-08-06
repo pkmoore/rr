@@ -5,6 +5,8 @@
 #include <elf.h>
 #include <limits.h>
 #include <linux/futex.h>
+#include <sys/types.h>
+#include <sys/socket.h>
 
 #include <algorithm>
 #include <sstream>
@@ -1152,12 +1154,13 @@ RecordTask* RecordSession::revive_task_for_exec(pid_t rec_tid) {
     FATAL() << "Can't find old task for execve";
   }
   ASSERT(t, rec_tid == t->tgid());
+  pid_t own_namespace_tid = t->thread_group()->real_tgid_own_namespace;
 
   LOG(debug) << "Changing task tid from " << t->tid << " to " << rec_tid;
 
   // Pretend the old task cloned a new task with the right tid, and then exited
   trace_writer().write_task_event(TraceTaskEvent::for_clone(
-      rec_tid, t->tid, t->own_namespace_rec_tid,
+      rec_tid, t->tid, own_namespace_tid,
       CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD |
           CLONE_SYSVSEM));
   trace_writer().write_task_event(
@@ -1166,13 +1169,12 @@ RecordTask* RecordSession::revive_task_for_exec(pid_t rec_tid) {
   // Account for tid change
   task_map.erase(t->tid);
   task_map.insert(make_pair(rec_tid, t));
-  // Update the serial as if this task was really created by cloning the old
-  // task.
-  t->set_tid_and_update_serial(rec_tid);
-
   // t probably would have been marked for unstable-exit when the old
   // thread-group leader died.
   t->unstable = false;
+  // Update the serial as if this task was really created by cloning the old
+  // task.
+  t->set_tid_and_update_serial(rec_tid, own_namespace_tid);
 
   return t;
 }
@@ -1283,14 +1285,19 @@ static bool inject_handled_signal(RecordTask* t) {
   t->stashed_signal_processed();
 
   int sig = t->ev().Signal().siginfo.si_signo;
-  // We are ready to inject our signal.
-  // XXX we assume the kernel won't respond by notifying us of a different
-  // signal. We don't want to do this with signals blocked because that will
-  // save a bogus signal mask in the signal frame.
-  t->resume_execution(RESUME_SINGLESTEP, RESUME_WAIT, RESUME_NO_TICKS, sig);
-  // Signal injection can change the sigmask due to sa_mask effects, lack of
-  // SA_NODEFER, and signal frame construction triggering a synchronous SIGSEGV.
-  t->invalidate_sigmask();
+  do {
+    // We are ready to inject our signal.
+    // XXX we assume the kernel won't respond by notifying us of a different
+    // signal. We don't want to do this with signals blocked because that will
+    // save a bogus signal mask in the signal frame.
+    t->resume_execution(RESUME_SINGLESTEP, RESUME_WAIT, RESUME_NO_TICKS, sig);
+    // Signal injection can change the sigmask due to sa_mask effects, lack of
+    // SA_NODEFER, and signal frame construction triggering a synchronous
+    // SIGSEGV.
+    t->invalidate_sigmask();
+    // Repeat injection if we got a desched signal. We observe in Linux 4.14.12
+    // that we get SYSCALLBUF_DESCHED_SIGNAL here once in a while.
+  } while (t->stop_sig() == SYSCALLBUF_DESCHED_SIGNAL);
 
   if (t->stop_sig() == SIGSEGV) {
     // Constructing the signal handler frame must have failed. The kernel will
@@ -1400,19 +1407,10 @@ void RecordSession::signal_state_changed(RecordTask* t, StepState* step_state) {
         last_task_switchable = PREVENT_SWITCH;
       }
 
-      // We record this data regardless to simplify replay. If the addresses
-      // are unmapped, write 0 bytes.
-      // But be careful not to run off the end of our mapping.
-      auto sp = t->regs().sp();
-      if (t->vm()->has_mapping(sp)) {
-        auto mapping_end = t->vm()->mapping_of(sp).map.end();
-        if (mapping_end > sp + sigframe_size) {
-          sigframe_size = mapping_end - sp;
-        }
-      } else {
-        sigframe_size = 0;
-      }
-      t->record_remote_fallible(sp, sigframe_size);
+      // We record this data even if sigframe_size is zero to simplify replay.
+      // Stop recording data if we run off the end of a writeable mapping.
+      // Our sigframe size is conservative so we need to do this.
+      t->record_remote_writeable(t->regs().sp(), sigframe_size);
 
       // This event is used by the replayer to set up the signal handler frame.
       // But if we don't have a handler, we don't want to record the event
@@ -1835,6 +1833,7 @@ static string lookup_by_path(const string& name) {
 
 /*static*/ RecordSession::shr_ptr RecordSession::create(
     const vector<string>& argv, const vector<string>& extra_env,
+    const DisableCPUIDFeatures& disable_cpuid_features,
     SyscallBuffering syscallbuf, BindCPU bind_cpu, bool strace_output) {
   // The syscallbuf library interposes some critical
   // external symbols like XShmQueryExtension(), so we
@@ -1919,7 +1918,8 @@ static string lookup_by_path(const string& name) {
   env.push_back("OPENSSL_ia32cap=~4611686018427387904:~0");
 
   shr_ptr session(
-      new RecordSession(full_path, argv, env, syscallbuf, bind_cpu));
+      new RecordSession(full_path, argv, env, disable_cpuid_features,
+                        syscallbuf, bind_cpu));
   session->strace_output = strace_output;
   return session;
 }
@@ -1927,9 +1927,12 @@ static string lookup_by_path(const string& name) {
 RecordSession::RecordSession(const std::string& exe_path,
                              const std::vector<std::string>& argv,
                              const std::vector<std::string>& envp,
+                             const DisableCPUIDFeatures& disable_cpuid_features,
                              SyscallBuffering syscallbuf, BindCPU bind_cpu)
-    : trace_out(argv[0], choose_cpu(bind_cpu), has_cpuid_faulting_),
+    : trace_out(argv[0], choose_cpu(bind_cpu), has_cpuid_faulting_,
+                disable_cpuid_features),
       scheduler_(*this),
+      disable_cpuid_features_(disable_cpuid_features),
       ignore_sig(0),
       continue_through_sig(0),
       last_task_switchable(PREVENT_SWITCH),
@@ -1939,9 +1942,16 @@ RecordSession::RecordSession(const std::string& exe_path,
       use_read_cloning_(true),
       enable_chaos_(false),
       wait_for_all_(false) {
+  if (!has_cpuid_faulting() &&
+      disable_cpuid_features.any_features_disabled()) {
+    FATAL() << "CPUID faulting required to disable CPUID features";
+  }
+
   ScopedFd error_fd = create_spawn_task_error_pipe();
   RecordTask* t = static_cast<RecordTask*>(
-      Task::spawn(*this, error_fd, trace_out, exe_path, argv, envp));
+      Task::spawn(*this, error_fd, &tracee_socket_fd(), 
+                  &tracee_socket_fd_number, trace_out,
+                  exe_path, argv, envp));
 
   initial_thread_group = t->thread_group();
   on_create(t);
@@ -2108,6 +2118,39 @@ RecordTask* RecordSession::find_task(pid_t rec_tid) const {
 
 RecordTask* RecordSession::find_task(const TaskUid& tuid) const {
   return static_cast<RecordTask*>(Session::find_task(tuid));
+}
+
+static const uint32_t CPUID_RDRAND_FLAG = 1 << 30;
+static const uint32_t CPUID_RTM_FLAG = 1 << 11;
+static const uint32_t CPUID_RDSEED_FLAG = 1 << 18;
+static const uint32_t CPUID_XSAVEOPT_FLAG = 1 << 0;
+
+void DisableCPUIDFeatures::amend_cpuid_data(uint32_t eax_in, uint32_t ecx_in,
+                                            CPUIDData* cpuid_data) const {
+  switch (eax_in) {
+    case CPUID_GETFEATURES:
+      cpuid_data->ecx &= ~(CPUID_RDRAND_FLAG | features_ecx);
+      cpuid_data->edx &= ~features_edx;
+      break;
+    case CPUID_GETEXTENDEDFEATURES:
+      if (ecx_in == 0) {
+        cpuid_data->ebx &= ~(CPUID_RDSEED_FLAG | CPUID_RTM_FLAG
+            | extended_features_ebx);
+        cpuid_data->ecx &= ~extended_features_ecx;
+        cpuid_data->edx &= ~extended_features_edx;
+      }
+      break;
+    case CPUID_GETXSAVE:
+      if (ecx_in == 1) {
+        // Always disable XSAVEOPT because it's nondeterministic,
+        // possibly depending on context switching behavior. Intel
+        // recommends not using it from user space.
+        cpuid_data->eax &= ~(CPUID_XSAVEOPT_FLAG | xsave_features_eax);
+      }
+      break;
+    default:
+      break;
+  }
 }
 
 } // namespace rr

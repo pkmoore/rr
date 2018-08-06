@@ -17,6 +17,35 @@ namespace rr {
 
 class RecordTask;
 
+struct DisableCPUIDFeatures {
+  DisableCPUIDFeatures()
+    : features_ecx(0)
+    , features_edx(0)
+    , extended_features_ebx(0)
+    , extended_features_ecx(0)
+    , extended_features_edx(0)
+    , xsave_features_eax(0)
+  {}
+  bool any_features_disabled() const {
+    return features_ecx || features_edx || extended_features_ebx
+      || extended_features_ecx || extended_features_edx || xsave_features_eax;
+  }
+  /**
+   * Includes disabling TSX and other rr-incompatible features */
+  void amend_cpuid_data(uint32_t eax_in, uint32_t ecx_in,
+                        CPUIDData* cpuid_data) const;
+
+  /* in: EAX=0x01 */
+  uint32_t features_ecx;
+  uint32_t features_edx;
+  /* in: EAX=0x07 ECX=0 */
+  uint32_t extended_features_ebx;
+  uint32_t extended_features_ecx;
+  uint32_t extended_features_edx;
+  /* in: EAX=0x0D ECX=1 */
+  uint32_t xsave_features_eax;
+};
+
 /** Encapsulates additional session state related to recording. */
 class RecordSession : public Session {
 public:
@@ -29,11 +58,15 @@ public:
   enum SyscallBuffering { ENABLE_SYSCALL_BUF, DISABLE_SYSCALL_BUF };
   static shr_ptr create(
       const std::vector<std::string>& argv,
-      const std::vector<std::string>& extra_env = std::vector<std::string>(),
+      const std::vector<std::string>& extra_env,
+      const DisableCPUIDFeatures& features,
       SyscallBuffering syscallbuf = ENABLE_SYSCALL_BUF,
       BindCPU bind_cpu = BIND_CPU,
       bool strace_output = false);
 
+  const DisableCPUIDFeatures& disable_cpuid_features() const {
+    return disable_cpuid_features_;
+  }
   bool use_syscall_buffer() const { return use_syscall_buffer_; }
   size_t syscall_buffer_size() const { return syscall_buffer_size_; }
   bool use_read_cloning() const { return use_read_cloning_; }
@@ -122,7 +155,7 @@ public:
    * dead with a PTRACE_EVENT_EXEC. See ptrace man page under "execve(2) under
    * ptrace" for the horrid details.
    *
-   * The task in the task-group that triggered the successful execve has changed
+   * The task in the thread-group that triggered the successful execve has changed
    * its tid to |rec_tid|. We mirror that, and emit TraceTaskEvents to make it
    * look like a new task was spawned and the old task exited.
    */
@@ -132,6 +165,7 @@ private:
   RecordSession(const std::string& exe_path,
                 const std::vector<std::string>& argv,
                 const std::vector<std::string>& envp,
+                const DisableCPUIDFeatures& features,
                 SyscallBuffering syscallbuf, BindCPU bind_cpu);
 
   virtual void on_create(Task* t) override;
@@ -163,6 +197,7 @@ private:
   ThreadGroup::shr_ptr initial_thread_group;
   SeccompFilterRewriter seccomp_filter_rewriter_;
 
+  DisableCPUIDFeatures disable_cpuid_features_;
   int ignore_sig;
   int continue_through_sig;
   Switchable last_task_switchable;

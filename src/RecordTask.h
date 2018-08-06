@@ -69,6 +69,7 @@ public:
   virtual void will_resume_execution(ResumeRequest, WaitRequest, TicksRequest,
                                      int /*sig*/) override;
   virtual void did_wait() override;
+  virtual pid_t own_namespace_tid() override { return own_namespace_rec_tid; }
 
   std::vector<remote_code_ptr> syscallbuf_syscall_entry_breakpoints();
   bool is_at_syscallbuf_syscall_entry_breakpoint();
@@ -348,8 +349,12 @@ public:
   void record_remote(const MemoryRange& range) {
     record_remote(range.start(), range.size());
   }
-  // Record as much as we can of the bytes in this range.
+  // Record as much as we can of the bytes in this range. Will record only
+  // contiguous mapped data starting at `addr`.
   void record_remote_fallible(remote_ptr<void> addr, ssize_t num_bytes);
+  // Record as much as we can of the bytes in this range. Will record only
+  // contiguous mapped-writable data starting at `addr`.
+  void record_remote_writeable(remote_ptr<void> addr, ssize_t num_bytes);
 
   // Simple helper that attempts to use the local mapping to record if one
   // exists
@@ -479,10 +484,7 @@ public:
    * where they can: when a non-main-thread does an execve, its tid changes
    * to the tid of the thread-group leader.
    */
-  void set_tid_and_update_serial(pid_t tid);
-
-  /* Retrieve the tid of this task from the tracee and store it */
-  void update_own_namespace_tid();
+  void set_tid_and_update_serial(pid_t tid, pid_t own_namespace_tid);
 
   /**
    * Return our cached copy of the signal mask, updating it if necessary.
@@ -498,6 +500,9 @@ public:
   void maybe_restore_original_syscall_registers();
 
 private:
+  /* Retrieve the tid of this task from the tracee and store it */
+  void update_own_namespace_tid();
+
   /**
    * Wait for |futex| in this address space to have the value
    * |val|.

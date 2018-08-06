@@ -94,14 +94,89 @@ ReplaySession::MemoryRanges ReplaySession::always_free_address_space(
   return result;
 }
 
+static bool tracee_xsave_enabled(const TraceReader& trace_in) {
+  const CPUIDRecord* record =
+    find_cpuid_record(trace_in.cpuid_records(), CPUID_GETFEATURES, 0);
+  return (record->out.ecx & OSXSAVE_FEATURE_FLAG) != 0;
+}
+
+static void check_xsave_compatibility(const TraceReader& trace_in) {
+  if (!tracee_xsave_enabled(trace_in)) {
+    // Tracee couldn't use XSAVE so everything should be fine.
+    // If it didn't detect absence of XSAVE and actually executed an XSAVE
+    // and got a fault then replay will probably diverge :-(
+    return;
+  }
+  if (!xsave_enabled()) {
+    // Replaying on a super old CPU that doesn't even support XSAVE!
+    if (!Flags::get().suppress_environment_warnings) {
+      fprintf(stderr, "rr: Tracees had XSAVE but XSAVE is not available "
+              "now; Replay will probably fail because glibc dynamic loader "
+              "uses XSAVE\n\n");
+    }
+    return;
+  }
+
+  uint64_t tracee_xcr0 = trace_in.xcr0();
+  uint64_t our_xcr0 = xcr0();
+  const CPUIDRecord* record =
+    find_cpuid_record(trace_in.cpuid_records(), CPUID_GETXSAVE, 1);
+  bool tracee_xsavec = record && (record->out.eax & XSAVEC_FEATURE_FLAG);
+  CPUIDData data = cpuid(CPUID_GETXSAVE, 1);
+  bool our_xsavec = (data.eax & XSAVEC_FEATURE_FLAG) != 0;
+  if (tracee_xsavec && !our_xsavec &&
+      !Flags::get().suppress_environment_warnings) {
+    fprintf(stderr, "rr: Tracees had XSAVEC but XSAVEC is not available "
+            "now; Replay will probably fail because glibc dynamic loader "
+            "uses XSAVEC\n\n");
+  }
+
+  if (tracee_xcr0 != our_xcr0) {
+    if (tracee_xsavec) {
+      LOG(warn) << "Trace XCR0 value " << HEX(tracee_xcr0) << " != our XCR0 "
+          << "value " << HEX(our_xcr0) << "; Replay will fail if the tracee "
+          << "used plain XSAVE";
+    } else if (!Flags::get().suppress_environment_warnings) {
+      // Tracee may have used XSAVE instructions which write different components
+      // to XSAVE instructions executed on our CPU. This will cause divergence.
+      cerr << "Trace XCR0 value " << HEX(tracee_xcr0) << " != our XCR0 "
+          << "value " << HEX(our_xcr0) << "; Replay will probably fail "
+          << "because glibc dynamic loader uses XSAVE\n\n";
+    }
+  }
+
+  bool check_alignment = tracee_xsavec && our_xsavec;
+  // Check that sizes and offsets of supported XSAVE areas area all identical.
+  // An Intel employee promised this on a mailing list...
+  // https://lists.xen.org/archives/html/xen-devel/2013-09/msg00484.html
+  for (int feature = 2; feature <= 63; ++feature) {
+    if (!(tracee_xcr0 & our_xcr0 & (uint64_t(1) << feature))) {
+      continue;
+    }
+    record =
+      find_cpuid_record(trace_in.cpuid_records(), CPUID_GETXSAVE, feature);
+    CPUIDData data = cpuid(CPUID_GETXSAVE, feature);
+    if (!record || record->out.eax != data.eax ||
+        record->out.ebx != data.ebx ||
+        (check_alignment && (record->out.ecx & 2) != (data.ecx & 2))) {
+      CLEAN_FATAL()
+          << "XSAVE offset/size/alignment differs for feature " << feature
+          << "; H. Peter Anvin said this would never happen!";
+    }
+  }
+}
+
 ReplaySession::ReplaySession(const std::string& dir)
     : emu_fs(EmuFs::create()),
       trace_in(dir),
       trace_frame(),
       current_step(),
-      ticks_at_start_of_event(0) {
+      ticks_at_start_of_event(0),
+      trace_start_time(0) {
   memset(&last_siginfo_, 0, sizeof(last_siginfo_));
   advance_to_next_trace_frame();
+
+  trace_start_time = trace_frame.monotonic_time();
 
   if (trace_in.uses_cpuid_faulting() && !has_cpuid_faulting()) {
     CLEAN_FATAL()
@@ -120,6 +195,8 @@ ReplaySession::ReplaySession(const std::string& dir)
     // that doesn't exist on this machine.
     trace_in.set_bound_cpu(choose_cpu(BIND_CPU));
   }
+
+  check_xsave_compatibility(trace_in);
 }
 
 ReplaySession::ReplaySession(const ReplaySession& other)
@@ -131,7 +208,8 @@ ReplaySession::ReplaySession(const ReplaySession& other)
       ticks_at_start_of_event(other.ticks_at_start_of_event),
       cpuid_bug_detector(other.cpuid_bug_detector),
       last_siginfo_(other.last_siginfo_),
-      flags(other.flags) {}
+      flags(other.flags),
+      trace_start_time(other.trace_start_time) {}
 
 ReplaySession::~ReplaySession() {
   // We won't permanently leak any OS resources by not ensuring
@@ -198,6 +276,8 @@ DiversionSession::shr_ptr ReplaySession::clone_diversion() {
              << " to DiversionSession...";
 
   DiversionSession::shr_ptr session(new DiversionSession());
+  session->tracee_socket = tracee_socket;
+  session->tracee_socket_fd_number = tracee_socket_fd_number;
   LOG(debug) << "  deepfork session is " << session.get();
 
 
@@ -224,7 +304,9 @@ Task* ReplaySession::new_task(pid_t tid, pid_t rec_tid, uint32_t serial,
 
   ScopedFd error_fd = session->create_spawn_task_error_pipe();
   ReplayTask* t = static_cast<ReplayTask*>(
-      Task::spawn(*session, error_fd, session->trace_in, exe_path, argv, env,
+      Task::spawn(*session, error_fd, &session->tracee_socket_fd(),
+                  &session->tracee_socket_fd_number,
+                  session->trace_in, exe_path, argv, env,
                   session->trace_reader().peek_frame().tid()));
   session->on_create(t);
 
@@ -323,7 +405,7 @@ bool ReplaySession::handle_unrecorded_cpuid_fault(
     ReplayTask* t, const StepConstraints& constraints) {
   if (t->stop_sig() != SIGSEGV || !has_cpuid_faulting() ||
       trace_in.uses_cpuid_faulting() ||
-      disabled_insn_at(t, t->ip()) != DisabledInsn::CPUID) {
+      trapped_instruction_at(t, t->ip()) != TrappedInstruction::CPUID) {
     return false;
   }
   // OK, this is a case where we did not record using CPUID faulting but we are
@@ -336,7 +418,7 @@ bool ReplaySession::handle_unrecorded_cpuid_fault(
   ASSERT(t, rec) << "Can't find CPUID record for request AX=" << HEX(r.ax())
                  << " CX=" << HEX(r.cx());
   r.set_cpuid_output(rec->out.eax, rec->out.ebx, rec->out.ecx, rec->out.edx);
-  r.set_ip(r.ip() + disabled_insn_len(DisabledInsn::CPUID));
+  r.set_ip(r.ip() + trapped_instruction_len(TrappedInstruction::CPUID));
   t->set_regs(r);
   // Clear SIGSEGV status since we're handling it
   t->set_status(constraints.is_singlestep() ? WaitStatus::for_stop_sig(SIGTRAP)
@@ -389,8 +471,9 @@ Completion ReplaySession::cont_syscall_boundary(
     default:
       break;
   }
-  ASSERT(t, !t->stop_sig()) << "Replay got unrecorded signal " << t->stop_sig()
-                            << " (" << signal_name(t->stop_sig()) << ")";
+  if (t->stop_sig()) {
+      ASSERT(t, false) << "Replay got unrecorded signal " << t->get_siginfo();
+  }
 
   if (t->seccomp_bpf_enabled &&
       syscall_seccomp_ordering_ == PTRACE_SYSCALL_BEFORE_SECCOMP_UNKNOWN) {
@@ -1732,6 +1815,11 @@ ReplayResult ReplaySession::replay_step(const StepConstraints& constraints) {
     case TSTEP_ENTER_SYSCALL:
       cpuid_bug_detector.notify_reached_syscall_during_replay(t);
       break;
+    case TSTEP_EXIT_SYSCALL:
+      if (constraints.is_singlestep()) {
+        result.break_status.singlestep_complete = true;
+      }
+      break;
     default:
       break;
   }
@@ -1774,6 +1862,10 @@ ReplayTask* ReplaySession::find_task(pid_t rec_tid) const {
 
 ReplayTask* ReplaySession::find_task(const TaskUid& tuid) const {
   return static_cast<ReplayTask*>(Session::find_task(tuid));
+}
+
+double ReplaySession::get_trace_start_time(){
+  return trace_start_time;
 }
 
 } // namespace rr

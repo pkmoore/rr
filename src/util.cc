@@ -699,6 +699,23 @@ void resize_shmem_segment(ScopedFd& fd, uint64_t num_bytes) {
   }
 }
 
+bool xsave_enabled() {
+  CPUIDData features = cpuid(CPUID_GETFEATURES, 0);
+  return (features.ecx & OSXSAVE_FEATURE_FLAG) != 0;
+}
+
+uint64_t xcr0() {
+  if (!xsave_enabled()) {
+    // Assume x87/SSE enabled.
+    return 3;
+  }
+  uint32_t eax, edx;
+  asm volatile("xgetbv"
+               : "=a"(eax), "=d"(edx)
+               : "c"(0));
+  return (uint64_t(edx) << 32) | eax;
+}
+
 CPUIDData cpuid(uint32_t code, uint32_t subrequest) {
   CPUIDData result;
   asm volatile("cpuid"
@@ -1174,7 +1191,7 @@ XSaveLayout xsave_layout_from_trace(const std::vector<CPUIDRecord> records) {
 
   CPUIDRecord cpuid_data = records[record_index];
   DEBUG_ASSERT(cpuid_data.ecx_in == 0);
-  layout.full_size = cpuid_data.out.ecx;
+  layout.full_size = cpuid_data.out.ebx;
   layout.supported_feature_bits =
       cpuid_data.out.eax | (uint64_t(cpuid_data.out.edx) << 32);
 
@@ -1382,31 +1399,31 @@ static const uint8_t rdtsc_insn[] = { 0x0f, 0x31 };
 static const uint8_t rdtscp_insn[] = { 0x0f, 0x01, 0xf9 };
 static const uint8_t cpuid_insn[] = { 0x0f, 0xa2 };
 
-DisabledInsn disabled_insn_at(Task* t, remote_code_ptr ip) {
+TrappedInstruction trapped_instruction_at(Task* t, remote_code_ptr ip) {
   uint8_t insn[sizeof(rdtscp_insn)];
   ssize_t len =
       t->read_bytes_fallible(ip.to_data_ptr<uint8_t>(), sizeof(insn), insn);
   if ((size_t)len >= sizeof(rdtsc_insn) &&
       !memcmp(insn, rdtsc_insn, sizeof(rdtsc_insn))) {
-    return DisabledInsn::RDTSC;
+    return TrappedInstruction::RDTSC;
   }
   if ((size_t)len >= sizeof(rdtscp_insn) &&
       !memcmp(insn, rdtscp_insn, sizeof(rdtscp_insn))) {
-    return DisabledInsn::RDTSCP;
+    return TrappedInstruction::RDTSCP;
   }
   if ((size_t)len >= sizeof(cpuid_insn) &&
       !memcmp(insn, cpuid_insn, sizeof(cpuid_insn))) {
-    return DisabledInsn::CPUID;
+    return TrappedInstruction::CPUID;
   }
-  return DisabledInsn::NONE;
+  return TrappedInstruction::NONE;
 }
 
-size_t disabled_insn_len(DisabledInsn insn) {
-  if (insn == DisabledInsn::RDTSC) {
+size_t trapped_instruction_len(TrappedInstruction insn) {
+  if (insn == TrappedInstruction::RDTSC) {
     return sizeof(rdtsc_insn);
-  } else if (insn == DisabledInsn::RDTSCP) {
+  } else if (insn == TrappedInstruction::RDTSCP) {
     return sizeof(rdtscp_insn);
-  } else if (insn == DisabledInsn::CPUID) {
+  } else if (insn == TrappedInstruction::CPUID) {
     return sizeof(cpuid_insn);
   } else {
     return 0;
