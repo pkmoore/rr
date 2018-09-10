@@ -463,6 +463,7 @@ endif()
 add_custom_target(libstrace
                   ALL
                   WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/third-party/strace"
+                  COMMAND ./bootstrap
                   COMMAND ./build_libstrace.sh
                   COMMAND cp libstrace.a libstrace.so "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
                   VERBATIM)
