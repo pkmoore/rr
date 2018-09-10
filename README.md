@@ -17,6 +17,26 @@ The Python 2 extension in the rrdump directory needs to be installed somewhere
 in python's module path.  This module provides functions for dumping state that
 the rrapper injector needs to operate on a spun off process.
 
+#Additional Dependencies
+
+This modified version of rr requires the following be installed before it will
+compile cleanly.  On supported versions of Ubuntu obtaining these dependencies
+is best accomplished through apt as other package managers (specifically pip)
+will give you installations that are not correctly detected by cmake
+
+```
+gcc-multilib
+g++-multilib
+python
+python-pexpect (using apt, pyenv/virtualenv versions don't work)
+libcapnproto
+autotools-dev
+autoconf
+gawk
+libpython-dev
+
+```
+
 # Overview From The rr Project
 
 rr is a lightweight tool for recording, replaying and debugging execution of applications (trees of processes and threads).
