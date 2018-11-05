@@ -479,7 +479,7 @@ endif()
 # libdw dependencies for libstrace
 execute_process(COMMAND bash
                 "-c"
-                "pkg-config libdw --cflags --libs --static 2>/dev/null || printf %s -ldwarf"
+                "pkg-config libdw --cflags --libs --static | awk '{sub(\" +$\",\"\",$0); printf(\"%s\", $0)}' 2>/dev/null || printf %s -ldwarf"
                 OUTPUT_VARIABLE CMAKE_DW_LIBS)
 
 target_link_libraries(rr
