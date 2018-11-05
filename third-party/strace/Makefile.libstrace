@@ -36,11 +36,14 @@ all:
 bootstrap.d:
 	@./bootstrap
 
-shared:
+shared: cleanlibs
 	@$(MAKE) -f $(THIS_MAKEFILE) libstrace.so
 
-static:
+static: cleanlibs
 	@$(MAKE) -f $(THIS_MAKEFILE) libstrace.a
+
+cleanlibs:
+	@$(RM) -fv -- libstrace.so libstrace.a
 
 libstrace.so: libstrace.a
 	$(LD) -shared $< $(LDFLAGS) $(LDLIBS) -Wl,-soname,$@.$(MAJOR) -o $@.$(MAJOR).$(MINOR).$(PATCH)
