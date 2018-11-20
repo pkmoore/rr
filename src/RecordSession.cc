@@ -924,7 +924,9 @@ void RecordSession::syscall_state_changed(RecordTask* t,
 
       if(this->strace_output) {
         if (strace_outfile == NULL) {
-          strace_outfile = fopen("strace_out.strace", "w");
+          if ((strace_outfile = fopen("strace_out.strace", "w")) == NULL) {
+            FATAL() << "Unable to open strace log file for writing";
+          }
         }
         // Set up global reference to the current task to call from our
         // overridden copies of umoven and umovestr
