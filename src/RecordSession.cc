@@ -1106,6 +1106,10 @@ void RecordSession::syscall_state_changed(RecordTask* t,
         syscall_exiting_trace(&tcp, NULL, res);
         // And pass it in here
         syscall_exiting_finish(&tcp);
+        //Output event number
+        std::stringstream eventstring;
+        eventstring << t->rec_tid << "  +++ " << t->trace_time() << " +++\n";
+        fwrite(eventstring.str().c_str(), 1, eventstring.str().length(), strace_outfile);
       }
 
       return;
