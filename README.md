@@ -25,7 +25,7 @@ is best accomplished through apt as other package managers (specifically pip)
 will give you installations that are not correctly detected by cmake
 
 ```
-sudo apt install gcc-multilib g++-multilib  python python-pexpect libcapnp-dev capnproto autotools-dev autoconf gawk libpython-dev
+sudo apt install gcc-multilib g++-multilib  python python-pexpect libcapnp-dev capnproto autotools-dev autoconf gawk libpython-dev cmake zlib1g zlib1g-dev libdw-dev
 
 ```
 
