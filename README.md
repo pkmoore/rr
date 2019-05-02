@@ -28,7 +28,7 @@ will give you installations that are not correctly detected by cmake
 sudo apt install gcc-multilib \
 g++-multilib \
 python \ 
-python-pexpect \ (using apt, pyenv/virtualenv versions don't work)
+python-pexpect \ #(using apt, pyenv/virtualenv versions don't work)
 libcapnproto \
 autotools-dev \ 
 autoconf \
