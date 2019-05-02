@@ -924,7 +924,9 @@ void RecordSession::syscall_state_changed(RecordTask* t,
 
       if(this->strace_output) {
         if (strace_outfile == NULL) {
-          strace_outfile = fopen("strace_out.strace", "w");
+          if ((strace_outfile = fopen("strace_out.strace", "w")) == NULL) {
+            FATAL() << "Unable to open strace log file for writing: " << strerror(errno);
+          }
         }
         // Set up global reference to the current task to call from our
         // overridden copies of umoven and umovestr
@@ -1106,6 +1108,10 @@ void RecordSession::syscall_state_changed(RecordTask* t,
         syscall_exiting_trace(&tcp, NULL, res);
         // And pass it in here
         syscall_exiting_finish(&tcp);
+        //Output event number
+        std::stringstream eventstring;
+        eventstring << t->rec_tid << "  +++ " << t->trace_time() << " +++\n";
+        fwrite(eventstring.str().c_str(), 1, eventstring.str().length(), strace_outfile);
       }
 
       return;
