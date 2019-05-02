@@ -25,15 +25,7 @@ is best accomplished through apt as other package managers (specifically pip)
 will give you installations that are not correctly detected by cmake
 
 ```
-sudo apt install gcc-multilib \
-g++-multilib \
-python \ 
-python-pexpect \ #(using apt, pyenv/virtualenv versions don't work)
-libcapnproto \
-autotools-dev \ 
-autoconf \
-gawk \
-libpython-dev \
+sudo apt install gcc-multilib g++-multilib  python python-pexpect libcapnproto autotools-dev autoconf gawk libpython-dev
 
 ```
 
