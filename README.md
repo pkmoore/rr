@@ -17,7 +17,7 @@ The Python 2 extension in the rrdump directory needs to be installed somewhere
 in python's module path.  This module provides functions for dumping state that
 the rrapper injector needs to operate on a spun off process.
 
-#Additional Dependencies
+# Additional Dependencies
 
 This modified version of rr requires the following be installed before it will
 compile cleanly.  On supported versions of Ubuntu obtaining these dependencies
