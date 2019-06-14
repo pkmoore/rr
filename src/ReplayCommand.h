@@ -3,6 +3,8 @@
 #ifndef RR_REPLAY_COMMAND_H_
 #define RR_REPLAY_COMMAND_H_
 
+#include <fstream>
+
 #include "Command.h"
 
 #include "ReplayTask.h"
@@ -19,11 +21,13 @@ protected:
   ReplayCommand(const char* name, const char* help) : Command(name, help) {}
 
   static ReplayCommand singleton;
+
 };
 
 } // namespace rr
+static std::ofstream rrdump_pipe;
 
-void rrdump_dump_state(int event);
+bool file_exists(const std::string& name);
 
 void rrdump_write_to_pipe(int ft, rr::ReplayTask* t, bool inject);
 

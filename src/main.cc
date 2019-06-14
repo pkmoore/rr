@@ -9,8 +9,6 @@
 #include <string.h>
 #include <sys/utsname.h>
 
-#include "Python.h"
-
 #include "strace_defs.h"
 
 #include <sstream>
@@ -202,15 +200,6 @@ bool parse_global_option(std::vector<std::string>& args) {
 
 using namespace rr;
 
-PyObject* process_syscall_func;
-PyObject* process_brk_func;
-PyObject* process_time_func;
-PyObject* process_gettimeofday_func;
-PyObject* process_clock_gettime_func;
-PyObject* dump_state_func;
-PyObject* write_to_pipe_func;
-PyObject* close_pipe_func;
-
 
 extern struct tcb *current_tcp;
 extern bool print_pid_pfx;
@@ -230,57 +219,6 @@ int main(int argc, char* argv[]) {
   qualify("signal=all");
   print_pid_pfx = true; // Tell strace to print out the PID information
   max_strlen = 65535;
-
-  PyObject* py_rrdump_modname;
-  PyObject* py_rrdump_module;
-  PyObject* py_rrdump_dict;
-  Py_Initialize();
-  std::string cpp_rrdump_modname = "rrdump.rrdump";
-  if((py_rrdump_modname = PyString_FromString(cpp_rrdump_modname.c_str())) == NULL) {
-    FATAL() << "Failed to parse modname into string";
-  }
-  if((py_rrdump_module = PyImport_Import(py_rrdump_modname)) == NULL) {
-    FATAL() << "Module import failed";
-  }
-  if((py_rrdump_dict = PyModule_GetDict(py_rrdump_module)) == NULL) {
-    FATAL() << "Module dict get failed";
-  }
-  std::string cpp_process_syscall_func_name = "process_syscall";
-  std::string cpp_process_brk_func_name = "process_brk";
-  std::string cpp_process_time_func_name = "process_time";
-  std::string cpp_process_gettimeofday_func_name = "process_gettimeofday";
-  std::string cpp_process_clock_gettime_func_name = "process_clock_gettime";
-  std::string cpp_dump_state_func_name = "dump_state";
-  std::string cpp_write_to_pipe_func_name = "write_to_pipe";
-  std::string cpp_close_pipe_func_name = "close_pipe";
-  process_syscall_func = PyDict_GetItemString(py_rrdump_dict,
-                                              cpp_process_syscall_func_name.c_str());
-  process_brk_func = PyDict_GetItemString(py_rrdump_dict,
-                                          cpp_process_brk_func_name.c_str());
-  process_time_func = PyDict_GetItemString(py_rrdump_dict,
-                                           cpp_process_time_func_name.c_str());
-  process_gettimeofday_func = PyDict_GetItemString(py_rrdump_dict,
-                                                   cpp_process_gettimeofday_func_name.c_str());
-  process_clock_gettime_func = PyDict_GetItemString(py_rrdump_dict,
-                                                    cpp_process_clock_gettime_func_name.c_str());
-  dump_state_func = PyDict_GetItemString(py_rrdump_dict,
-                                         cpp_dump_state_func_name.c_str());
-  write_to_pipe_func = PyDict_GetItemString(py_rrdump_dict,
-                                            cpp_write_to_pipe_func_name.c_str());
-  close_pipe_func = PyDict_GetItemString(py_rrdump_dict,
-                                         cpp_close_pipe_func_name.c_str());
-
-  if((!PyCallable_Check(process_syscall_func))           ||
-     (!PyCallable_Check(process_brk_func))               ||
-     (!PyCallable_Check(process_time_func))              ||
-     (!PyCallable_Check(process_gettimeofday_func))      ||
-     (!PyCallable_Check(process_clock_gettime_func))     ||
-     (!PyCallable_Check(dump_state_func))                ||
-     (!PyCallable_Check(write_to_pipe_func))             ||
-     (!PyCallable_Check(close_pipe_func)))
-  {
-    FATAL() << "Failed to collect required python functions";
-  }
 
   init_random();
   raise_resource_limits();
@@ -318,9 +256,6 @@ int main(int argc, char* argv[]) {
     }
   }
   auto result = command->run(args);
-  Py_DECREF(py_rrdump_modname);
-  Py_DECREF(py_rrdump_module);
-  Py_Finalize();
 
   return result;
 }

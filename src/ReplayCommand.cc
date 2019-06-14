@@ -8,7 +8,6 @@
 #include <unistd.h>
 #include <string>
 
-#include <Python.h>
 #include <sstream>
 #include "ReplayTask.h"
 
@@ -30,9 +29,6 @@
 
 using namespace std;
 
-extern PyObject* dump_state_func;
-extern PyObject* write_to_pipe_func;
-extern PyObject* close_pipe_func;
 
 namespace rr {
 
@@ -646,39 +642,31 @@ int ReplayCommand::run(vector<string>& args) {
 
 } // namespace rr
 
-void rrdump_dump_state(int event) {
-  PyObject* event_obj;
-  if((event_obj = PyInt_FromLong((long)event)) == NULL) {
-    std::cerr << "Failed to create event from int" << std::endl;
-  }
-  if(PyObject_CallFunctionObjArgs(dump_state_func, event_obj, NULL) == NULL) {
-    std::cerr << "dump_state call failed" << std::endl;
-    PyErr_Print();
-  }
+inline bool file_exists(const std::string& name) {
+  struct stat buffer;
+  return (stat(name.c_str(), &buffer) == 0);
 }
 
 void rrdump_write_to_pipe(int ft, rr::ReplayTask* t, bool inject) {
-    PyObject* proc_string_obj;
-    ostringstream os;
-    os << (inject ? "INJECT: " : "DONT_INJECT: ")
-       << "EVENT: " << ft
-       << " PID: " << t->tid
-       << " REC_PID: " << t->rec_tid
-       << "\n";
-    if((proc_string_obj = PyString_FromString(os.str().c_str())) == NULL) {
-        std::cerr << "Failed to create python string" << std::endl;
+  if (rrdump_pipe.is_open()) {
+    if(!file_exists("rrdump_proc.pipe")) {
+      if((-1 == mkfifo("rrdump_proc.pipe", 0666))) {
+        std::cerr << "Failed to create rrdump_proc.pipe" << std::endl;
+      }
     }
-    if(PyObject_CallFunctionObjArgs(write_to_pipe_func,
-                                    proc_string_obj,
-                                    NULL) == NULL) {
-        std::cerr << "write_to_pipe call failed" << std::endl;
-        PyErr_Print();
-    }
+    rrdump_pipe.open("rrdump_proc.pipe", std::ofstream::out);
+  }
+  ostringstream os;
+  os << (inject ? "INJECT: " : "DONT_INJECT: ")
+    << "EVENT: " << ft
+    << " PID: " << t->tid
+    << " REC_PID: " << t->rec_tid
+    << "\n";
+  rrdump_pipe << os.str();
 }
 
 void rrdump_close_pipe() {
-    if(PyObject_CallFunction(close_pipe_func, NULL) == NULL) {
-        std::cerr << "close_pipe call failed" << std::endl;
-        PyErr_Print();
-    }
+  if (rrdump_pipe.is_open()) {
+    rrdump_pipe.close();
+  }
 }
