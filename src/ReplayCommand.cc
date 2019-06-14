@@ -371,6 +371,7 @@ static void serve_replay_no_debugger(const string& trace_dir,
     }
 
     FrameTime before_time = replay_session->trace_reader().time();
+    auto result = replay_session->replay_step(cmd);
     std::vector<std::pair<int, int>> events_to_process;
     auto pred = [&before_time, &events_to_process](const std::pair<int, int>& arg) {
       if (arg.second == (int)before_time) {
@@ -384,21 +385,22 @@ static void serve_replay_no_debugger(const string& trace_dir,
          itr != events_to_process.end();
          ++itr) {
       // HACK HACK HACK:  Work around for each event being "handled" twice
-      DiversionSession::shr_ptr diversion_session = replay_session->clone_diversion();
+      ReplaySession::shr_ptr tmp_replay_session = replay_session->clone();
+      DiversionSession::shr_ptr diversion_session = tmp_replay_session->clone_diversion();
       RunCommand rc = RUN_CONTINUE;
       for (auto& v : diversion_session->tasks()) {
           Task* t = v.second;
           t->spin_off_on_next_resume_execution = true;
           diversion_session->diversion_step(t, rc, 0);
         if (itr->first == t->rec_tid) {
-          rrdump_dump_state(int(before_time));
           rrdump_write_to_pipe(before_time, (ReplayTask*)t, true);
         } else {
           rrdump_write_to_pipe(before_time, (ReplayTask*)t, false);
         }
       }
     }
-    auto result = replay_session->replay_step(cmd);
+    //MAGIC HACK IF THIS IS DELETED YOU GET SEGFAULTS
+    std::cout << "";
     FrameTime after_time = replay_session->trace_reader().time();
     DEBUG_ASSERT(after_time >= before_time && after_time <= before_time + 1);
 
