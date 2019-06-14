@@ -355,8 +355,6 @@ static void serve_replay_no_debugger(const string& trace_dir,
   uint32_t step_count = 0;
   struct timeval last_dump_time;
   Session::Statistics last_stats;
-  // HACK HACK HACK:  Work around for each event being "handled" twice
-  FrameTime last_event_handled = -1;
   gettimeofday(&last_dump_time, NULL);
 
   while (true) {
@@ -373,31 +371,31 @@ static void serve_replay_no_debugger(const string& trace_dir,
     }
 
     FrameTime before_time = replay_session->trace_reader().time();
-    auto pred = [&before_time](const std::pair<int, int>& arg) {
-      return arg.second == (int)before_time;
+    std::vector<std::pair<int, int>> events_to_process;
+    auto pred = [&before_time, &events_to_process](const std::pair<int, int>& arg) {
+      if (arg.second == (int)before_time) {
+        events_to_process.push_back(arg);
+      }
     };
-    std::vector<std::pair<int, int>>::iterator itr = std::find_if(events.begin(), events.end(), pred);
-    if (itr != events.end()) {
+    std::for_each(events.begin(), events.end(), pred);
+
+    std::vector<std::pair<int, int>>::iterator itr;
+    for (itr = events_to_process.begin();
+         itr != events_to_process.end();
+         ++itr) {
       // HACK HACK HACK:  Work around for each event being "handled" twice
-      if(before_time != last_event_handled) { 
-        DiversionSession::shr_ptr diversion_session = replay_session->clone_diversion();
-        RunCommand rc = RUN_CONTINUE;
-        for (auto& v : diversion_session->tasks()) {
-            Task* t = v.second;
-            t->spin_off_on_next_resume_execution = true;
-            diversion_session->diversion_step(t, rc, 0);
-          if (itr->first == t->rec_tid) {
-            rrdump_dump_state(int(before_time));
-            rrdump_write_to_pipe(before_time, (ReplayTask*)t, true);
-          } else {
-            rrdump_write_to_pipe(before_time, (ReplayTask*)t, false);
-          }
+      DiversionSession::shr_ptr diversion_session = replay_session->clone_diversion();
+      RunCommand rc = RUN_CONTINUE;
+      for (auto& v : diversion_session->tasks()) {
+          Task* t = v.second;
+          t->spin_off_on_next_resume_execution = true;
+          diversion_session->diversion_step(t, rc, 0);
+        if (itr->first == t->rec_tid) {
+          rrdump_dump_state(int(before_time));
+          rrdump_write_to_pipe(before_time, (ReplayTask*)t, true);
+        } else {
+          rrdump_write_to_pipe(before_time, (ReplayTask*)t, false);
         }
-        events.erase(itr);
-        if(events.size() == 0) {
-            rrdump_close_pipe();
-        }
-        last_event_handled = before_time;
       }
     }
     auto result = replay_session->replay_step(cmd);
@@ -429,6 +427,7 @@ static void serve_replay_no_debugger(const string& trace_dir,
     DEBUG_ASSERT(cmd == RUN_SINGLESTEP ||
                  !result.break_status.singlestep_complete);
   }
+  rrdump_close_pipe();
   LOG(info) << "Replayer successfully finished";
 }
 
