@@ -460,13 +460,18 @@ else()
   set(RR_BIN rr)
 endif()
 
-add_custom_target(libstrace
-                  ALL
-                  WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/third-party/strace"
-                  COMMAND ./bootstrap
-                  COMMAND ./build_libstrace.sh
-                  COMMAND cp libstrace.a libstrace.so "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
-                  VERBATIM)
+if(DEFINED ENV{DONT_REBUILD_LIBSTRACE})
+    message(STATUS "not rebuilding libstrace")
+else()
+    message(STATUS "rebuilding libstrace")
+    add_custom_target(libstrace
+                      ALL
+                      WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/third-party/strace"
+                      COMMAND ./bootstrap
+                      COMMAND ./build_libstrace.sh
+                      COMMAND cp libstrace.a libstrace.so "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
+                      VERBATIM)
+endif()
 
 add_dependencies(rr Generated Pages libstrace)
 
