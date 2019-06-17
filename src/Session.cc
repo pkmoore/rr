@@ -203,14 +203,24 @@ AddressSpace* Session::find_address_space(const AddressSpaceUid& vmuid) const {
 
 void Session::kill_all_tasks() {
   for (auto& v : task_map) {
+    // Preston: We need this here because we are actively detaching some tasks
+    // in the middle of this loop meaning we can hit t-> stuff when t no longer
+    // exists (because of the way the upper for loop construct works I think...)
+    if(task_map.empty()) {
+      break;
+    }
     Task* t = v.second;
 
-    if (t->spun_off) {
+    // Preston: empty check to make sure we don't access t when it has been
+    // spun off
+    if (!task_map.empty() && t->spun_off) {
       t->destroy();
       continue;
     }
 
-    if (!t->is_stopped) {
+    // Preston: empty check to make sure we don't access t when it has been
+    // spun off
+    if (!task_map.empty() && !t->is_stopped) {
       // During recording we might be aborting the recording, in which case
       // one or more tasks might not be stopped. We haven't got any really
       // good options here so we'll just skip detaching and try killing
@@ -244,24 +254,33 @@ void Session::kill_all_tasks() {
     // We also tried setting ip() to an address that does an infinite loop,
     // but that leaves a runaway process if something happens to kill rr
     // after detaching but before we get a chance to SIGKILL the tracee.
-    Registers r = t->regs();
-    r.set_ip(t->vm()->privileged_traced_syscall_ip());
-    r.set_syscallno(syscall_number_for_exit(r.arch()));
-    r.set_arg1(0);
-    t->set_regs(r);
-    t->flush_regs();
-    long result;
-    do {
-      // We have observed this failing with an ESRCH when the thread clearly
-      // still exists and is ptraced. Retrying the PTRACE_DETACH seems to
-      // work around it.
-      result = t->fallible_ptrace(PTRACE_DETACH, nullptr, nullptr);
-      ASSERT(t, result >= 0 || errno == ESRCH);
-      // But we it might get ESRCH because it really doesn't exist.
-      if (errno == ESRCH && is_zombie_process(t->tid)) {
-        break;
+
+    // Preston: empty check to make sure we don't access t when it has been
+    // spun off
+    if(!task_map.empty()) {
+      Registers r = t->regs();
+      r.set_ip(t->vm()->privileged_traced_syscall_ip());
+      r.set_syscallno(syscall_number_for_exit(r.arch()));
+      r.set_arg1(0);
+      t->set_regs(r);
+      t->flush_regs();
+      long result;
+      // Preston: We don't want rr to try to kill a task we have spun off.
+      // We're trying to create a ZOMBIE ON PURPOSE essentially
+      if(!t->spun_off) {
+        do {
+          // We have observed this failing with an ESRCH when the thread clearly
+          // still exists and is ptraced. Retrying the PTRACE_DETACH seems to
+          // work around it.
+          result = t->fallible_ptrace(PTRACE_DETACH, nullptr, nullptr);
+          ASSERT(t, result >= 0 || errno == ESRCH);
+          // But we it might get ESRCH because it really doesn't exist.
+          if (errno == ESRCH && is_zombie_process(t->tid)) {
+            break;
+          }
+        } while (result < 0);
       }
-    } while (result < 0);
+    }
   }
 
   while (!task_map.empty()) {

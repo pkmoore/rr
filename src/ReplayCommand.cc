@@ -395,8 +395,6 @@ static void serve_replay_no_debugger(const string& trace_dir,
         }
       }
     }
-    //MAGIC HACK IF THIS IS DELETED YOU GET SEGFAULTS
-    std::cout << "";
     FrameTime after_time = replay_session->trace_reader().time();
     DEBUG_ASSERT(after_time >= before_time && after_time <= before_time + 1);
 
@@ -648,7 +646,7 @@ inline bool file_exists(const std::string& name) {
 }
 
 void rrdump_write_to_pipe(int ft, rr::ReplayTask* t, bool inject) {
-  if (rrdump_pipe.is_open()) {
+  if (!rrdump_pipe.is_open()) {
     if(!file_exists("rrdump_proc.pipe")) {
       if((-1 == mkfifo("rrdump_proc.pipe", 0666))) {
         std::cerr << "Failed to create rrdump_proc.pipe" << std::endl;
@@ -663,6 +661,7 @@ void rrdump_write_to_pipe(int ft, rr::ReplayTask* t, bool inject) {
     << " REC_PID: " << t->rec_tid
     << "\n";
   rrdump_pipe << os.str();
+  rrdump_pipe.flush();
 }
 
 void rrdump_close_pipe() {
