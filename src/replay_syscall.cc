@@ -26,6 +26,8 @@
 #include <sstream>
 #include <string>
 
+#include <fstream>
+
 #include "preload/preload_interface.h"
 
 #include "rr/rr.h"
@@ -660,7 +662,7 @@ static void process_brk(ReplayTask* t) {
   TraceReader::MappedData data;
   KernelMapping km = t->trace_reader().read_mapped_region(&data);
   // Zero flags means it's an an unmap, or no change.
-  rrdump_process_brk(km);
+  rrdump_process_brk(t, km);
   if (km.flags()) {
     AutoRemoteSyscalls remote(t);
     ASSERT(t, data.source == TraceReader::SOURCE_ZERO);
@@ -679,7 +681,22 @@ static void process_brk(ReplayTask* t) {
   }
 }
 
-void rrdump_process_brk(KernelMapping km) {
+void rrdump_process_brk(ReplayTask* t, KernelMapping km) {
+  std::ostringstream jkm;
+  jkm << "{";
+  jkm << "\"flags\": \"" << km.flags() << "\"," << std::endl;
+  jkm << "\"start\": \"" << km.start() << "\"," << std::endl;
+  jkm << "\"size\": \"" << km.size() << "\"," << std::endl;
+  jkm << "\"prot\": \"" << km.prot()  << "\"" << std::endl;
+  jkm << "}," << std::endl;
+
+  std::ostringstream filename;
+  filename << "./" << t->rec_tid;
+  filename << "_brks.json";
+  std::ofstream ofs;
+  ofs.open(filename.str(), std::ofstream::out | std::ofstream::app);
+  ofs << jkm.str();
+  ofs.close();
 }
 
 /**
