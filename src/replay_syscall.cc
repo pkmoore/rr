@@ -684,19 +684,12 @@ static void process_brk(ReplayTask* t) {
 void rrdump_process_brk(ReplayTask* t, KernelMapping km) {
   std::ostringstream jkm;
   jkm << "{";
-  jkm << "\"flags\": \"" << km.flags() << "\"," << std::endl;
-  jkm << "\"start\": \"" << km.start() << "\"," << std::endl;
-  jkm << "\"size\": \"" << km.size() << "\"," << std::endl;
-  jkm << "\"prot\": \"" << km.prot()  << "\"" << std::endl;
-  jkm << "}," << std::endl;
-
-  std::ostringstream filename;
-  filename << "./" << t->rec_tid;
-  filename << "_brks.json";
-  std::ofstream ofs;
-  ofs.open(filename.str(), std::ofstream::out | std::ofstream::app);
-  ofs << jkm.str();
-  ofs.close();
+  jkm << "\"flags\": \"" << km.flags() << "\",";
+  jkm << "\"start\": \"" << km.start() << "\",";
+  jkm << "\"size\": \"" << km.size() << "\",";
+  jkm << "\"prot\": \"" << km.prot()  << "\"";
+  jkm << "},";
+  t->brks_json += jkm.str();
 }
 
 /**

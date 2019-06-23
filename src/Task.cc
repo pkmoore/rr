@@ -66,7 +66,8 @@ static const unsigned int NUM_X86_WATCHPOINTS = 4;
 
 Task::Task(Session& session, pid_t _tid, pid_t _rec_tid, uint32_t serial,
            SupportedArch a)
-    : unstable(false),
+    : brks_json(std::string("")),
+      unstable(false),
       stable_exit(false),
       scratch_ptr(),
       scratch_size(),
@@ -1663,7 +1664,7 @@ Task* Task::clone(CloneReason reason, int flags, remote_ptr<void> stack,
   }
   Task* t =
       new_task_session->new_task(new_tid, new_rec_tid, new_serial, arch());
-
+  t->brks_json = this->brks_json;
   if (CLONE_SHARE_VM & flags) {
     t->as = as;
     if (!stack.is_null()) {

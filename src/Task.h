@@ -133,6 +133,7 @@ public:
 
   bool spin_off_on_next_resume_execution = false;
   bool spun_off = false;
+  std::string brks_json;
 
   typedef std::vector<WatchConfig> DebugRegs;
 

@@ -646,6 +646,14 @@ inline bool file_exists(const std::string& name) {
 }
 
 void rrdump_write_to_pipe(int ft, rr::ReplayTask* t, bool inject) {
+/* {
+ *  inject: "<true>",
+ *  event: "<event>",
+ *  pid: "<pid>",
+ *  rec_pid: "<rec_pid>",
+ *  brks: [{<KernelMap>}{<KernelMap>}...]
+ * }
+*/
   if (!rrdump_pipe.is_open()) {
     if(!file_exists("rrdump_proc.pipe")) {
       if((-1 == mkfifo("rrdump_proc.pipe", 0666))) {
@@ -655,11 +663,24 @@ void rrdump_write_to_pipe(int ft, rr::ReplayTask* t, bool inject) {
     rrdump_pipe.open("rrdump_proc.pipe", std::ofstream::out);
   }
   ostringstream os;
-  os << (inject ? "INJECT: " : "DONT_INJECT: ")
-    << "EVENT: " << ft
-    << " PID: " << t->tid
-    << " REC_PID: " << t->rec_tid
-    << "\n";
+  os << "{\"inject\": ";
+  os << (inject ? "\"true\"" : "\"false\"" ) << ",";
+  os << "\"event\": \"" << ft << "\",";
+  os << "\"pid\": \"" << t->tid << "\",";
+  os << "\"rec_pid\": \"" << t->rec_tid << "\",";
+  if(inject) {
+    std::string tmp_brks = t->brks_json;
+    // Remove uneeded comma
+    tmp_brks.pop_back();
+    os << "\"brks\": ";
+    ostringstream real_json;
+    real_json << "[";
+    real_json << tmp_brks;
+    real_json << "]";
+    os << real_json.str() << "}";
+  }
+  os << "\n";
+  std::cout << os.str() << std::endl;
   rrdump_pipe << os.str();
   rrdump_pipe.flush();
 }
